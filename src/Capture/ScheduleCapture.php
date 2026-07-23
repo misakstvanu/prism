@@ -11,6 +11,7 @@ use Illuminate\Console\Scheduling\Event as ScheduledEvent;
 use Illuminate\Contracts\Container\Container;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Scrubber;
 use Misakstvanu\Prism\Support\TraceContext;
@@ -63,12 +64,27 @@ final class ScheduleCapture
      */
     private array $started = [];
 
+    /**
+     * @param  list<string>  $ignore  Command patterns never captured.
+     */
     public function __construct(
         private readonly EventBuffer $buffer,
         private readonly Scrubber $scrubber,
         private readonly Container $container,
         private readonly int $maxOutput,
+        private readonly array $ignore = [],
     ) {}
+
+    /**
+     * Whether a task is on the configured ignore list, matched on the same
+     * command string the captured event carries ({@see command()}) so a pattern
+     * is written against the identity the console displays. Wildcards make a
+     * family of internal tasks (`prism:*`, `*:cleanup`) one pattern.
+     */
+    private function isIgnored(ScheduledEvent $task): bool
+    {
+        return IgnoreList::matches($this->ignore, $this->command($task));
+    }
 
     /**
      * Record the start of a task: stamp the start time keyed by the task's
@@ -78,7 +94,7 @@ final class ScheduleCapture
     public function recordStart(ScheduledTaskStarting $event): void
     {
         try {
-            if (Recursion::suppressed()) {
+            if (Recursion::suppressed() || $this->isIgnored($event->task)) {
                 return;
             }
 
@@ -133,7 +149,7 @@ final class ScheduleCapture
     private function record(ScheduledEvent $task, int $exitCode, float $durationMs, string $output): bool
     {
         try {
-            if (Recursion::suppressed()) {
+            if (Recursion::suppressed() || $this->isIgnored($task)) {
                 return false;
             }
 

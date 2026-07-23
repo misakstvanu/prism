@@ -14,6 +14,7 @@ use Illuminate\Support\Str;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Capture\Concerns\BuildsSpanEvents;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\TraceContext;
 
@@ -34,7 +35,11 @@ use Misakstvanu\Prism\Support\TraceContext;
  *
  * The package's own cache activity — a lookup run while it flushes a batch — is
  * never captured: {@see capture()} short-circuits under
- * {@see Recursion::suppressed()}.
+ * {@see Recursion::suppressed()}. Beyond that, `prism.ignore.cache` silences
+ * keys by pattern ({@see IgnoreList}), which matters because cache is the
+ * chattiest signal here — a single operation that touches half a dozen counters
+ * emits half a dozen spans, and a store used for internal bookkeeping produces
+ * far more noise than insight.
  */
 final class CacheCapture
 {
@@ -50,14 +55,19 @@ final class CacheCapture
      */
     private const MAX_KEY_LENGTH = 120;
 
+    /**
+     * @param  list<string>  $ignore  Cache-key patterns never captured.
+     */
     public function __construct(
         private readonly EventBuffer $buffer,
         private readonly Container $container,
+        private readonly array $ignore = [],
     ) {}
 
     /**
      * Record one cache event into the buffer as a span, unless it is the
-     * package's own work or an event type we do not surface.
+     * package's own work, a key on the ignore list, or an event type we do not
+     * surface.
      */
     public function capture(CacheEvent $event): void
     {
@@ -71,7 +81,15 @@ final class CacheCapture
             return;
         }
 
-        $key = Str::limit((string) $event->key, self::MAX_KEY_LENGTH);
+        $rawKey = (string) $event->key;
+
+        // Matched against the full key, before truncation — a pattern must not
+        // depend on where the display limit happens to fall.
+        if (IgnoreList::matches($this->ignore, $rawKey)) {
+            return;
+        }
+
+        $key = Str::limit($rawKey, self::MAX_KEY_LENGTH);
         $store = is_string($event->storeName) && $event->storeName !== '' ? $event->storeName : 'default';
 
         $this->buffer->add(self::SPAN_EVENT_TYPE, $this->spanEvent(

@@ -295,13 +295,44 @@ return [
     | Ignore lists
     |--------------------------------------------------------------------------
     |
-    | "paths" are request URI patterns (Str::is wildcards) never captured —
-    | Prism's own routes, dev tooling and health checks, which would otherwise
-    | be pure noise or a feedback loop. "jobs" are fully-qualified job classes
-    | to skip, for high-frequency internal jobs you do not want to trace.
-    | "exceptions" are exception classes (and their subclasses) never reported
-    | (US-042) — routine control-flow throwables like a missing route or a
-    | failed validation are not faults worth an error group, so they default off.
+    | Activity the client never captures. Every list but "exceptions" matches
+    | with Str::is wildcards, so one pattern can cover a family ("api/internal/*",
+    | "App\Jobs\Internal\*", "prism:*"); a pattern without a "*" matches exactly.
+    |
+    | Two different reasons to add something here. The mild one is noise: a
+    | health check polled every second, or a cache key touched on every request,
+    | costs an event each time and tells you nothing. The serious one is
+    | feedback: capturing work that exists *because* of telemetry means the
+    | capture produces more work to capture. An application monitored by a Prism
+    | workspace that it also hosts is the clearest case — the inbound ingest
+    | request, the job that stores the batch and the datastore write it performs
+    | each generate the events that trigger the next round, and the loop does not
+    | settle. Prism's own outbound work is excluded automatically (US-039), but
+    | work the *host* does on Prism's behalf is only known to the host.
+    |
+    |   paths      Request URI patterns (US-043). Defaults cover Prism's own
+    |              routes, dev tooling and health checks. An inbound ingest batch
+    |              from another Prism client is skipped automatically, whatever
+    |              path it arrives on, so it needs no entry here.
+    |   jobs       Queued job class names (US-047), as resolved for display — for
+    |              a queued broadcast that is the event class, not the framework's
+    |              wrapper.
+    |   commands   Scheduled task commands (US-049), matched on the description
+    |              if the task sets one, otherwise the command string.
+    |   http       Outgoing HTTP destinations (US-046), matched against the host,
+    |              the host and path, and the full URL without its query string —
+    |              "redis.internal", "*.googleapis.com", "http://ch:8123/*" all
+    |              work. Worth using for a datastore reached over HTTP rather than
+    |              a database connection, where every read and write would
+    |              otherwise become a span.
+    |   cache      Cache keys (US-046), matched on the full key before it is
+    |              truncated for display. Cache is the chattiest signal: one
+    |              operation touching several counters emits a span per counter.
+    |   exceptions Exception classes and their subclasses, never reported
+    |              (US-042). Matched with instanceof rather than by pattern, so a
+    |              subclass of an ignored throwable is ignored too. Routine
+    |              control-flow throwables like a missing route or a failed
+    |              validation are not faults worth an error group.
     |
     */
 
@@ -318,6 +349,15 @@ return [
         ],
         'jobs' => [
             // \App\Jobs\HighFrequencyInternalJob::class,
+        ],
+        'commands' => [
+            // 'metrics:*',
+        ],
+        'http' => [
+            // 'search.internal',
+        ],
+        'cache' => [
+            // 'session:*',
         ],
         'exceptions' => [
             NotFoundHttpException::class,

@@ -11,6 +11,7 @@ use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\JobReleasedAfterException;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Scrubber;
 use Misakstvanu\Prism\Support\TraceContext;
@@ -201,7 +202,9 @@ final class JobCapture
     /**
      * Whether a job is skipped entirely: the package's own work (a flush in
      * progress or one of the package's own jobs, so shipping never re-captures
-     * itself), or a class on the configured ignore list.
+     * itself), or a class matching the configured ignore list — which accepts
+     * wildcards, so a whole namespace of internal jobs (`App\Jobs\Internal\*`)
+     * is silenced with one pattern.
      */
     private function shouldSkip(object $job): bool
     {
@@ -219,7 +222,7 @@ final class JobCapture
             return true;
         }
 
-        return in_array($name, $this->ignore, true);
+        return IgnoreList::matches($this->ignore, $name);
     }
 
     /**

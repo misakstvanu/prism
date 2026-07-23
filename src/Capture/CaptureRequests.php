@@ -12,6 +12,7 @@ use Illuminate\Routing\Route;
 use Illuminate\Support\Str;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Scrubber;
 use Misakstvanu\Prism\Support\SpanStack;
@@ -39,10 +40,13 @@ use Symfony\Component\HttpFoundation\Response;
  * middleware stack. The authenticated user id and current trace id ride the event
  * envelope so the console can attribute and correlate the request.
  *
- * Two things are never captured: a path matching the configurable ignore list
+ * Three things are never captured: a path matching the configurable ignore list
  * (`prism.ignore.paths`, defaulting to Prism's own routes, dev tooling and health
- * checks — otherwise the client would report on itself), and any request whose
- * work is the package's own ({@see Recursion::suppressed()}).
+ * checks — otherwise the client would report on itself), any request whose work
+ * is the package's own ({@see Recursion::suppressed()}), and any request carrying
+ * the {@see Recursion::MARKER_HEADER} marker — an inbound ingest batch from
+ * another Prism client, which a workspace monitoring itself would otherwise
+ * capture as application traffic and answer with a batch of its own.
  *
  * A non-GET request's body is captured too, but only after being run through the
  * {@see Scrubber} so a secret is redacted at the source, then truncated to
@@ -117,6 +121,22 @@ final class CaptureRequests
         $this->firstQueryOffsetMs = null;
         $this->start = microtime(true);
         $this->ctrlSpanId = null;
+
+        // An inbound batch from another Prism client is Prism's own traffic end
+        // to end — not only the request itself, but every query, cache read and
+        // log line emitted while it is handled. Skipping just the request event
+        // would still capture that collateral, some of it unmatchable by pattern
+        // (a rate limiter hashes its cache key), and each captured event ships a
+        // batch that produces the next one. Suppress capture for the request's
+        // whole lifetime instead, exactly as the package brackets its own
+        // outbound flush. This middleware runs in the host's `web`/`api` group,
+        // so `$next` still covers the route middleware that authenticates and
+        // rate-limits the batch.
+        if (Recursion::isInternalRequest($request->headers)) {
+            $this->tracesEnabled = false;
+
+            return Recursion::suppress(static fn (): Response => $next($request));
+        }
 
         // Assemble waterfall spans only when trace capture is on and the request
         // is not one we ignore — an ignored request buffers nothing, so opening a
@@ -284,13 +304,18 @@ final class CaptureRequests
      */
     private function isIgnored(Request $request): bool
     {
-        $patterns = $this->config->get('prism.ignore.paths', []);
-
-        if (! is_array($patterns)) {
-            return false;
+        // A request carrying the internal marker is another Prism client's
+        // outbound batch arriving here (US-039). The in-process suppression flag
+        // cannot see across that boundary — this is a fresh request, in a fresh
+        // process — so the header is the only signal available, and it is exactly
+        // what the header exists for. Without this a Prism workspace monitoring
+        // itself captures every inbound ingest POST as application traffic, and
+        // each captured request ships a batch that produces the next one.
+        if (Recursion::isInternalRequest($request->headers)) {
+            return true;
         }
 
-        $patterns = array_values(array_filter($patterns, 'is_string'));
+        $patterns = IgnoreList::patterns($this->config->get('prism.ignore.paths', []));
 
         return $patterns !== [] && $request->is(...$patterns);
     }

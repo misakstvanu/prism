@@ -39,6 +39,7 @@ use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Http\Middleware\TraceRequests;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Runtime;
 use Misakstvanu\Prism\Support\Scrubber;
@@ -468,7 +469,11 @@ class PrismServiceProvider extends ServiceProvider
         }
 
         $this->app->singleton(CacheCapture::class, static function ($app): CacheCapture {
-            return new CacheCapture($app->make(EventBuffer::class), $app);
+            return new CacheCapture(
+                $app->make(EventBuffer::class),
+                $app,
+                IgnoreList::patterns($app['config']->get('prism.ignore.cache', [])),
+            );
         });
 
         foreach ([CacheHit::class, CacheMissed::class, KeyWritten::class, KeyForgotten::class] as $eventClass) {
@@ -503,6 +508,7 @@ class PrismServiceProvider extends ServiceProvider
                 $app->make(EventBuffer::class),
                 $app->make(Scrubber::class),
                 $app,
+                IgnoreList::patterns($app['config']->get('prism.ignore.http', [])),
             );
         });
 
@@ -539,13 +545,11 @@ class PrismServiceProvider extends ServiceProvider
         }
 
         $this->app->singleton(JobCapture::class, static function ($app): JobCapture {
-            $ignore = $app['config']->get('prism.ignore.jobs', []);
-
             return new JobCapture(
                 $app->make(EventBuffer::class),
                 $app->make(Scrubber::class),
                 $app,
-                array_values(array_filter(is_array($ignore) ? $ignore : [], 'is_string')),
+                IgnoreList::patterns($app['config']->get('prism.ignore.jobs', [])),
             );
         });
 
@@ -612,6 +616,7 @@ class PrismServiceProvider extends ServiceProvider
                 $app->make(Scrubber::class),
                 $app,
                 is_numeric($maxOutput) ? (int) $maxOutput : 16384,
+                IgnoreList::patterns($app['config']->get('prism.ignore.commands', [])),
             );
         });
 

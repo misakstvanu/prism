@@ -10,6 +10,7 @@ use Illuminate\Contracts\Container\Container;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Capture\Concerns\BuildsSpanEvents;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Scrubber;
 use Misakstvanu\Prism\Support\TraceContext;
@@ -38,8 +39,13 @@ use Throwable;
  * Two things are never captured: the package's own outbound work — an ingest
  * POST carries {@see Recursion::MARKER_HEADER} and a flush runs under
  * {@see Recursion::suppressed()} (US-039) — so shipping a batch is never itself
- * recorded as an outgoing request. Recording is fully guarded, so a fault in the
- * capture can never corrupt the host's HTTP response.
+ * recorded as an outgoing request, and any destination matching
+ * `prism.ignore.http` ({@see IgnoreList}). That second list matters for a
+ * datastore reached over HTTP rather than a database connection: every read and
+ * write becomes an outgoing call, so an application that stores its telemetry
+ * that way would record a span for each one — and storing that span is another
+ * write. Recording is fully guarded, so a fault in the capture can never corrupt
+ * the host's HTTP response.
  */
 final class HttpCapture
 {
@@ -48,11 +54,43 @@ final class HttpCapture
     /** The span sub-type (US-006 `spans.type`); the waterfall tints it as an HTTP span. */
     private const SPAN_TYPE = 'http';
 
+    /**
+     * @param  list<string>  $ignore  Destination patterns never captured.
+     */
     public function __construct(
         private readonly EventBuffer $buffer,
         private readonly Scrubber $scrubber,
         private readonly Container $container,
+        private readonly array $ignore = [],
     ) {}
+
+    /**
+     * Whether an outgoing call's destination is on the ignore list.
+     *
+     * The destination is offered three ways — host, host and path, and the full
+     * URL without its query string — so a pattern can be written at whatever
+     * precision the user has in mind (`clickhouse`, `clickhouse/*`,
+     * `http://clickhouse:8123/*`) without having to guess the form the matcher
+     * uses. The query string is excluded because it varies per call and may hold
+     * a credential the {@see Scrubber} would otherwise have to redact first.
+     */
+    private function isIgnored(UriInterface $uri): bool
+    {
+        if ($this->ignore === []) {
+            return false;
+        }
+
+        $host = $uri->getHost();
+        $path = $uri->getPath();
+        $authority = $uri->getPort() === null ? $host : $host.':'.$uri->getPort();
+
+        return IgnoreList::matches(
+            $this->ignore,
+            $host,
+            $host.$path,
+            $uri->getScheme().'://'.$authority.$path,
+        );
+    }
 
     /**
      * The Guzzle middleware: given the next handler, return a handler that times
@@ -65,7 +103,10 @@ final class HttpCapture
     public function __invoke(callable $handler): callable
     {
         return function (RequestInterface $request, array $options) use ($handler): PromiseInterface {
-            if (Recursion::suppressed() || Recursion::isInternalRequest($request->getHeaders())) {
+            if (Recursion::suppressed()
+                || Recursion::isInternalRequest($request->getHeaders())
+                || $this->isIgnored($request->getUri())
+            ) {
                 return $handler($request, $options);
             }
 

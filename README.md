@@ -152,11 +152,37 @@ request.
 
 ### Ignore lists
 
+Activity the client never captures. Every list but `ignore.exceptions` matches with `Str::is`
+wildcards, so one pattern covers a family (`api/internal/*`, `App\Jobs\Internal\*`, `prism:*`); a
+pattern without a `*` matches exactly.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ignore.paths` | Prism's own routes, `telescope*`, `horizon*`, `_debugbar*`, `nova*`, `up`, `health*` | Request URI patterns (`Str::is` wildcards) never captured. |
-| `ignore.jobs` | `[]` | Fully-qualified job classes to skip. |
-| `ignore.exceptions` | `NotFoundHttpException`, `ValidationException` | Exception classes (and subclasses) never reported. |
+| `ignore.paths` | Prism's own routes, `telescope*`, `horizon*`, `_debugbar*`, `nova*`, `up`, `health*` | Request URI patterns never captured. |
+| `ignore.jobs` | `[]` | Queued job class names, as resolved for display — for a queued broadcast that is the event class, not the framework's wrapper. |
+| `ignore.commands` | `[]` | Scheduled task commands, matched on the task's description if it sets one, otherwise its command string. |
+| `ignore.http` | `[]` | Outgoing HTTP destinations, matched against the host, the host and path, and the full URL without its query string — `redis.internal`, `*.googleapis.com` and `http://ch:8123/*` all work. |
+| `ignore.cache` | `[]` | Cache keys, matched on the full key before it is truncated for display. |
+| `ignore.exceptions` | `NotFoundHttpException`, `ValidationException` | Exception classes never reported. Matched with `instanceof`, so subclasses are covered too. |
+
+There are two reasons to add something here. The mild one is noise: a health check polled every
+second, or a cache key touched on every request, costs an event each time and tells you nothing.
+
+The serious one is **feedback**. Capturing work that exists *because* of telemetry means the capture
+produces more work to capture. Prism excludes its own outbound batch automatically — it carries an
+internal marker header and runs under a suppression scope — and an *inbound* request carrying that
+same marker is treated the same way: capture is suppressed for its whole lifetime, so neither the
+request nor the queries, cache reads and log lines it triggers are recorded. An application that
+hosts the Prism workspace it reports to therefore never captures another client's ingest POST, on
+any endpoint, with no configuration. What it cannot know is the work **your** application does on Prism's
+behalf: the job that stores a batch, the counters it increments, the datastore it writes to. Those
+are what the lists above are for. Two cases worth checking in any install:
+
+- **A datastore reached over HTTP** rather than as a database connection (ClickHouse, OpenSearch, a
+  cloud API) travels through Laravel's HTTP client, so every read and write becomes a span — and
+  storing that span is another write. Add its host to `ignore.http`.
+- **Cache is the chattiest signal.** One operation touching half a dozen counters emits a span per
+  counter, so a prefix used for internal bookkeeping is worth an `ignore.cache` entry.
 
 ### Scrubbed keys
 
