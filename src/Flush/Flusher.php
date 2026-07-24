@@ -26,6 +26,15 @@ use Misakstvanu\Prism\Transport\Transport;
  * gzip-and-POST of a large payload does not hold the process. The `sync` flush
  * strategy forces the inline path regardless — it exists for scripts and tests
  * with no queue worker.
+ *
+ * The `spool` strategy sends from neither: the envelope goes onto the
+ * cache-backed {@see BatchSpool} and one debounced drain job
+ * ({@see SpoolScheduler}) ships everything that accumulated. That is what a host
+ * wants when the ingest endpoint is expensive to reach per request — or is served
+ * by the very process doing the sending, where an inline POST deadlocks against
+ * itself. It needs a queue worker and a cache store with atomic locks; without
+ * either, {@see shouldSpool()} declines and the batch takes the normal path
+ * rather than being lost.
  */
 final class Flusher
 {
@@ -33,11 +42,19 @@ final class Flusher
         private readonly Repository $config,
         private readonly EventBuffer $buffer,
         private readonly Transport $transport,
+        private readonly BatchSpool $spool,
+        private readonly SpoolScheduler $scheduler,
     ) {}
 
     /**
      * Ship whatever is buffered. A no-op when the buffer is empty, so a request
      * that produced no telemetry costs nothing at terminate.
+     *
+     * Every caller is a terminal hook — the app's `terminating` callback, a job's
+     * terminal queue event, a scheduled task's terminal event — so the batch this
+     * builds always describes finished work. That is what lets the spool hand a
+     * batch to another process without any risk of shipping the middle of a
+     * request.
      */
     public function flush(): void
     {
@@ -48,6 +65,15 @@ final class Flusher
         $batch = $this->buffer->flush();
         $envelope = $this->envelope($batch);
 
+        // Spool first: only a refusal (no lock support, no worker, a lock the
+        // producer could not take in time) falls through to sending it here, so
+        // declining is always safe.
+        if ($this->shouldSpool() && $this->spool->push($envelope)) {
+            $this->scheduler->arm();
+
+            return;
+        }
+
         if ($this->shouldQueue($batch)) {
             SendBatchJob::dispatch($envelope)->onQueue($this->queue());
 
@@ -55,6 +81,25 @@ final class Flusher
         }
 
         $this->transport->send($envelope);
+    }
+
+    /**
+     * Whether this flush should be spooled for a drain job rather than sent.
+     *
+     * Three things have to hold. The strategy has to ask for it; the cache store
+     * has to offer atomic locks, which is what keeps concurrent producers and the
+     * drain from losing a batch between them; and the queue connection must not
+     * be `sync`, on which the "deferred" drain would run inline inside the
+     * terminating callback — precisely the blocking send spooling exists to
+     * avoid.
+     */
+    private function shouldSpool(): bool
+    {
+        if ($this->config->get('prism.batch.flush', 'terminate') !== 'spool') {
+            return false;
+        }
+
+        return $this->spool->usable() && $this->spool->drainable();
     }
 
     /**

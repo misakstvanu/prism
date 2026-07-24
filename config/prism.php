@@ -148,6 +148,13 @@ return [
     |   - "sync":      ship inline before the process ends, never handing the
     |                  batch to the queue. Useful for one-off scripts and tests
     |                  where there is no queue worker to drain the batch.
+    |   - "spool":     ship from neither. The finished batch is parked in the
+    |                  cache and one debounced job drains everything spooled
+    |                  since the last drain, so a burst of requests costs one
+    |                  ingest POST rather than one each. Requires a queue worker
+    |                  and a cache store with atomic locks; without either the
+    |                  flush quietly falls back to "terminate" rather than
+    |                  holding telemetry it cannot ship. See "spool" below.
     |
     | "timeout" bounds the ingest POST (seconds). Kept short so a slow or
     | unreachable endpoint can never stall the process for long, even though the
@@ -158,7 +165,36 @@ return [
     | large payload during "terminate" would still hold the worker (notably
     | under Octane), so a big batch is offloaded to the queue. Zero keeps every
     | flush inline. "queue" names the queue that job is dispatched onto; leave
-    | it null for the default queue.
+    | it null for the default queue — it names the drain job's queue too.
+    |
+    | The "spool" block below tunes the spool strategy. Only batches from
+    | finished work ever reach the spool (a flush runs at the end of a request,
+    | job or scheduled task), and a cache lock guards the hand-off, so a drain
+    | can never pick up a half-written batch.
+    |
+    |   delay         Seconds the drain job waits before it runs. This is the
+    |                 debounce window: everything spooled during it ships
+    |                 together. Longer trades freshness for fewer round trips.
+    |   grace         Extra seconds the "a drain is already pending" marker is
+    |                 held beyond the delay, covering the time a job waits for a
+    |                 free worker. Once it lapses the next flush arms a
+    |                 replacement, so a drain lost with its worker cannot strand
+    |                 the spool.
+    |   ttl           Seconds a spooled batch survives in the cache. A backlog
+    |                 nobody could deliver expires rather than accumulating.
+    |   max_batches   Batches held at once. Past the cap the oldest are dropped
+    |                 (fresh telemetry beats a stale batch nobody could send).
+    |                 Zero is unbounded.
+    |   max_attempts  Send attempts a batch gets before it is discarded. A batch
+    |                 that fails goes back on the spool one attempt older, so an
+    |                 outage costs a delay rather than the telemetry — but a
+    |                 permanently wrong endpoint must not cycle forever.
+    |   store         Cache store backing the spool; null uses the default. It
+    |                 must support atomic locks and be shared by every process
+    |                 that captures (so not "array" outside tests).
+    |   lock_seconds  How long the index lock is held, and lock_wait how long a
+    |                 flush waits for it before giving up and sending inline.
+    |                 Both are short: the critical section is a list of keys.
     |
     */
 
@@ -168,6 +204,16 @@ return [
         'timeout' => (float) env('PRISM_FLUSH_TIMEOUT', 2.0),
         'queue_threshold' => (int) env('PRISM_QUEUE_THRESHOLD', 100),
         'queue' => env('PRISM_FLUSH_QUEUE'),
+        'spool' => [
+            'delay' => (int) env('PRISM_SPOOL_DELAY', 5),
+            'grace' => (int) env('PRISM_SPOOL_GRACE', 60),
+            'ttl' => (int) env('PRISM_SPOOL_TTL', 900),
+            'max_batches' => (int) env('PRISM_SPOOL_MAX_BATCHES', 500),
+            'max_attempts' => (int) env('PRISM_SPOOL_MAX_ATTEMPTS', 3),
+            'store' => env('PRISM_SPOOL_STORE'),
+            'lock_seconds' => (int) env('PRISM_SPOOL_LOCK_SECONDS', 5),
+            'lock_wait' => (int) env('PRISM_SPOOL_LOCK_WAIT', 3),
+        ],
     ],
 
     /*

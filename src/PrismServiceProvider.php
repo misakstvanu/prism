@@ -12,6 +12,7 @@ use Illuminate\Cache\Events\KeyWritten;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskStarting;
+use Illuminate\Contracts\Cache\Factory as CacheFactory;
 use Illuminate\Contracts\Debug\ExceptionHandler as ExceptionHandlerContract;
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
 use Illuminate\Database\Events\QueryExecuted;
@@ -35,7 +36,9 @@ use Misakstvanu\Prism\Capture\QueryCapture;
 use Misakstvanu\Prism\Capture\ScheduleCapture;
 use Misakstvanu\Prism\Capture\SpanRecorder;
 use Misakstvanu\Prism\Console\CheckCommand;
+use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
+use Misakstvanu\Prism\Flush\SpoolScheduler;
 use Misakstvanu\Prism\Http\Middleware\TraceRequests;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
@@ -152,6 +155,20 @@ class PrismServiceProvider extends ServiceProvider
         // every flush a long-lived runtime (Octane, a worker) performs.
         $this->app->singleton(Transport::class, static function ($app): HttpTransport {
             return new HttpTransport($app['config']);
+        });
+
+        // The cache-backed hand-off behind the `spool` flush strategy (US-038):
+        // a terminal flush parks its finished batch here and one debounced drain
+        // job ships everything at once, so no request ever waits on the ingest
+        // host. Singletons because both are stateless readers of config and the
+        // cache — the coordination lives in the store's atomic locks, not in the
+        // objects, so they are safe to share across a long-lived process.
+        $this->app->singleton(BatchSpool::class, static function ($app): BatchSpool {
+            return new BatchSpool($app->make(CacheFactory::class), $app['config']);
+        });
+
+        $this->app->singleton(SpoolScheduler::class, static function ($app): SpoolScheduler {
+            return new SpoolScheduler($app->make(CacheFactory::class), $app['config']);
         });
 
         // The redactor every capture listener runs its collected data through

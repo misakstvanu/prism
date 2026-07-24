@@ -124,10 +124,41 @@ can never be sampled out at the client.**
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `batch.size` | `PRISM_BATCH_SIZE` | `1000` | Max events one request may buffer; the excess is dropped and counted, bounding memory. |
-| `batch.flush` | `PRISM_FLUSH_STRATEGY` | `terminate` | `terminate` ships after the response is returned (off the critical path — the default). `sync` ships inline before the process ends (useful for one-off scripts and tests). |
+| `batch.flush` | `PRISM_FLUSH_STRATEGY` | `terminate` | `terminate` ships after the response is returned (off the critical path — the default). `sync` ships inline before the process ends (useful for one-off scripts and tests). `spool` parks the batch in the cache for one debounced drain job (see below). |
 | `batch.timeout` | `PRISM_FLUSH_TIMEOUT` | `2.0` | Ingest POST timeout in seconds, kept short so a slow endpoint never stalls the process. |
 | `batch.queue_threshold` | `PRISM_QUEUE_THRESHOLD` | `100` | A flush larger than this is handed to a queued job instead of sent inline. `0` keeps every flush inline. |
-| `batch.queue` | `PRISM_FLUSH_QUEUE` | `null` | Queue that job is dispatched onto; `null` = default queue. |
+| `batch.queue` | `PRISM_FLUSH_QUEUE` | `null` | Queue the send/drain job is dispatched onto; `null` = default queue. |
+
+#### The `spool` strategy
+
+Under `terminate` and `sync` the process that captured the telemetry is also the one that ships it —
+a POST per request. `spool` decouples the two: a finished batch is written to the cache and a single
+debounced job drains everything spooled since the last drain, so a burst of requests costs one ingest
+POST instead of one each. It is the right choice when reaching the ingest host is expensive per
+request, and the necessary one when the host *is* the ingest host — an inline POST into a
+single-worker dev server deadlocks against the request making it.
+
+Only finished work is ever spooled (a flush runs at the end of a request, job or scheduled task), and
+a cache lock guards the hand-off, so a drain can never pick up a half-written batch. A batch that
+fails to send goes back on the spool and a fresh drain is armed, so an outage costs a delay rather
+than the telemetry.
+
+It needs two things: a **cache store with atomic locks** shared by every process that captures (redis,
+memcached, database, file — not `array` outside tests), and a **queue worker** (the drain never runs
+on the `sync` driver). Without either, the flush quietly falls back to `terminate` rather than piling
+up telemetry it cannot ship — `php artisan prism:check` reports which, and how many batches are
+waiting.
+
+| Key | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| `batch.spool.delay` | `PRISM_SPOOL_DELAY` | `5` | Seconds the drain waits before running — the debounce window everything spooled during it ships in. |
+| `batch.spool.grace` | `PRISM_SPOOL_GRACE` | `60` | Extra seconds the "a drain is pending" marker is held, covering the wait for a free worker. Once it lapses the next flush arms a replacement. |
+| `batch.spool.ttl` | `PRISM_SPOOL_TTL` | `900` | Seconds a spooled batch survives in the cache. |
+| `batch.spool.max_batches` | `PRISM_SPOOL_MAX_BATCHES` | `500` | Batches held at once; past the cap the oldest are dropped. `0` = unbounded. |
+| `batch.spool.max_attempts` | `PRISM_SPOOL_MAX_ATTEMPTS` | `3` | Send attempts a batch gets before it is discarded, so a wrong endpoint cannot cycle forever. |
+| `batch.spool.store` | `PRISM_SPOOL_STORE` | `null` | Cache store backing the spool; `null` = default store. |
+| `batch.spool.lock_seconds` | `PRISM_SPOOL_LOCK_SECONDS` | `5` | How long the spool index lock is held. |
+| `batch.spool.lock_wait` | `PRISM_SPOOL_LOCK_WAIT` | `3` | How long a flush waits for that lock before giving up and sending inline. |
 
 ### Per-domain limits
 
@@ -261,6 +292,7 @@ php artisan prism:check
 | A `401` from the endpoint | The token is wrong, revoked, or not an **ingest**-scope token. Mint a fresh ingest token. |
 | A `429` from the endpoint | The workspace is over its monthly event quota. Connectivity and the token are fine — this is a billing state. Errors are still accepted. |
 | Nothing appears in the console | Confirm `PRISM_ENABLED` is not `false`, the path/job is not on an ignore list, and — for a worker — that a job has actually run (the batch flushes at the end of each job). |
+| Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, batches are landing but nothing drains them: check a worker is consuming the queue named by `PRISM_FLUSH_QUEUE` (default queue), and that the endpoint is reachable **from the worker**, which is where the send now happens. |
 | Events flow but bodies/args are blank | Expected: sensitive keys are scrubbed at the source, and non-GET bodies are truncated to `request.max_body`. |
 | No telemetry after a deploy | Config cache is stale — `php artisan config:clear` (or re-run `config:cache`). |
 

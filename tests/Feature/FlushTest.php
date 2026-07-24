@@ -10,7 +10,9 @@ use GuzzleHttp\Psr7\Response as GuzzleResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 use Misakstvanu\Prism\Buffer\EventBuffer;
+use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
+use Misakstvanu\Prism\Flush\SpoolScheduler;
 use Misakstvanu\Prism\Jobs\SendBatchJob;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Transport\HttpTransport;
@@ -33,6 +35,22 @@ class RecordingTransport implements Transport
 
         return $this->result;
     }
+}
+
+/**
+ * A flusher over the given buffer and transport, with the spool collaborators
+ * resolved from the container. The default `terminate` strategy never reaches
+ * them; the spool's own behaviour is covered in SpoolFlushTest.
+ */
+function flusherOver(EventBuffer $buffer, Transport $transport): Flusher
+{
+    return new Flusher(
+        app('config'),
+        $buffer,
+        $transport,
+        app(BatchSpool::class),
+        app(SpoolScheduler::class),
+    );
 }
 
 /**
@@ -145,7 +163,7 @@ it('builds a versioned envelope, flattening events and stamping the type', funct
     $buffer->add('request', ['path' => '/b', 'timestamp' => 't3']);
 
     $transport = new RecordingTransport;
-    (new Flusher(app('config'), $buffer, $transport))->flush();
+    flusherOver($buffer, $transport)->flush();
 
     expect($transport->sent)->toHaveCount(1);
 
@@ -169,7 +187,7 @@ it('builds a versioned envelope, flattening events and stamping the type', funct
 it('does nothing when the buffer is empty', function () {
     $transport = new RecordingTransport;
 
-    (new Flusher(app('config'), new EventBuffer, $transport))->flush();
+    flusherOver(new EventBuffer, $transport)->flush();
 
     expect($transport->sent)->toBeEmpty();
 });
@@ -188,7 +206,7 @@ it('hands a batch over the threshold to a queued job instead of an inline send',
     $buffer->add('log', ['n' => 3, 'timestamp' => 't']); // count 3 > threshold 2
 
     $transport = new RecordingTransport;
-    (new Flusher(app('config'), $buffer, $transport))->flush();
+    flusherOver($buffer, $transport)->flush();
 
     Queue::assertPushed(SendBatchJob::class, 1);
 
@@ -211,7 +229,7 @@ it('sends inline under the sync strategy even over the threshold', function () {
     $buffer->add('log', ['n' => 3, 'timestamp' => 't']);
 
     $transport = new RecordingTransport;
-    (new Flusher(app('config'), $buffer, $transport))->flush();
+    flusherOver($buffer, $transport)->flush();
 
     Queue::assertNothingPushed();
     expect($transport->sent)->toHaveCount(1);

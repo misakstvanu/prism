@@ -7,6 +7,7 @@ namespace Misakstvanu\Prism\Console;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Support\Facades\Http;
+use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
@@ -14,17 +15,21 @@ use Throwable;
  * Verifies the Prism client is correctly wired up before a team trusts it
  * (US-052) — a one-shot preflight for `php artisan prism:check`.
  *
- * It runs four checks and reports each in plain language:
+ * It runs five checks and reports each in plain language:
  *
  *   1. Configuration. The two required variables (PRISM_TOKEN, PRISM_APP) are
  *      present and the endpoint is a valid URL. A missing or malformed value
  *      names the exact variable at fault, so the fix is obvious.
  *   2. Capture domains. Which per-domain toggles are on, so a surprised user
  *      can see at a glance that, say, queries are silenced.
- *   3. Connectivity + token. A single test event is POSTed to the configured
+ *   3. Delivery. How a finished batch leaves the process and, under the `spool`
+ *      strategy, whether the cache store and queue it depends on are in place —
+ *      an install that captures happily into a spool nothing drains looks
+ *      identical to a healthy one from the inside.
+ *   4. Connectivity + token. A single test event is POSTed to the configured
  *      ingest endpoint with the bearer token. An unreachable host, a rejected
  *      token and an accepted event are three distinct, clearly-labelled outcomes.
- *   4. Acceptance. The endpoint's `{ accepted }` count is inspected so the
+ *   5. Acceptance. The endpoint's `{ accepted }` count is inspected so the
  *      command confirms the event was actually stored, not merely that the POST
  *      returned 2xx.
  *
@@ -42,7 +47,7 @@ class CheckCommand extends Command
     /** @var string */
     protected $description = 'Verify the Prism client is configured and can reach the ingest endpoint.';
 
-    public function handle(Repository $config): int
+    public function handle(Repository $config, BatchSpool $spool): int
     {
         $this->newLine();
         $this->line('<options=bold>Prism install verification</>');
@@ -63,6 +68,7 @@ class CheckCommand extends Command
         $problems = $this->validateConfiguration($config);
 
         $this->reportCaptureDomains($config);
+        $this->reportDelivery($config, $spool);
 
         // A configuration fault means the live checks cannot even run (no token
         // to authenticate with, no endpoint to reach). Report every problem at
@@ -130,6 +136,55 @@ class CheckCommand extends Command
             $status = $enabled ? '<fg=green>enabled</>' : '<fg=yellow>disabled</>';
 
             $this->line(sprintf('    %s %s', str_pad((string) $domain.' ', 16, '.'), $status));
+        }
+    }
+
+    /**
+     * Report how batches leave this process, and — under the `spool` strategy —
+     * whether the two things a spool depends on are actually in place.
+     *
+     * A spool that cannot be drained is the quietest way for an install to go
+     * silent: capture keeps working, batches keep landing in the cache, and
+     * nothing ever ships. Both preconditions are reported explicitly, with the
+     * fallback spelled out, so that state is visible here rather than inferred
+     * from an empty console.
+     */
+    private function reportDelivery(Repository $config, BatchSpool $spool): void
+    {
+        $strategy = (string) $config->get('prism.batch.flush', 'terminate');
+
+        $this->newLine();
+        $this->line('  <options=bold>Delivery</>');
+        $this->line(sprintf('    %s %s', str_pad('strategy ', 16, '.'), $strategy));
+
+        if ($strategy !== 'spool') {
+            return;
+        }
+
+        $delay = (int) $config->get('prism.batch.spool.delay', 5);
+        $store = $config->get('prism.batch.spool.store');
+        $store = is_string($store) && $store !== '' ? $store : (string) $config->get('cache.default');
+
+        $this->line(sprintf('    %s %s (%s)', str_pad('cache store ', 16, '.'), $store,
+            $spool->usable() ? '<fg=green>atomic locks</>' : '<fg=red>no atomic locks</>'));
+        $this->line(sprintf('    %s every %ds via %s', str_pad('drain ', 16, '.'), $delay,
+            (string) $config->get('queue.default')));
+        $this->line(sprintf('    %s %d', str_pad('waiting ', 16, '.'), $spool->pending()));
+
+        if (! $spool->usable()) {
+            $this->components->warn(
+                'The configured cache store has no atomic locks, so batches cannot be spooled safely. '
+                .'Prism is falling back to sending each batch inline; point PRISM_SPOOL_STORE at a '
+                .'store that supports locks (redis, memcached, database, file).'
+            );
+        }
+
+        if (! $spool->drainable()) {
+            $this->components->warn(
+                'The default queue connection is "sync", so a spooled batch would be drained inline '
+                .'rather than by a worker. Prism is falling back to sending each batch inline; '
+                .'configure a real queue connection to use the spool.'
+            );
         }
     }
 
