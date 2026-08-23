@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace Misakstvanu\Prism\Console;
 
+use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Support\Facades\Http;
+use Laravel\Nightwatch\Core;
 use Misakstvanu\Prism\Flush\BatchSpool;
+use Misakstvanu\Prism\Nightwatch\PrismIngest;
+use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
@@ -20,8 +24,10 @@ use Throwable;
  *   1. Configuration. The two required variables (PRISM_TOKEN, PRISM_APP) are
  *      present and the endpoint is a valid URL. A missing or malformed value
  *      names the exact variable at fault, so the fix is obvious.
- *   2. Capture domains. Which per-domain toggles are on, so a surprised user
- *      can see at a glance that, say, queries are silenced.
+ *   2. Capture engine (US-005). Which engine is capturing, at which version,
+ *      whether Prism's own in-process ingest is installed over it, and — said
+ *      out loud, because an operator who follows the engine's own documentation
+ *      will otherwise go looking for one — that no agent daemon is required.
  *   3. Delivery. How a finished batch leaves the process and, under the `spool`
  *      strategy, whether the cache store and queue it depends on are in place —
  *      an install that captures happily into a spool nothing drains looks
@@ -47,6 +53,15 @@ class CheckCommand extends Command
     /** @var string */
     protected $description = 'Verify the Prism client is configured and can reach the ingest endpoint.';
 
+    /**
+     * Prism's OpenTelemetry span processor, named as a string rather than
+     * imported: the report has to work for an install where the span lane is
+     * not there at all — a host that took `keepsuit/laravel-opentelemetry` out
+     * of its tree, or one that published `config/opentelemetry.php` and
+     * therefore registers the processor itself or not at all.
+     */
+    private const SPAN_PROCESSOR = 'Misakstvanu\\Prism\\Otel\\PrismSpanProcessor';
+
     public function handle(Repository $config, BatchSpool $spool): int
     {
         $this->newLine();
@@ -67,7 +82,7 @@ class CheckCommand extends Command
 
         $problems = $this->validateConfiguration($config);
 
-        $this->reportCaptureDomains($config);
+        $this->reportCaptureEngine($config);
         $this->reportDelivery($config, $spool);
 
         // A configuration fault means the live checks cannot even run (no token
@@ -118,25 +133,147 @@ class CheckCommand extends Command
     }
 
     /**
-     * List each per-domain capture toggle and whether it is on, so a user can
-     * confirm at a glance which signals are being captured (AC1).
+     * Report what is actually capturing in this process, and where its records
+     * go (US-005).
+     *
+     * Four of the six lines exist because the interesting failures here are
+     * silent ones:
+     *
+     *   - **engine** names `laravel/nightwatch` and its installed version. The
+     *     record shapes Prism translates are versioned per type upstream, so
+     *     "which version is in this tree" is the first thing worth knowing when
+     *     a screen has quietly emptied.
+     *   - **ingest** says whether `Core::$ingest` is Prism's. It is what the
+     *     provider assigns at boot, and it is assigned only on the enabled +
+     *     token path — so an install that is capturing happily into the
+     *     engine's own socket ingest, with nothing reaching Prism, is visible
+     *     here rather than inferred from an empty console.
+     *   - **agent** says `not required`, unconditionally and out loud. The
+     *     engine's own documentation tells an operator to run a `nightwatch:agent`
+     *     daemon; Prism replaces the ingest wholesale, so that daemon is not a
+     *     thing to install, start, monitor or debug. An operator who goes
+     *     looking for it has already lost an afternoon.
+     *   - **otel spans** reports whether the span processor is registered —
+     *     which is the whole of the span lane, and the half of "is this
+     *     install complete" the `ingest` line does not answer. Its absence is
+     *     a state, not a fault: spans keep arriving from the engine's own
+     *     records, flat, so the line reports and the command carries on.
+     *
+     * The last two restate the token and the endpoint beside them, because the
+     * token is what decides whether the ingest above was installed at all, and
+     * the endpoint is the address the connectivity check below actually reaches
+     * for — the three answers explain each other and are worth reading together.
      */
-    private function reportCaptureDomains(Repository $config): void
+    private function reportCaptureEngine(Repository $config): void
     {
-        $domains = $config->get('prism.capture', []);
-
-        if (! is_array($domains) || $domains === []) {
-            return;
-        }
-
         $this->newLine();
-        $this->line('  <options=bold>Capture domains</>');
+        $this->line('  <options=bold>Capture engine</>');
 
-        foreach ($domains as $domain => $enabled) {
-            $status = $enabled ? '<fg=green>enabled</>' : '<fg=yellow>disabled</>';
+        $this->engineLine('engine', $this->engineDescription());
+        $this->engineLine('ingest', $this->ingestDescription());
+        $this->engineLine('agent', '<fg=green>not required</> — no daemon, nothing opens the agent socket');
+        $this->engineLine('otel spans', $this->spanProcessorDescription());
+        $this->engineLine('token', blank($config->get('prism.token'))
+            ? '<fg=red>missing</> — set PRISM_TOKEN'
+            : '<fg=green>present</>');
+        $this->engineLine('endpoint', (string) $config->get('prism.endpoint'));
+    }
 
-            $this->line(sprintf('    %s %s', str_pad((string) $domain.' ', 16, '.'), $status));
+    /** One dotted label/value line of the capture-engine report. */
+    private function engineLine(string $label, string $value): void
+    {
+        $this->line(sprintf('    %s %s', str_pad($label.' ', 16, '.'), $value));
+    }
+
+    /**
+     * The capture engine and the version of it installed in this tree.
+     *
+     * The version comes from Composer's runtime API rather than from a constant
+     * of the engine's own, so it reports what is *installed* rather than what
+     * the package believes about itself — and its absence (a classmap-only
+     * autoloader, a tree assembled by hand) is reported as an unknown version
+     * rather than as a failure.
+     */
+    private function engineDescription(): string
+    {
+        if (! class_exists(Core::class)) {
+            return '<fg=red>laravel/nightwatch is not installed</> — run composer install';
         }
+
+        $version = $this->engineVersion();
+
+        return 'laravel/nightwatch '.($version ?? '<fg=yellow>(version unknown)</>');
+    }
+
+    /** The installed version of the capture engine, or null if it cannot be read. */
+    private function engineVersion(): ?string
+    {
+        try {
+            if (! InstalledVersions::isInstalled('laravel/nightwatch')) {
+                return null;
+            }
+
+            return InstalledVersions::getPrettyVersion('laravel/nightwatch');
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether Prism's own in-process pipeline is installed over the engine's
+     * ingest — the single fact that decides whether anything captured in this
+     * process ever reaches the workspace.
+     */
+    private function ingestDescription(): string
+    {
+        if (! $this->laravel->bound(Core::class)) {
+            return '<fg=yellow>not installed</> — the capture engine has not registered in this process';
+        }
+
+        try {
+            $ingest = $this->laravel->make(Core::class)->ingest;
+        } catch (Throwable $e) {
+            return '<fg=yellow>unknown</> — '.$e->getMessage();
+        }
+
+        if ($ingest instanceof PrismIngest) {
+            return "<fg=green>in-process</> — records go straight into Prism's buffer";
+        }
+
+        return '<fg=red>'.get_debug_type($ingest).'</> — records are NOT reaching Prism';
+    }
+
+    /**
+     * The OpenTelemetry span lane, which is what contributes the parent/child
+     * span tree — the one thing the capture engine's completion-only records
+     * cannot express.
+     *
+     * Two different absences, and the second is the one worth a sentence: no
+     * class at all means the span package is not in the tree, while a class
+     * that is installed and not registered means the host published
+     * `config/opentelemetry.php` (so Prism wrote nothing, deliberately) and has
+     * not added the processor to `traces.processors` itself. Either way the
+     * command succeeds: spans still arrive from the engine's own records, so a
+     * missing processor is a flatter waterfall rather than a broken install.
+     */
+    private function spanProcessorDescription(): string
+    {
+        if (! class_exists(self::SPAN_PROCESSOR)) {
+            return '<fg=yellow>not configured</> — spans come from the capture engine\'s own records';
+        }
+
+        // The verdict comes from {@see SpanLane} rather than from a second
+        // reading of the config, because since US-018 it decides behaviour as
+        // well as wording: with the processor registered, the engine's own
+        // `query` and `outgoing-request` records are dropped in favour of the
+        // spans. A line that could disagree with that decision would be the
+        // one place an operator looks to find out why the Queries screen is
+        // empty.
+        if ($this->laravel->make(SpanLane::class)->registered()) {
+            return '<fg=green>configured</>';
+        }
+
+        return '<fg=yellow>not configured</> — '.self::SPAN_PROCESSOR.' is installed but not registered';
     }
 
     /**

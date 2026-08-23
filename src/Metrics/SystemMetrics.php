@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace Misakstvanu\Prism\Metrics;
 
+use Closure;
 use Illuminate\Contracts\Container\Container;
-use Misakstvanu\Prism\Buffer\EventBuffer;
+use Laravel\Nightwatch\Contracts\Ingest;
+use Misakstvanu\Prism\Nightwatch\PrismIngest;
+use Misakstvanu\Prism\Nightwatch\RecordTranslator;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Runtime;
@@ -13,7 +16,7 @@ use Throwable;
 
 /**
  * Samples this instance's own health — CPU load, memory pressure and uptime —
- * and buffers it as a `replica_metric` event (US-051), so the console can chart
+ * and ships it as a `replica_metric` event (US-051), so the console can chart
  * the health of every running replica even one that is up but idle.
  *
  * It is the counterpart to {@see QueueMetrics}: both emit the same
@@ -22,10 +25,27 @@ use Throwable;
  * — a web front-end just as much as a worker — so this collector is registered
  * unconditionally by {@see PrismServiceProvider::registerSystemMetrics()}.
  *
- * Like queue polling it is sampled on an interval (default 60s) and piggybacked
- * onto whatever flush happens next rather than sent on its own request (AC1):
- * {@see PrismServiceProvider::flush()} calls {@see collect()} before draining the
- * buffer, so a due sample rides an existing flush.
+ * Like queue polling it is sampled on an interval (default 60s) rather than on
+ * every flush: {@see PrismServiceProvider::flush()} calls {@see collect()} at the
+ * end of an execution and most of those calls do nothing.
+ *
+ * **A due sample is shipped with {@see Ingest::writeNow()}, never buffered**
+ * (US-013). Nightwatch is the capture engine now, and `Core::finishExecution()`
+ * answers an execution the sampler rejected with `flush()`, which on
+ * {@see PrismIngest} means *discard the whole buffer*. A metric written into
+ * that buffer would therefore vanish whenever the request it happened to ride
+ * was sampled out — and an instance's CPU, memory and uptime have nothing to do
+ * with whether one request was interesting. `writeNow()` puts the sample in a
+ * batch of its own, so the Replicas screen and the `replica_cpu` alert keep
+ * reporting at whatever rate the interval sets, wholly independently of the
+ * sampling rate.
+ *
+ * The record it hands over is Nightwatch-shaped (`v`/`t`/`timestamp` and the
+ * fields beside them) because that is the vocabulary the ingest speaks, but its
+ * type — `replica_metric` — is **Prism's own**: Nightwatch's `Sensors` directory
+ * has no system sensor and no queue sensor, so this signal has no upstream
+ * counterpart to be replaced by. {@see RecordTranslator} knows the type for
+ * that reason.
  *
  * Two robustness rules make it safe in any host (AC4):
  *
@@ -44,7 +64,12 @@ use Throwable;
  */
 class SystemMetrics
 {
-    /** The telemetry signal name (US-026); the server routes it to `replica_metrics`. */
+    /**
+     * The telemetry signal name (US-026) — the server routes it to
+     * `replica_metrics` — and, since US-013, the record type this collector
+     * hands the ingest. Prism's own: Nightwatch has no system sensor, so there
+     * is no upstream `t` to borrow.
+     */
     private const EVENT_TYPE = 'replica_metric';
 
     /** Cache-key prefix for the cross-process once-per-interval throttle. */
@@ -59,6 +84,13 @@ class SystemMetrics
     private ?int $lastSampledAt = null;
 
     /**
+     * @param  Closure(): ?Ingest  $ingest  Resolves the ingest to ship through,
+     *                                      read per sample rather than held: the
+     *                                      one Prism installs over
+     *                                      `Core::$ingest` is assigned in a
+     *                                      `booted` callback, which on a re-boot
+     *                                      (Octane, a test) happens after this
+     *                                      collector was built.
      * @param  string  $replica  This instance's name — used to scope the throttle
      *                           key so distinct replicas on a shared cache do not
      *                           throttle one another.
@@ -69,7 +101,7 @@ class SystemMetrics
      *                                negative samples on every flush.
      */
     public function __construct(
-        private readonly EventBuffer $buffer,
+        private readonly Closure $ingest,
         private readonly Container $container,
         private readonly string $replica,
         private readonly string $replicaType,
@@ -77,9 +109,8 @@ class SystemMetrics
     ) {}
 
     /**
-     * Add a health sample to the buffer when the interval has elapsed, so it
-     * ships with the flush this call precedes. A no-op between intervals and
-     * while the package is doing its own work; never throws.
+     * Ship a health sample when the interval has elapsed. A no-op between
+     * intervals and while the package is doing its own work; never throws.
      */
     public function collect(): void
     {
@@ -88,8 +119,19 @@ class SystemMetrics
                 return;
             }
 
+            $ingest = ($this->ingest)();
+
+            if ($ingest === null) {
+                return;
+            }
+
+            // Marked sampled BEFORE the send, so a transport that throws (it
+            // does not — the send path swallows its own failures — but a
+            // resolver above it might) cannot turn one unreachable ingest into
+            // a sample on every single flush.
             $this->lastSampledAt = $this->now();
-            $this->buffer->add(self::EVENT_TYPE, $this->sample());
+
+            $ingest->writeNow($this->record());
         } catch (Throwable) {
             // Telemetry must never surface an error into the host application.
         }
@@ -125,27 +167,33 @@ class SystemMetrics
     }
 
     /**
-     * Build the metric event: the correlating envelope (a replica metric belongs
-     * to no trace, so its trace/request/user ids are empty) plus a payload of the
-     * health fields the server spreads over `replica_metrics`. A field the host
-     * does not expose is null (AC4); the reported replica type rides the payload
-     * too (AC3, dropped by the server until a column exists for it).
+     * Build the record: the globals the translator reads off every record plus
+     * the health fields, which need no restating because Prism raised this
+     * signal in its own vocabulary and the translator's passthrough carries them
+     * into the payload under exactly these names. A field the host does not
+     * expose is null (AC4); the reported replica type rides along too (AC3).
+     *
+     * A replica metric belongs to no trace and to no execution, so `trace_id` is
+     * blank and there is no `execution_id` — which is why {@see PrismIngest} must
+     * not stamp one onto it the way it does for a request.
+     *
+     * The timestamp is a **float microtime**, the shape every Nightwatch record
+     * carries and the only one the translator accepts; taking it off Carbon
+     * rather than `microtime(true)` keeps `Carbon::setTestNow()` able to move it.
      *
      * @return array<string, mixed>
      */
-    private function sample(): array
+    private function record(): array
     {
         return [
-            'timestamp' => now()->toIso8601String(),
+            'v' => 1,
+            't' => self::EVENT_TYPE,
+            'timestamp' => (float) now()->format('U.u'),
             'trace_id' => '',
-            'request_id' => '',
-            'user_id' => '',
-            'payload' => [
-                'cpu_percent' => $this->cpuPercent(),
-                'memory_percent' => $this->memoryPercent(),
-                'uptime_seconds' => $this->uptimeSeconds(),
-                'type' => $this->replicaType,
-            ],
+            'cpu_percent' => $this->cpuPercent(),
+            'memory_percent' => $this->memoryPercent(),
+            'uptime_seconds' => $this->uptimeSeconds(),
+            'type' => $this->replicaType,
         ];
     }
 

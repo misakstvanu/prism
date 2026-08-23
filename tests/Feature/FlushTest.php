@@ -14,6 +14,7 @@ use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Flush\SpoolScheduler;
 use Misakstvanu\Prism\Jobs\SendBatchJob;
+use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Transport\HttpTransport;
 use Misakstvanu\Prism\Transport\Transport;
@@ -50,6 +51,7 @@ function flusherOver(EventBuffer $buffer, Transport $transport): Flusher
         $transport,
         app(BatchSpool::class),
         app(SpoolScheduler::class),
+        app(SpanFlush::class),
     );
 }
 
@@ -68,8 +70,8 @@ function bootFlush(): void
         'prism.replica' => 'web-1',
         'prism.batch.flush' => 'terminate',
         'prism.batch.queue_threshold' => 0,
-        // Replica health sampling (US-051) piggybacks a metric onto every flush;
-        // disabled here so it never inflates this file's exact event counts.
+        // Replica health sampling (US-051) ships a metric at the end of every
+        // execution; disabled here so it never inflates this file's exact counts.
         'prism.capture.metrics' => false,
     ]);
 

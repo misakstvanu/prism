@@ -118,6 +118,9 @@ it('clears the buffer between two consecutive queue jobs in the same worker', fu
 
     // Job 2 begins in the same long-lived worker process.
     $job = Mockery::mock(Job::class)->shouldIgnoreMissing();
+    // `shouldIgnoreMissing()` answers null, and the reject listener the provider
+    // registers reads this one for real — a Job always names itself.
+    $job->shouldReceive('resolveName')->andReturn('App\\Jobs\\PriceOrder');
     event(new JobProcessing('redis', $job));
 
     // Job 2 sees a clean buffer — none of job 1's events leaked across.

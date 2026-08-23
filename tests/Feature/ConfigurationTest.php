@@ -29,20 +29,22 @@ it('covers every documented config domain', function () {
     expect(config('prism'))
         ->toHaveKeys([
             'enabled', 'token', 'app', 'endpoint', 'environment', 'replica',
-            'capture', 'sample_rates', 'batch', 'request', 'ignore', 'scrub',
+            'batch', 'request', 'ignore', 'scrub', 'metrics',
         ]);
 
-    expect(config('prism.capture'))->toHaveKeys([
-        'requests', 'exceptions', 'logs', 'queries', 'traces', 'jobs', 'schedules', 'metrics',
-    ]);
     expect(config('prism.metrics'))->toHaveKey('queue_interval');
     expect(config('prism.metrics.queue_interval'))->toBe(30);
     expect(config('prism.ignore'))->toHaveKeys(['paths', 'jobs']);
     expect(config('prism.scrub'))->toContain('password')->toContain('authorization');
 });
 
-it('exceptions are pinned to a 1.0 sample rate and never sampled out', function () {
-    expect(config('prism.sample_rates.exceptions'))->toBe(1.0);
+it('no longer declares capture toggles or sample rates of its own', function () {
+    // Both blocks are Nightwatch's vocabulary now — its `sampling` and
+    // `filtering` config, wired from Prism's own ignore/scrub lists in later
+    // stories. Declaring a second set here would be two sources of one truth.
+    expect(config('prism'))
+        ->not->toHaveKey('capture')
+        ->not->toHaveKey('sample_rates');
 });
 
 it('registers no capture and stays silent when disabled', function () {

@@ -6,8 +6,10 @@ namespace Misakstvanu\Prism;
 
 use Closure;
 use Illuminate\Container\Container;
-use Misakstvanu\Prism\Capture\ExceptionCapture;
-use Misakstvanu\Prism\Capture\SpanRecorder;
+use Keepsuit\LaravelOpenTelemetry\Tracer;
+use Laravel\Nightwatch\Facades\Nightwatch;
+use Misakstvanu\Prism\Otel\PrismSpanProcessor;
+use Misakstvanu\Prism\Otel\SpanLane;
 use Throwable;
 
 /**
@@ -18,6 +20,12 @@ use Throwable;
  * client is inert (disabled or unconfigured), so a host can call it
  * unconditionally without guarding on whether Prism is set up: a build with
  * `PRISM_ENABLED=false` simply does nothing.
+ *
+ * **Both methods changed producer in the capture engine replacement (US-021)
+ * while keeping their signatures**, because both used to be the manual entry
+ * points to capture listeners Prism wrote itself and no longer has. What they
+ * hand the work to is now the engine that owns the signal: an exception goes to
+ * the capture engine, a span to the span lane. See the package `UPGRADING.md`.
  */
 final class Prism
 {
@@ -26,38 +34,56 @@ final class Prism
      * and wants it in Prism anyway — a swallowed integration error, a
      * best-effort background task's failure.
      *
-     * Captured as `handled` (distinct from an unhandled exception that escaped
-     * to the reporter), scrubbed and buffered like any other; the same ignore
-     * list and recursion guard apply. A no-op when the client is inert.
+     * Delegates to the capture engine's own reporter (US-021), which is what
+     * every *unhandled* exception already travels through: the engine's
+     * exception sensor builds the record, `prism.scrub` rewrites it through the
+     * redact callbacks and `prism.ignore.exceptions` drops it in Prism's
+     * ingest, exactly as for an exception that escaped. `handled: true` is the
+     * one thing this call says that the automatic path does not — it is the
+     * flag that distinguishes an error the application dealt with from one that
+     * got away, and it is also what keeps a handled report from re-rolling the
+     * execution's sampling decision.
+     *
+     * A no-op when the client is inert: `ACTIVE` is bound only once capture is
+     * wired (enabled + token), and without it there is nowhere to send this.
      */
     public static function captureException(Throwable $e): void
     {
         $app = Container::getInstance();
 
-        // ACTIVE is bound only once capture is wired (enabled + token). Absent
-        // means the client is inert, so there is nowhere to send this.
         if (! $app->bound(PrismServiceProvider::ACTIVE)) {
             return;
         }
 
-        $app->make(ExceptionCapture::class)->capture($e, handled: true);
+        Nightwatch::report($e, handled: true);
     }
 
     /**
      * Manually instrument a block of code as a trace span (US-050). The closure
      * is timed and recorded as a span carrying its offset from the front of the
-     * trace, its duration, its parent span and its nesting depth, so arbitrary
-     * application work — an expensive computation, a third-party SDK call the
-     * automatic capturers do not see — appears on the trace waterfall.
+     * trace, its duration and its parent span, so arbitrary application work —
+     * an expensive computation, a third-party SDK call no instrumentation sees
+     * — appears on the trace waterfall.
      *
-     * A span opened inside the closure (another `Prism::span()`, a cache lookup,
-     * an outgoing HTTP call) nests beneath this one automatically. The default
-     * `ctrl` type renders it as application logic; pass one of the prototype's
-     * span types (`db`, `http`, …) to tint it differently.
+     * Since US-021 the span is a real OpenTelemetry span rather than one Prism
+     * assembled from a stack of its own, which is the point of the span lane:
+     * anything opened inside the closure (a query, an outgoing call, another
+     * `Prism::span()`) nests beneath it by construction, and the trace it joins
+     * is the one that crosses service and queue boundaries.
+     * {@see PrismSpanProcessor} is what turns it into the Prism `span` event
+     * the waterfall draws, so the lane's own rules — self-monitoring, scrubbing
+     * and `prism.ignore.*` — apply to it unchanged.
      *
-     * A safe no-op when the client is inert: the closure still runs and its
+     * `$type` is one of the prototype's waterfall lanes (`ctrl`, `db`, `http`,
+     * `mw`, `cache`, `resp`) and rides the span as an attribute the processor
+     * reads back, so a manual span keeps the tint the caller asked for instead
+     * of falling through to the default. `$extra` becomes span attributes,
+     * which travel into the event's payload.
+     *
+     * A safe no-op when the lane is not live: the closure still runs and its
      * value is returned, it is simply not recorded — so a host can wrap code in
-     * `Prism::span()` unconditionally.
+     * `Prism::span()` unconditionally, including one that has switched the
+     * OpenTelemetry SDK off entirely.
      *
      * @template TReturn
      *
@@ -67,12 +93,46 @@ final class Prism
      */
     public static function span(string $name, Closure $callback, string $type = 'ctrl', array $extra = []): mixed
     {
-        $app = Container::getInstance();
+        $tracer = self::tracer();
 
-        if (! SpanRecorder::isActive($app)) {
+        if ($tracer === null || $name === '') {
             return $callback();
         }
 
-        return $app->make(SpanRecorder::class)->record($name, $type, $callback, $extra);
+        /** @var TReturn */
+        return $tracer->newSpan($name)
+            ->setAttributes([...$extra, PrismSpanProcessor::TYPE_ATTRIBUTE => $type])
+            ->measure(static fn (): mixed => $callback());
+    }
+
+    /**
+     * The span lane's tracer, or null when there is nothing to record onto.
+     *
+     * Three conditions, and each is a different way of not being live: the
+     * client is inert, the host has switched the lane off with
+     * `PRISM_OTEL_ENABLED=false`, or the SDK is not installed at all (the
+     * package is a `require`, but a host may have replaced the provider). A
+     * throw is answered the same way — a manual span is never worth costing the
+     * caller their own work over.
+     */
+    private static function tracer(): ?Tracer
+    {
+        $app = Container::getInstance();
+
+        if (! $app->bound(PrismServiceProvider::ACTIVE) || ! $app->bound(Tracer::class)) {
+            return null;
+        }
+
+        try {
+            if (! $app->make(SpanLane::class)->enabled()) {
+                return null;
+            }
+
+            $tracer = $app->make(Tracer::class);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $tracer instanceof Tracer ? $tracer : null;
     }
 }

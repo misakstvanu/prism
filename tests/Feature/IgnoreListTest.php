@@ -1,174 +1,20 @@
 <?php
 
-use Illuminate\Cache\Events\CacheHit;
-use Illuminate\Console\Events\ScheduledTaskFinished;
-use Illuminate\Console\Events\ScheduledTaskStarting;
-use Illuminate\Console\Scheduling\Schedule;
-use Illuminate\Contracts\Queue\Job;
-use Illuminate\Http\Request;
-use Illuminate\Http\Response;
-use Illuminate\Queue\Events\JobProcessed;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Queue;
-use Misakstvanu\Prism\Buffer\EventBuffer;
-use Misakstvanu\Prism\Capture\CacheCapture;
-use Misakstvanu\Prism\Capture\CaptureRequests;
-use Misakstvanu\Prism\Capture\HttpCapture;
-use Misakstvanu\Prism\Capture\JobCapture;
-use Misakstvanu\Prism\Capture\ScheduleCapture;
-use Misakstvanu\Prism\Capture\SpanRecorder;
-use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\IgnoreList;
-use Misakstvanu\Prism\Support\Recursion;
-use Misakstvanu\Prism\Support\Scrubber;
-use Misakstvanu\Prism\Support\SpanStack;
-use Misakstvanu\Prism\Support\TraceContext;
-use Misakstvanu\Prism\Transport\Transport;
 
 /**
- * A transport double recording the envelopes it is handed. Scheduled tasks flush
- * at the end of every run (US-049), so their events leave the buffer before a
- * test can read it and must be asserted on what shipped. Uniquely named — Pest
- * loads every test file into one process.
- */
-class IgnoreCaptureTransport implements Transport
-{
-    /** @var list<array<string, mixed>> */
-    public array $sent = [];
-
-    public function send(array $envelope): bool
-    {
-        $this->sent[] = $envelope;
-
-        return true;
-    }
-}
-
-/**
- * Reconfigure the app with full credentials and re-boot so every capturer is
- * wired with the ignore lists under test. The flush strategy is `sync` and no
- * kernel drains the buffer, so a request/cache/HTTP event stays readable
- * directly off the buffer; a schedule event ships through the returned transport
- * instead. Replica health sampling is off because it rides every flush and would
- * inflate the exact counts this file asserts. Uniquely named — Pest loads every
- * test file into one process.
+ * The `prism.ignore.*` matcher itself (US-039), and nothing else.
  *
- * @param  array<string, mixed>  $overrides
+ * Every dimension it answers used to be applied by a capture listener of
+ * Prism's own, and this file used to drive those listeners. Since US-021 there
+ * are none: `RejectRules` says the same lists in the capture engine's
+ * vocabulary and `SpanLane` applies them to the span lane, so what each
+ * dimension *does* is asserted end-to-end against the real engine in
+ * `tests/Host/NightwatchRejectRulesTest.php` and, for the internal-marker
+ * boundary, in `RecursionGuardTest`. What is left here is the matcher's own
+ * semantics — the part both of those depend on and neither would localise a
+ * failure in.
  */
-function bootIgnores(array $overrides = []): IgnoreCaptureTransport
-{
-    config(array_merge([
-        'prism.enabled' => true,
-        'prism.token' => 'prism_live_'.str_repeat('a', 40),
-        'prism.app' => 'demo',
-        'prism.environment' => 'production',
-        'prism.replica' => 'web-1',
-        'prism.batch.flush' => 'sync',
-        'prism.batch.queue_threshold' => 0,
-        'prism.capture.metrics' => false,
-        'prism.ignore.paths' => [],
-        'prism.ignore.jobs' => [],
-        'prism.ignore.commands' => [],
-        'prism.ignore.http' => [],
-        'prism.ignore.cache' => [],
-    ], $overrides));
-
-    Recursion::reset();
-    TraceContext::reset();
-    SpanStack::reset();
-
-    app()->forgetInstance(PrismServiceProvider::ACTIVE);
-    app()->forgetInstance(EventBuffer::class);
-    app()->forgetInstance(Transport::class);
-    app()->forgetInstance(Scrubber::class);
-    app()->forgetInstance(SpanRecorder::class);
-    app()->forgetInstance(CaptureRequests::class);
-    app()->forgetInstance(CacheCapture::class);
-    app()->forgetInstance(HttpCapture::class);
-    app()->forgetInstance(JobCapture::class);
-    app()->forgetInstance(ScheduleCapture::class);
-
-    (new PrismServiceProvider(app()))->boot();
-
-    $transport = new IgnoreCaptureTransport;
-    app()->instance(Transport::class, $transport);
-
-    return $transport;
-}
-
-/**
- * Every `schedule` event across everything the transport received, by command.
- *
- * @return list<mixed>
- */
-function shippedScheduleCommands(IgnoreCaptureTransport $transport): array
-{
-    $commands = [];
-
-    foreach ($transport->sent as $envelope) {
-        foreach (($envelope['events'] ?? []) as $event) {
-            if (($event['type'] ?? null) === 'schedule') {
-                $commands[] = $event['payload']['command'] ?? null;
-            }
-        }
-    }
-
-    return $commands;
-}
-
-/**
- * Drive one request through the capture middleware's full lifecycle and return
- * how many `request` events it buffered.
- *
- * @param  array<string, string>  $headers
- */
-function ignoredRequestEvents(string $uri, array $headers = []): int
-{
-    $server = [];
-
-    foreach ($headers as $name => $value) {
-        $server['HTTP_'.strtoupper(str_replace('-', '_', $name))] = $value;
-    }
-
-    $request = Request::create($uri, 'POST', server: $server);
-    $middleware = app(CaptureRequests::class);
-
-    $response = $middleware->handle($request, static fn (): Response => new Response('ok'));
-    $middleware->terminate($request, $response);
-
-    return count(app(EventBuffer::class)->all()['request'] ?? []);
-}
-
-/** The buffered span events, in order. */
-function ignoredSpans(): array
-{
-    return app(EventBuffer::class)->all()['span'] ?? [];
-}
-
-/**
- * A queue Job double stubbing exactly the accessors JobCapture reads. Uniquely
- * named — Pest loads every test file into one process, so it must not collide
- * with JobCaptureTest's own double.
- */
-function fakeIgnoredJob(string $name): Job
-{
-    $job = Mockery::mock(Job::class);
-    $job->shouldReceive('uuid')->andReturn('job-uuid-1');
-    $job->shouldReceive('resolveName')->andReturn($name);
-    $job->shouldReceive('getQueue')->andReturn('default');
-    $job->shouldReceive('attempts')->andReturn(1);
-    $job->shouldReceive('payload')->andReturn([]);
-
-    return $job;
-}
-
-afterEach(function (): void {
-    Recursion::reset();
-    TraceContext::reset();
-    SpanStack::reset();
-    Queue::createPayloadUsing(null);
-});
-
 it('normalises a raw config value into a pattern list', function (): void {
     // Config is untyped, so a published file can hold anything at all.
     expect(IgnoreList::patterns(['a', 'b']))->toBe(['a', 'b'])
@@ -193,108 +39,49 @@ it('matches any candidate against any pattern, with wildcards', function (): voi
         ->and(IgnoreList::matches(['*'], ''))->toBeFalse();
 });
 
-it('never captures an inbound ingest batch from another Prism client', function (): void {
-    bootIgnores();
+/**
+ * The `Str::is` → PCRE conversion (US-010).
+ *
+ * `laravel/nightwatch`'s cache-key rejection is the one matcher in either
+ * engine that speaks regex: it runs `@preg_match($pattern, $key)` and falls
+ * back to a literal string comparison only when the pattern will not compile.
+ * A raw `prism:*` does not compile — no delimiters — so it is compared to the
+ * key as a literal and silences nothing at all, with no error anywhere. These
+ * assert the conversion against the matcher's own semantics rather than against
+ * a spelling, and pair each one with the `Str::is` verdict it has to reproduce.
+ */
+it('converts a wildcard pattern into a regex the engine matcher accepts', function (): void {
+    $pattern = IgnoreList::toRegex('prism:*');
 
-    // The marker header is the only signal available here: this is a fresh
-    // request in a fresh process, so the in-process suppression flag cannot see
-    // that it originated from a Prism client. Without this the pipeline loops —
-    // capturing the batch ships a batch that produces the next one.
-    expect(ignoredRequestEvents('/api/ingest', [Recursion::MARKER_HEADER => '1']))->toBe(0);
+    // `preg_match` answers `false` for a pattern that will not compile, so a
+    // 1 here is also the proof that upstream's literal-string fallback — the
+    // branch that silences nothing — is not the one being taken.
+    expect(preg_match($pattern, 'prism:usage:1:2026-07'))->toBe(1)
+        ->and(preg_match($pattern, 'orders:recent'))->toBe(0)
+        // The verdict it has to reproduce.
+        ->and(IgnoreList::matches(['prism:*'], 'prism:usage:1:2026-07'))->toBeTrue();
 });
 
-it('captures the same request when it carries no internal marker', function (): void {
-    bootIgnores();
+it('anchors a pattern with no wildcard at both ends, so it matches exactly', function (): void {
+    $pattern = IgnoreList::toRegex('prism');
 
-    expect(ignoredRequestEvents('/api/ingest'))->toBe(1);
+    expect(preg_match($pattern, 'prism'))->toBe(1)
+        ->and(preg_match($pattern, 'prism:usage'))->toBe(0)
+        ->and(preg_match($pattern, 'my-prism'))->toBe(0)
+        ->and(IgnoreList::matches(['prism'], 'prism:usage'))->toBeFalse();
 });
 
-it('suppresses everything an inbound ingest batch does while it is handled', function (): void {
-    bootIgnores();
+it('quotes a pattern that would otherwise be read as regex syntax', function (): void {
+    // A cache key is a string, not an expression: the dots and slashes a host
+    // writes are literal, and an unquoted `.` would match any character.
+    $pattern = IgnoreList::toRegex('laravel_cache:user.1/session');
 
-    $request = Request::create('/api/ingest', 'POST', server: [
-        'HTTP_'.strtoupper(str_replace('-', '_', Recursion::MARKER_HEADER)) => '1',
-    ]);
-
-    $middleware = app(CaptureRequests::class);
-
-    // Storing a batch reads the cache and runs queries of its own. Skipping only
-    // the request event would leave that collateral captured — and a rate
-    // limiter's cache key is hashed, so no pattern could exclude it.
-    $middleware->handle($request, static function () use (&$suppressed): Response {
-        $suppressed = Recursion::suppressed();
-        event(new CacheHit('array', 'a3f9c1e0b2d4', 1));
-
-        return new Response('ok');
-    });
-
-    expect($suppressed)->toBeTrue()
-        ->and(ignoredSpans())->toBe([])
-        // The scope must close with the request, not leak into the next one.
-        ->and(Recursion::suppressed())->toBeFalse();
+    expect(preg_match($pattern, 'laravel_cache:user.1/session'))->toBe(1)
+        ->and(preg_match($pattern, 'laravel_cacheXuserZ1/session'))->toBe(0);
 });
 
-it('skips a request path on the ignore list', function (): void {
-    bootIgnores(['prism.ignore.paths' => ['api/*']]);
-
-    expect(ignoredRequestEvents('/api/ingest'))->toBe(0)
-        ->and(ignoredRequestEvents('/orders'))->toBe(1);
-});
-
-it('skips a job class matching an ignore pattern', function (): void {
-    bootIgnores(['prism.ignore.jobs' => ['App\Events\*']]);
-
-    $capture = app(JobCapture::class);
-
-    // A queued broadcast resolves to the event class, so one namespace pattern
-    // covers every broadcast without naming them individually.
-    expect($capture->recordProcessed(new JobProcessed(
-        'redis',
-        fakeIgnoredJob('App\Events\TelemetryUpdated'),
-    )))->toBeFalse();
-
-    expect($capture->recordProcessed(new JobProcessed(
-        'redis',
-        fakeIgnoredJob('App\Jobs\SendWelcomeEmail'),
-    )))->toBeTrue();
-});
-
-it('skips a scheduled command matching an ignore pattern', function (): void {
-    $transport = bootIgnores(['prism.ignore.commands' => ['prism:*']]);
-
-    $ignored = app(Schedule::class)->exec('prism:usage:flush')->cron('* * * * *');
-    $kept = app(Schedule::class)->exec('reports:build')->cron('* * * * *');
-
-    foreach ([$ignored, $kept] as $task) {
-        event(new ScheduledTaskStarting($task));
-        event(new ScheduledTaskFinished($task, 0.5));
-    }
-
-    expect(shippedScheduleCommands($transport))->toBe(['reports:build']);
-});
-
-it('skips an outgoing call to an ignored destination', function (): void {
-    bootIgnores(['prism.ignore.http' => ['clickhouse']]);
-
-    Http::fake(['*' => Http::response('', 200)]);
-
-    // A datastore reached over HTTP would otherwise emit a span per read and per
-    // write — and storing that span is another write.
-    Http::get('http://clickhouse:8123/?query=SELECT+1');
-    Http::get('https://api.stripe.com/v1/charges');
-
-    $names = array_map(static fn (array $span): mixed => $span['payload']['name'] ?? null, ignoredSpans());
-
-    expect($names)->toBe(['GET api.stripe.com/v1/charges']);
-});
-
-it('skips a cache key matching an ignore pattern', function (): void {
-    bootIgnores(['prism.ignore.cache' => ['prism:*']]);
-
-    event(new CacheHit('array', 'prism:usage:1:2026-07', 1));
-    event(new CacheHit('array', 'orders:recent', ['id' => 1]));
-
-    $names = array_map(static fn (array $span): mixed => $span['payload']['name'] ?? null, ignoredSpans());
-
-    expect($names)->toBe(['cache:hit orders:recent (array)']);
+it('handles a wildcard in the middle and a bare wildcard', function (): void {
+    expect(preg_match(IgnoreList::toRegex('cache:*:lock'), 'cache:orders:lock'))->toBe(1)
+        ->and(preg_match(IgnoreList::toRegex('cache:*:lock'), 'cache:orders:key'))->toBe(0)
+        ->and(preg_match(IgnoreList::toRegex('*'), 'anything at all'))->toBe(1);
 });

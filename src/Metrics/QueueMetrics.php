@@ -4,24 +4,32 @@ declare(strict_types=1);
 
 namespace Misakstvanu\Prism\Metrics;
 
+use Closure;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Queue\QueueManager;
-use Misakstvanu\Prism\Buffer\EventBuffer;
+use Laravel\Nightwatch\Contracts\Ingest;
+use Misakstvanu\Prism\Nightwatch\PrismIngest;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
 /**
- * Samples live queue depth and worker counts and buffers them as a
+ * Samples live queue depth and worker counts and ships them as a
  * `replica_metric` event (US-048).
  *
  * Queue depth and worker count are point-in-time facts about the queue backend,
- * not per-event telemetry, so they are sampled on an interval and piggybacked
- * onto whatever flush happens next — there is no dedicated request. On a queue
- * worker the buffer is flushed at the end of every job (US-047), so
- * {@see collect()} runs before each of those flushes and adds a sample at most
- * once per configured interval; between samples the call is a cheap timestamp
- * comparison.
+ * not per-event telemetry, so they are sampled on an interval rather than on
+ * every execution. On a queue worker Prism flushes at the end of every job
+ * (US-047), so {@see collect()} runs that often and does nothing on all but one
+ * call per interval; between samples it is a cheap timestamp comparison.
+ *
+ * **A due sample is shipped with {@see Ingest::writeNow()}, never buffered**
+ * (US-013), for the reason {@see SystemMetrics} sets out at length: on
+ * {@see PrismIngest} the buffer is *discarded* for any execution Nightwatch
+ * sampled out, and how deep the queue is has nothing to do with whether the job
+ * that happened to be running was interesting. Nightwatch has no queue sensor at
+ * all, so `replica_metric` is Prism's own record type rather than a replacement
+ * for an upstream one.
  *
  * {@see PrismServiceProvider::registerQueueMetrics()} binds this only on a
  * process that actually works the queue, so a web replica that dispatches jobs
@@ -40,7 +48,12 @@ use Throwable;
  */
 final class QueueMetrics
 {
-    /** The telemetry signal name (US-026); the server routes it to `replica_metrics`. */
+    /**
+     * The telemetry signal name (US-026) — the server routes it to
+     * `replica_metrics` — and, since US-013, the record type this collector
+     * hands the ingest. Shared with {@see SystemMetrics}: the two halves of a
+     * replica's health land in one table.
+     */
     private const EVENT_TYPE = 'replica_metric';
 
     /**
@@ -50,19 +63,21 @@ final class QueueMetrics
     private ?int $lastSampledAt = null;
 
     /**
+     * @param  Closure(): ?Ingest  $ingest  Resolves the ingest to ship through,
+     *                                      read per sample; see
+     *                                      {@see SystemMetrics::__construct()}.
      * @param  int  $intervalSeconds  Minimum seconds between samples; zero or
      *                                negative samples on every flush.
      */
     public function __construct(
-        private readonly EventBuffer $buffer,
+        private readonly Closure $ingest,
         private readonly Container $container,
         private readonly int $intervalSeconds = 30,
     ) {}
 
     /**
-     * Add a queue-metrics sample to the buffer when the interval has elapsed, so
-     * it ships with the flush this call precedes. A no-op between intervals and
-     * while the package is doing its own work; never throws.
+     * Ship a queue-metrics sample when the interval has elapsed. A no-op between
+     * intervals and while the package is doing its own work; never throws.
      */
     public function collect(): void
     {
@@ -71,8 +86,15 @@ final class QueueMetrics
                 return;
             }
 
+            $ingest = ($this->ingest)();
+
+            if ($ingest === null) {
+                return;
+            }
+
             $this->lastSampledAt = $this->now();
-            $this->buffer->add(self::EVENT_TYPE, $this->sample());
+
+            $ingest->writeNow($this->record());
         } catch (Throwable) {
             // Telemetry must never surface an error into the host application.
         }
@@ -89,26 +111,28 @@ final class QueueMetrics
     }
 
     /**
-     * Build the metric event: the correlating envelope (a replica metric belongs
-     * to no trace, so its trace/request/user ids are empty) plus a payload of the
-     * queue depths and worker fields the server spreads over `replica_metrics`.
+     * Build the record: the globals the translator reads plus the queue depths
+     * and worker fields, which travel into the payload under exactly these names
+     * because Prism raised this signal in its own vocabulary.
+     *
+     * A replica metric belongs to no trace and to no execution — see
+     * {@see SystemMetrics::record()} and {@see PrismIngest}, which must not stamp
+     * an execution id onto it.
      *
      * @return array<string, mixed>
      */
-    private function sample(): array
+    private function record(): array
     {
         $horizon = $this->horizonMetrics();
 
         return [
-            'timestamp' => now()->toIso8601String(),
+            'v' => 1,
+            't' => self::EVENT_TYPE,
+            'timestamp' => (float) now()->format('U.u'),
             'trace_id' => '',
-            'request_id' => '',
-            'user_id' => '',
-            'payload' => [
-                'queues' => $this->queueDepths(),
-                'workers' => $horizon['workers'],
-                'supervisor' => $horizon['supervisor'],
-            ],
+            'queues' => $this->queueDepths(),
+            'workers' => $horizon['workers'],
+            'supervisor' => $horizon['supervisor'],
         ];
     }
 

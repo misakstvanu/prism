@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Support\Carbon;
+use Laravel\Nightwatch\Contracts\Ingest;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
@@ -12,10 +13,10 @@ use Misakstvanu\Prism\Support\TraceContext;
 use Misakstvanu\Prism\Transport\Transport;
 
 /**
- * A transport double recording the envelopes it is handed, so the metric a flush
- * piggybacks (AC1) can be asserted without a network. Uniquely named — Pest loads
- * every test file into one process, so it must not collide with the doubles in
- * FlushTest/JobCaptureTest.
+ * A transport double recording the envelopes it is handed, so the metric an
+ * execution's end produces (AC1) can be asserted without a network. Uniquely
+ * named — Pest loads every test file into one process, so it must not collide
+ * with the doubles in FlushTest/JobCaptureTest.
  */
 class QueueMetricsTransport implements Transport
 {
@@ -116,19 +117,42 @@ function bootMetrics(array $overrides = [], bool $asWorker = true): void
     (new PrismServiceProvider(app()))->boot();
 
     // US-051's replica-health collector also emits `replica_metric` events and
-    // rides every flush on any replica. Drop its binding so this file's
-    // assertions see only the queue-metrics collector under test.
+    // samples on every replica. Drop its binding so this file's assertions see
+    // only the queue-metrics collector under test.
     unset(app()[SystemMetrics::class]);
+
+    // Bound AFTER boot: the ingest's flusher factory resolves the transport at
+    // flush time, so a recording one installed here is the transport a sample
+    // actually leaves through.
+    app()->instance(Transport::class, new QueueMetricsTransport);
 }
 
 /**
- * The replica-metric events buffered so far.
+ * The replica-metric events shipped so far, across every envelope.
+ *
+ * The observation point moved with US-013: a sample is handed to the ingest's
+ * `writeNow()` and leaves in a batch of its own rather than being added to the
+ * shared buffer for a later flush to drain. Reading the buffer would now assert
+ * nothing — it is empty either way.
  *
  * @return list<array<string, mixed>>
  */
-function bufferedMetrics(): array
+function shippedQueueMetrics(): array
 {
-    return app(EventBuffer::class)->all()['replica_metric'] ?? [];
+    /** @var QueueMetricsTransport $transport */
+    $transport = app(Transport::class);
+
+    $events = [];
+
+    foreach ($transport->sent as $envelope) {
+        foreach ($envelope['events'] as $event) {
+            if ($event['type'] === 'replica_metric') {
+                $events[] = $event;
+            }
+        }
+    }
+
+    return $events;
 }
 
 $prismOriginalArgv = $_SERVER['argv'] ?? null;
@@ -170,12 +194,10 @@ it('registers no queue polling on a web replica that never processes jobs', func
 
     expect(app()->bound(QueueMetrics::class))->toBeFalse();
 
-    // A flush on a web replica ships nothing extra — no metric is piggybacked.
-    $transport = new QueueMetricsTransport;
-    app()->instance(Transport::class, $transport);
+    // An execution ending on a web replica ships no queue metric.
     app()->terminate();
 
-    expect($transport->sent)->toBeEmpty();
+    expect(shippedQueueMetrics())->toBeEmpty();
 });
 
 it('registers nothing when metrics capture is disabled, even on a worker', function () {
@@ -184,23 +206,37 @@ it('registers nothing when metrics capture is disabled, even on a worker', funct
     expect(app()->bound(QueueMetrics::class))->toBeFalse();
 });
 
-// -- AC1: sampled on an interval and piggybacked onto an existing flush -------
+// -- AC1: sampled on an interval, at the end of an execution -----------------
 
-it('piggybacks a queue-metrics sample onto an existing flush', function () {
+it('ships a queue-metrics sample when an execution ends', function () {
     bootMetrics();
 
-    $transport = new QueueMetricsTransport;
-    app()->instance(Transport::class, $transport);
-
-    // The terminating flush is an existing flush — no dedicated request is made.
+    // The terminating flush is where the interval is consulted; the sample it
+    // finds due ships itself.
     app()->terminate();
 
-    expect($transport->sent)->toHaveCount(1);
+    expect(shippedQueueMetrics())->toHaveCount(1);
+});
 
-    $events = $transport->sent[0]['events'];
+// -- US-013: writeNow, so sampling cannot take the metric with it ------------
 
-    expect($events)->toHaveCount(1)
-        ->and($events[0]['type'])->toBe('replica_metric');
+it('hands the sample to writeNow and never to the shared buffer', function () {
+    $ingest = new RecordingNightwatchIngest;
+    $metrics = new QueueMetrics(fn (): Ingest => $ingest, app(), 30);
+
+    $metrics->collect();
+
+    // write() would put it in the buffer Core::flush() discards for an execution
+    // the sampler rejected — and how deep the queue is has nothing to do with
+    // whether the job that happened to be running was interesting.
+    expect($ingest->writtenNow)->toHaveCount(1)
+        ->and($ingest->written)->toBeEmpty();
+
+    $record = $ingest->writtenNow[0];
+
+    expect($record['v'])->toBe(1)
+        ->and($record['t'])->toBe('replica_metric')
+        ->and($record['timestamp'])->toBeFloat();
 });
 
 it('samples at most once per configured interval', function () {
@@ -212,11 +248,11 @@ it('samples at most once per configured interval', function () {
 
     $metrics->collect();   // first sample: due
     $metrics->collect();   // still within the interval: skipped
-    expect(bufferedMetrics())->toHaveCount(1);
+    expect(shippedQueueMetrics())->toHaveCount(1);
 
     Carbon::setTestNow(Carbon::create(2026, 7, 21, 12, 0, 31)); // +31s
     $metrics->collect();   // interval elapsed: due again
-    expect(bufferedMetrics())->toHaveCount(2);
+    expect(shippedQueueMetrics())->toHaveCount(2);
 });
 
 it('does not sample while the package is doing its own work', function () {
@@ -226,7 +262,7 @@ it('does not sample while the package is doing its own work', function () {
         app(QueueMetrics::class)->collect();
     });
 
-    expect(bufferedMetrics())->toBeEmpty();
+    expect(shippedQueueMetrics())->toBeEmpty();
 });
 
 // -- AC2/AC6: depth read through the host's own configured backend ------------
@@ -245,7 +281,7 @@ it('reads queue depth per connection from the configured backend', function () {
 
     app(QueueMetrics::class)->collect();
 
-    expect(bufferedMetrics()[0]['payload']['queues'])->toBe([
+    expect(shippedQueueMetrics()[0]['payload']['queues'])->toBe([
         ['connection' => 'redis', 'queue' => 'default', 'depth' => 7],
         ['connection' => 'database', 'queue' => 'jobs', 'depth' => 7],
     ]);
@@ -264,7 +300,7 @@ it('degrades to a null depth when the backend cannot be read, without throwing',
 
     app(QueueMetrics::class)->collect(); // must not throw
 
-    expect(bufferedMetrics()[0]['payload']['queues'])->toBe([
+    expect(shippedQueueMetrics()[0]['payload']['queues'])->toBe([
         ['connection' => 'redis', 'queue' => 'default', 'depth' => null],
     ]);
 });
@@ -276,7 +312,7 @@ it('reports null worker and supervisor fields when Horizon is not installed', fu
 
     app(QueueMetrics::class)->collect();
 
-    $payload = bufferedMetrics()[0]['payload'];
+    $payload = shippedQueueMetrics()[0]['payload'];
 
     expect($payload['workers'])->toBeNull()
         ->and($payload['supervisor'])->toBeNull();

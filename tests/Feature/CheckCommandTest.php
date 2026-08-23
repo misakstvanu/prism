@@ -1,8 +1,11 @@
 <?php
 
+use Composer\InstalledVersions;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
+use Laravel\Nightwatch\Core;
+use Misakstvanu\Prism\Otel\PrismSpanProcessor;
 
 /**
  * Set full, valid credentials so the command reaches the live connectivity
@@ -45,19 +48,104 @@ it('passes when config is valid and the endpoint accepts the test event', functi
     });
 });
 
-it('reports which capture domains are enabled', function () {
-    configureCheck(['prism.capture.queries' => false]);
+it('reports the capture engine and the version installed in this tree', function () {
+    configureCheck();
     Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
 
-    // Each asserted substring must land on a distinct output line: Laravel's
-    // command-output mock routes one `doWrite` call to a single expectation, so
-    // two substrings on the same line would compete for it. "requests" is the
-    // enabled line, "disabled" is the (queries) disabled line, and the header is
-    // its own line — none collide.
+    // The version is read back the same way the command reads it rather than
+    // spelled out here: what is asserted is that the command reports the
+    // INSTALLED version, not that this tree happens to be on any given one.
+    $version = InstalledVersions::getPrettyVersion('laravel/nightwatch');
+
+    expect($version)->toBeString()->not->toBeEmpty();
+
     $this->artisan('prism:check')
-        ->expectsOutputToContain('Capture domains')
-        ->expectsOutputToContain('requests')
-        ->expectsOutputToContain('disabled')
+        ->expectsOutputToContain('Capture engine')
+        ->expectsOutputToContain('laravel/nightwatch '.$version)
+        ->assertExitCode(0);
+});
+
+it('says out loud that no agent daemon is required', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // Nightwatch's own documentation tells an operator to run a `nightwatch:agent`
+    // daemon. Prism replaces the ingest wholesale, so there is no daemon to
+    // install or monitor — and an operator who goes looking for one has already
+    // lost an afternoon. That is why the line is unconditional.
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('not required')
+        ->assertExitCode(0);
+});
+
+it('reports the ingest as not installed when nightwatch never registered', function () {
+    // This suite registers Prism ALONE (see `TestCase`), so no `Core` is bound
+    // and the swap had nothing to assign onto. The command reports that state
+    // rather than claiming an in-process pipeline it cannot see.
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    expect(app()->bound(Core::class))->toBeFalse();
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('not installed')
+        ->assertExitCode(0);
+});
+
+it('reports the otel span lane, which is what gives the waterfall its nesting', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // The `ingest` line says records reach Prism; this one says whether they
+    // reach it as a TREE. Set here rather than left to the provider's own
+    // derivation because this suite configures Prism from inside the test —
+    // long after `register()` and the `booting()` pass that write this key —
+    // and what is under test is the report, not the derivation
+    // (OpenTelemetryConfigTest owns that half).
+    config(['opentelemetry.traces.processors' => [PrismSpanProcessor::class]]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('otel spans')
+        ->assertExitCode(0);
+});
+
+it('reports the span lane as not configured when the host owns the otel config, without failing', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // The state a host that published config/opentelemetry.php is left in:
+    // Prism wrote nothing, deliberately, so the processor is installed and
+    // registered by nobody. Spans keep arriving from the capture engine's own
+    // records — flat — so the command reports it and still exits zero.
+    config(['opentelemetry.traces.processors' => []]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('installed but not registered')
+        ->assertExitCode(0);
+});
+
+it('reports the token as present without printing it', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('present')
+        ->doesntExpectOutputToContain(str_repeat('a', 40))
+        ->assertExitCode(0);
+});
+
+it('reports no per-domain capture toggles, because there are none to honour', function () {
+    // US-001 moved the "which signals" vocabulary to the capture engine and
+    // dropped the `capture` block; US-021 deleted the listeners the block's
+    // remaining entries would have gated. A host that published the pre-2.0 file
+    // still HAS the block, which is exactly why this section had to go rather
+    // than stay: printing "requests ... enabled" off a key nothing reads is a
+    // report that lies to the one operator who would consult it.
+    configureCheck(['prism.capture' => ['requests' => true, 'queries' => false]]);
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    $this->artisan('prism:check')
+        ->doesntExpectOutputToContain('Capture domains')
         ->assertExitCode(0);
 });
 

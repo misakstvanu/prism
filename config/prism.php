@@ -28,8 +28,14 @@ return [
     |
     | The one kill switch. With PRISM_ENABLED=false the service provider
     | registers no listeners at all and adds zero overhead — the package is
-    | inert, as if it were not installed. Leave it true and rely on the
-    | per-domain toggles below to silence individual signals.
+    | inert, as if it were not installed. It is also what switches the capture
+    | engine off: "nightwatch.enabled" is derived from this value, so a
+    | disabled Prism leaves laravel/nightwatch dormant too rather than letting
+    | a transitive dependency keep capturing on its own account.
+    |
+    | Which signals are captured, and at what rate, is Nightwatch's own
+    | vocabulary now (its sampling and filtering blocks) — this package no
+    | longer declares "capture" or "sample_rates" toggles of its own.
     |
     */
 
@@ -86,49 +92,96 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Per-domain capture toggles
+    | Sampling
     |--------------------------------------------------------------------------
     |
-    | Turn individual signals on or off without touching the master switch.
-    | Each maps to one telemetry table on the server (US-006). A domain set to
-    | false registers no listener for that signal, so disabling a noisy source
-    | costs nothing rather than capturing-then-discarding.
+    | The share of executions captured, as a fraction of 1. Sampling here is per
+    | EXECUTION rather than per signal: a request, an artisan command or a
+    | scheduled task is kept or dropped whole, together with every query, cache
+    | read, log line, outgoing call and span it produced. So halving the request
+    | rate halves span volume with it — there is no separate span or query rate
+    | to turn down, and no half-captured trace to reassemble.
+    |
+    | 1.0 keeps everything (the default) and 0.0 keeps nothing. A rate this
+    | package cannot read at all is treated as 1.0, never 0.0: capturing more
+    | than intended is a bill, capturing nothing is an outage nobody is told
+    | about.
+    |
+    | There is deliberately no rate for exceptions. An error is never sampled
+    | out — the capture engine pulls a sampled-out execution back into the
+    | sample the moment it throws, so a fault on a dropped request still ships,
+    | and the Prism server pins the exception rate to 1.0 on ingest as well.
+    | A team is never blind to breakage because of a rate someone tuned.
+    |
+    | Note this is "sample", not "sampling": on a host that IS a Prism
+    | workspace, "prism.sampling" is the server's own per-workspace rules and
+    | the two must not collide (a package/host config merge is shallow, so one
+    | key cannot mean two things).
     |
     */
 
-    'capture' => [
-        'requests' => env('PRISM_CAPTURE_REQUESTS', true),
-        'exceptions' => env('PRISM_CAPTURE_EXCEPTIONS', true),
-        'logs' => env('PRISM_CAPTURE_LOGS', true),
-        'queries' => env('PRISM_CAPTURE_QUERIES', true),
-        'traces' => env('PRISM_CAPTURE_TRACES', true),
-        'jobs' => env('PRISM_CAPTURE_JOBS', true),
-        'schedules' => env('PRISM_CAPTURE_SCHEDULES', true),
-        'metrics' => env('PRISM_CAPTURE_METRICS', true),
+    'sample' => [
+        'requests' => (float) env('PRISM_SAMPLE_REQUESTS', 1.0),
+        'commands' => (float) env('PRISM_SAMPLE_COMMANDS', 1.0),
+        'schedules' => (float) env('PRISM_SAMPLE_SCHEDULES', 1.0),
     ],
 
     /*
     |--------------------------------------------------------------------------
-    | Client-side sample rates
+    | OpenTelemetry span lane
     |--------------------------------------------------------------------------
     |
-    | A fraction in [0, 1] of each domain to keep before shipping — a first,
-    | client-side reduction on top of the server's trace-consistent sampling
-    | (US-031). 1.0 keeps everything; 0.1 keeps roughly a tenth. Exceptions are
-    | pinned to 1.0 and never sampled out here, because an error you dropped at
-    | the client is an error the console can never show you.
+    | The second capture engine, and the one that produces the trace waterfall.
+    | `keepsuit/laravel-opentelemetry` instruments the framework through events
+    | and middleware — it needs no OS or PECL extension, so installing Prism is
+    | still `composer require` and two variables.
+    |
+    | Spans never leave this process as OTLP. Prism consumes them in-process and
+    | ships them in its own batch alongside every other signal, so all three
+    | OpenTelemetry exporters (traces, metrics, logs) are pinned to "null" and
+    | no exporter connection is ever opened. There is no collector to run and no
+    | endpoint to point anywhere.
+    |
+    | Why a second engine at all: the capture engine's own cache, query and
+    | outgoing-request sensors fire on COMPLETION only, so the records they
+    | produce are flat siblings sharing a trace id. OpenTelemetry spans carry a
+    | parent span id by construction, which is the one thing a waterfall needs
+    | and the one thing those records cannot express.
+    |
+    | With the lane on it is also the PRODUCER of two signals the capture engine
+    | watches as well. Both see a query and an outgoing HTTP call, so leaving
+    | both alone would store one query as a "queries" row AND a "db" span, and
+    | one outgoing call as two "http" spans. The span wins — it is the one that
+    | knows its parent — so the engine's own query and outgoing-request records
+    | are dropped as they pass through the ingest, and the "queries" row is
+    | built from the db span instead. A record is dropped only where the span
+    | really replaced it: a console command opens no trace, and neither does a
+    | query run before the request span, so in those the engine's record is
+    | kept because it is the only producer there is.
+    |
+    | Turning this off leaves every other signal exactly as it was — requests,
+    | errors, logs, queries, jobs, commands, mail, notifications and replica
+    | metrics all keep flowing, and the "queries" rows go back to being the
+    | capture engine's. What is lost is the nesting: the Traces screen falls
+    | back to the spans the engine's own records produce, which are correlated
+    | by trace but not by parent. It is also switched off wholesale by
+    | PRISM_ENABLED=false, like everything else here.
+    |
+    | "slow_trace_ms" is the threshold the span lane's TAIL SAMPLING keeps a
+    | trace at. Tail sampling defers the keep-or-drop decision until the trace
+    | has finished, so a request that turned out to be slow — or that recorded
+    | an error anywhere in its tree — is kept WHOLE rather than half-sampled,
+    | which is the same stance the Prism server takes when a slow query pulls
+    | its trace through. A trace at or beyond this many milliseconds is kept;
+    | an unreadable value falls back to 2000, never to zero, because zero is
+    | "every trace is slow" and this number is read as a threshold.
     |
     */
 
-    'sample_rates' => [
-        'requests' => (float) env('PRISM_SAMPLE_REQUESTS', 1.0),
-        'exceptions' => 1.0,
-        'logs' => (float) env('PRISM_SAMPLE_LOGS', 1.0),
-        'queries' => (float) env('PRISM_SAMPLE_QUERIES', 1.0),
-        'traces' => (float) env('PRISM_SAMPLE_TRACES', 1.0),
-        'jobs' => (float) env('PRISM_SAMPLE_JOBS', 1.0),
-        'schedules' => (float) env('PRISM_SAMPLE_SCHEDULES', 1.0),
-        'metrics' => (float) env('PRISM_SAMPLE_METRICS', 1.0),
+    'otel' => [
+        'enabled' => (bool) env('PRISM_OTEL_ENABLED', true),
+
+        'slow_trace_ms' => (int) env('PRISM_SLOW_TRACE_MS', 2000),
     ],
 
     /*
@@ -221,16 +274,23 @@ return [
     | Request capture
     |--------------------------------------------------------------------------
     |
-    | Settings for the HTTP request capturer (US-043). "max_body" caps the byte
-    | size of a captured request body — bodies are recorded for non-GET requests
-    | only, scrubbed of any sensitive key first, then truncated to this many
-    | bytes so a large upload cannot bloat a batch. Zero keeps the whole scrubbed
-    | body with no size cap.
+    | "capture_payload" decides whether a request's body is recorded at all. It
+    | defaults to FALSE, which is the capture engine's own default and a change
+    | from earlier versions of this package: a body used to be captured for
+    | every non-GET request, scrubbed and truncated. Off, a body is captured
+    | only when the request faulted — the case worth debugging — and no ordinary
+    | request ever carries user input off the machine. Turn it on where the
+    | debugging is worth more than the exposure; the scrub list below still
+    | applies either way.
+    |
+    | There is no size cap of Prism's own any more (US-021): the capture engine
+    | decides what a body is worth recording and how much of it, and a second
+    | limit here would be a key nothing reads.
     |
     */
 
     'request' => [
-        'max_body' => (int) env('PRISM_MAX_BODY_SIZE', 65536),
+        'capture_payload' => (bool) env('PRISM_CAPTURE_REQUEST_PAYLOAD', false),
     ],
 
     /*
@@ -238,9 +298,11 @@ return [
     | Log capture
     |--------------------------------------------------------------------------
     |
-    | Settings for the log capturer (US-044). A Monolog handler is pushed onto
-    | each named channel below, so the host's own log output is mirrored to
-    | Prism while its existing destinations keep receiving everything.
+    | Settings for log capture (US-044). The capture engine registers a
+    | "nightwatch" log channel and captures nothing until that channel is in
+    | your stack, so Prism pushes its handler onto the channels named below for
+    | you — your existing destinations keep receiving everything, and there is
+    | no config/logging.php edit to remember.
     |
     | "channels" names the logging channels to capture. Leave it empty to attach
     | to the application's default channel (its "stack"), which is what most
@@ -266,9 +328,11 @@ return [
     | Settings for the database query capturer (US-045). "slow_threshold_ms" is
     | the execution time (in milliseconds) at or above which a query is marked
     | slow. A slow query is always kept — and forces its whole trace to be kept —
-    | on the server regardless of any configured sampling rate (US-031), so a
-    | slow query on an otherwise-sampled-out request is never lost. Set it to 0
-    | to disable the marker (no query is treated as slow).
+    | on the SERVER, regardless of the per-workspace sampling rules configured
+    | there (US-031). It does not survive the client-side "sample" rates above:
+    | those drop a whole execution before anything is sent, so nothing reaches
+    | the server to be rescued. Set it to 0 to disable the marker (no query is
+    | treated as slow).
     |
     */
 
@@ -278,31 +342,11 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Scheduled task capture
-    |--------------------------------------------------------------------------
-    |
-    | Settings for the scheduled-task capturer (US-049). Each run of a scheduled
-    | task — command or closure — is captured with its cron expression, exit
-    | code, duration, peak memory and captured output. "max_output" caps the
-    | byte size of that captured output so a chatty task cannot bloat a batch;
-    | zero keeps the whole output with no size cap. Output is read from the file
-    | a task streams to (via "sendOutputTo"); a task with the default /dev/null
-    | destination contributes no output.
-    |
-    */
-
-    'schedule' => [
-        'max_output' => (int) env('PRISM_MAX_OUTPUT_SIZE', 16384),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | Runtime metrics
     |--------------------------------------------------------------------------
     |
     | Point-in-time facts about the process and the queue backend, sampled on an
-    | interval and piggybacked onto an existing flush rather than sent on their
-    | own request (US-048/US-051).
+    | interval at the end of an execution (US-048/US-051).
     |
     | "system_interval" is how often (in seconds) this instance's own health —
     | CPU load, memory pressure and uptime — is sampled (US-051). It runs on
@@ -320,8 +364,15 @@ return [
     | connection of its own — and a backend it cannot read degrades to a null
     | depth rather than throwing.
     |
-    | Either sample rides the next flush, so a shorter interval never means a
-    | dedicated request.
+    | Either sample ships in a batch of its OWN, and deliberately so (US-013):
+    | the capture engine discards an execution's whole batch when the sampling
+    | rates below reject it, and a replica's health has nothing to do with
+    | whether one request was interesting. Lowering "sample.requests" therefore
+    | does not thin out the Replicas screen or the replica_cpu alert with it.
+    | The interval is what keeps that from meaning a send per execution.
+    |
+    | This is also the one signal the capture engine has no sensor for at all,
+    | which is why Prism still collects it itself.
     |
     | "replica_type" is the kind of instance this process reports as — "web" or
     | "worker". Leave it null to infer it from the process (a queue worker
@@ -345,6 +396,12 @@ return [
     | with Str::is wildcards, so one pattern can cover a family ("api/internal/*",
     | "App\Jobs\Internal\*", "prism:*"); a pattern without a "*" matches exactly.
     |
+    | The first three silence a whole EXECUTION: a request, a job's run or a
+    | command that matches contributes nothing at all — not its own row, and not
+    | the queries, cache reads, log lines or outgoing calls it made along the
+    | way. The last three silence one SIGNAL wherever it occurs, so an ignored
+    | cache key is invisible on an otherwise fully captured request.
+    |
     | Two different reasons to add something here. The mild one is noise: a
     | health check polled every second, or a cache key touched on every request,
     | costs an event each time and tells you nothing. The serious one is
@@ -362,9 +419,10 @@ return [
     |              path it arrives on, so it needs no entry here.
     |   jobs       Queued job class names (US-047), as resolved for display — for
     |              a queued broadcast that is the event class, not the framework's
-    |              wrapper.
-    |   commands   Scheduled task commands (US-049), matched on the description
-    |              if the task sets one, otherwise the command string.
+    |              wrapper. Covers the dispatch and the worker's run alike.
+    |   commands   Artisan command names — "prism:*", "reports:build". A
+    |              scheduled task runs as one of these, so silencing it here
+    |              silences it wherever it was started from.
     |   http       Outgoing HTTP destinations (US-046), matched against the host,
     |              the host and path, and the full URL without its query string —
     |              "redis.internal", "*.googleapis.com", "http://ch:8123/*" all
@@ -378,7 +436,10 @@ return [
     |              (US-042). Matched with instanceof rather than by pattern, so a
     |              subclass of an ignored throwable is ignored too. Routine
     |              control-flow throwables like a missing route or a failed
-    |              validation are not faults worth an error group.
+    |              validation are not faults worth an error group — Laravel's own
+    |              "don't report" list already covers those two, so the entries
+    |              below are a restatement and the list earns its keep for
+    |              whatever you add to it.
     |
     */
 
@@ -417,10 +478,21 @@ return [
     |--------------------------------------------------------------------------
     |
     | Keys whose values are redacted before an event leaves the process
-    | (US-040), matched case-insensitively against request input, headers, job
-    | payloads and query bindings. Extend this list with any field specific to
-    | your app that must never reach the console — the redaction happens at the
-    | source, so a scrubbed value is never transmitted or stored.
+    | (US-040), matched case-insensitively. Extend this list with any field
+    | specific to your app that must never reach the console — the redaction
+    | happens at the source, so a scrubbed value is never transmitted or stored.
+    |
+    | One list governs every signal. A key here is redacted wherever it appears:
+    | in a request's body, its headers and its query string; in an outgoing
+    | call's query string; and as the value half of a "name = value" pair
+    | anywhere Prism captures free text — a SQL statement, an artisan command
+    | line, a cache key, a mail subject, an exception message. So a secret
+    | passed as --api-key=..., written into a raw statement, or built into a
+    | cache key all lose the value and keep the shape.
+    |
+    | Not listed here because there is nothing to list: a queued job's payload
+    | is never captured at all, so a secret dispatched inside a job cannot reach
+    | the console however this list is written.
     |
     */
 

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Misakstvanu\Prism\Support;
 
 use Misakstvanu\Prism\Contracts\PrismInternal;
-use Misakstvanu\Prism\Http\Middleware\TraceRequests;
+use Misakstvanu\Prism\Http\Middleware\RejectIgnoredRequests;
 use Throwable;
 
 /**
@@ -45,6 +45,16 @@ final class Recursion
      * would itself be recorded as an outgoing request and shipped in turn.
      */
     public const MARKER_HEADER = 'X-Prism-Internal';
+
+    /** Root namespace of the package's own classes, the mark of its own work. */
+    private const NAMESPACE_PREFIX = 'Misakstvanu\\Prism\\';
+
+    /**
+     * Cache namespace the package's own bookkeeping lives in — the spool index
+     * and its segments, the metrics interval marks. Those touches are the
+     * package working, so capturing them is capturing capture.
+     */
+    public const CACHE_PREFIX = 'prism:';
 
     /** Depth of nested {@see suppress()} scopes; greater than zero means suppressed. */
     private static int $depth = 0;
@@ -121,25 +131,55 @@ final class Recursion
     public static function isInternalJob(object $job): bool
     {
         return $job instanceof PrismInternal
-            || str_starts_with($job::class, 'Misakstvanu\\Prism\\');
+            || self::isInternalClass($job::class);
     }
 
     /**
-     * Whether an exception originated inside package code, so the exception
-     * capture listener (US-042) skips it — a fault in the client must never be
-     * reported through the client (AC4). True when it is thrown during
-     * suppressed work, is a {@see PrismInternal} or package exception class, or
-     * was *thrown from* package source.
+     * Whether a class name is the package's own.
+     *
+     * The name rather than the object, because the capture engine reports some
+     * of its work as a string and nothing else: a queued-job record carries the
+     * job's display name, and by the time a job attempt is reported the object
+     * is behind a queue driver's wrapper. Both need the same answer as
+     * {@see isInternalJob()}, and one prefix written twice is one prefix that
+     * can drift.
+     */
+    public static function isInternalClass(string $class): bool
+    {
+        return str_starts_with($class, self::NAMESPACE_PREFIX);
+    }
+
+    /**
+     * Whether a cache key is one the package writes for itself.
+     *
+     * The metrics collectors are deliberately run *outside* a
+     * {@see suppress()} scope — their own guards would otherwise read as
+     * tripped — so their interval marks are ordinary cache traffic to anything
+     * watching, and the spool's index is written from a flush a long-lived
+     * worker may have left the scope of. Both are the package working, and a
+     * capture engine that recorded them would be capturing capture.
+     */
+    public static function isInternalCacheKey(string $key): bool
+    {
+        return str_starts_with($key, self::CACHE_PREFIX);
+    }
+
+    /**
+     * Whether an exception originated inside package code, so it is never
+     * reported (US-042 AC4) — a fault in the client must not travel through the
+     * client. True when it is thrown during suppressed work, is a
+     * {@see PrismInternal} or package exception class, or was *thrown from*
+     * package source.
      *
      * "Thrown from" is the exception's own origin ({@see Throwable::getFile()}),
-     * deliberately NOT any frame in its trace. The package installs a passthrough
-     * middleware ({@see TraceRequests}, US-041)
-     * that sits in the call stack of every request, so a whole-trace scan would
-     * flag every genuine application exception raised inside a request as
-     * internal and silently drop it. The origin is what identifies the package
-     * as the thrower; the package's own outbound work (flush, send) is already
-     * bracketed by {@see suppress()}, so an exception it raises is caught by the
-     * suppression check above regardless of where it surfaces.
+     * deliberately NOT any frame in its trace. The package puts middleware in
+     * the call stack of every request ({@see RejectIgnoredRequests}), so a
+     * whole-trace scan would flag every genuine application exception raised
+     * inside a request as internal and silently drop it. The origin is what
+     * identifies the package as the thrower; the package's own outbound work
+     * (flush, send) is already bracketed by {@see suppress()}, so an exception
+     * it raises is caught by the suppression check above regardless of where it
+     * surfaces.
      */
     public static function isInternalException(Throwable $e): bool
     {
@@ -147,7 +187,7 @@ final class Recursion
             return true;
         }
 
-        if ($e instanceof PrismInternal || str_starts_with($e::class, 'Misakstvanu\\Prism\\')) {
+        if ($e instanceof PrismInternal || self::isInternalClass($e::class)) {
             return true;
         }
 

@@ -6,6 +6,17 @@ use Misakstvanu\Prism\Support\Scrubber;
 use Misakstvanu\Prism\Transport\Transport;
 
 /**
+ * The redactor `prism.scrub` is expressed through (US-040), and its wiring.
+ *
+ * It is no longer a capture listener's collaborator — US-021 deleted those, and
+ * the capture engine owns every signal now — but it is still the one
+ * implementation of the rule, which `RedactRules` answers upstream's `redact*`
+ * callbacks with. So *what gets redacted where* is asserted against the real
+ * engine in `tests/Host/NightwatchRedactRulesTest.php`, and what is left here is
+ * the rule itself: which keys, how deep, and how a host extends the list.
+ */
+
+/**
  * Reconfigure the app with full credentials and re-boot so registerCapture()
  * wires the Scrubber singleton from the current `prism.scrub` config. Named
  * apart from the other test files' boot helpers so Pest — which loads every

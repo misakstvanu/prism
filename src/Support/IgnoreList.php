@@ -5,12 +5,9 @@ declare(strict_types=1);
 namespace Misakstvanu\Prism\Support;
 
 use Illuminate\Support\Str;
-use Misakstvanu\Prism\Capture\CacheCapture;
-use Misakstvanu\Prism\Capture\CaptureRequests;
-use Misakstvanu\Prism\Capture\ExceptionCapture;
-use Misakstvanu\Prism\Capture\HttpCapture;
-use Misakstvanu\Prism\Capture\JobCapture;
-use Misakstvanu\Prism\Capture\ScheduleCapture;
+use Misakstvanu\Prism\Http\Middleware\RejectIgnoredRequests;
+use Misakstvanu\Prism\Nightwatch\PrismIngest;
+use Misakstvanu\Prism\Nightwatch\RejectRules;
 
 /**
  * The one matcher behind every `prism.ignore.*` list.
@@ -27,22 +24,28 @@ use Misakstvanu\Prism\Capture\ScheduleCapture;
  * Six dimensions can be silenced, each a list of patterns in the client's
  * `prism.ignore` config block:
  *
- *   - `paths` — request URI patterns ({@see CaptureRequests})
- *   - `jobs` — queued job class names ({@see JobCapture})
- *   - `commands` — scheduled task commands ({@see ScheduleCapture})
- *   - `http` — outgoing HTTP destinations ({@see HttpCapture})
- *   - `cache` — cache keys ({@see CacheCapture})
+ *   - `paths` — request URI patterns ({@see RejectIgnoredRequests})
+ *   - `jobs` — queued job class names
+ *   - `commands` — scheduled task and artisan commands
+ *   - `http` — outgoing HTTP destinations
+ *   - `cache` — cache keys
  *   - `exceptions` — exception classes, matched by `instanceof` rather than by
  *     pattern (a subclass of an ignored throwable is ignored too), so those are
- *     handled in {@see ExceptionCapture} and not here
+ *     handled in {@see PrismIngest} and not here
+ *
+ * Since US-010 every one of them is said in the capture engine's own vocabulary
+ * by {@see RejectRules} — three of the six as `reject*` callbacks, two as a
+ * refused sampling decision and `exceptions` as a drop at Prism's ingest — but
+ * the patterns and the matching are still this class's, so a list means the
+ * same thing wherever it is consulted.
  *
  * Every dimension but `exceptions` matches with {@see Str::is}, so `*` is a
  * wildcard: `api/*`, `App\Jobs\*`, `prism:*`, `*.internal`. Matching is exact
  * when a pattern carries no wildcard.
  *
- * Both methods are static and allocate nothing beyond the match, so a capture
- * listener can consult one on a hot path without a container lookup — the same
- * stance as {@see Recursion}, {@see TraceContext} and {@see SpanStack}.
+ * Both methods are static and allocate nothing beyond the match, so a caller can
+ * consult one on a hot path without a container lookup — the same stance as
+ * {@see Recursion} and {@see TraceContext}.
  */
 final class IgnoreList
 {
@@ -92,5 +95,37 @@ final class IgnoreList
         }
 
         return false;
+    }
+
+    /**
+     * The same pattern as a PCRE, for a matcher that speaks regex rather than
+     * {@see Str::is}.
+     *
+     * `laravel/nightwatch`'s cache-key rejection is regex-first: it runs
+     * `@preg_match($pattern, $key)` and falls back to a literal string
+     * comparison only when the pattern would not compile. A raw `prism:*`
+     * compiles as nothing (no delimiters, so `preg_match` returns false) and is
+     * then compared literally against the key — so it silently matches nothing
+     * at all, which is exactly how a configured exclusion turns into a
+     * self-monitoring loop nobody sees. Converting it here means the conversion
+     * exists once, beside the rule it mirrors, rather than at each call site.
+     *
+     * The conversion is {@see Str::is}'s own: everything is quoted except `*`,
+     * which becomes `.*`. A pattern that ends in a wildcard drops the tail
+     * anchor with it, so `prism:*` becomes a prefix match — the shape
+     * upstream's own default vendor cache keys are written in — and a pattern
+     * with no wildcard is anchored at both ends and therefore matches exactly,
+     * as it does everywhere else in this class. Everything but the wildcard is
+     * quoted, so the dots and colons a cache key is full of stay literal.
+     */
+    public static function toRegex(string $pattern): string
+    {
+        $quoted = str_replace('\*', '.*', preg_quote($pattern, '#'));
+
+        if (str_ends_with($quoted, '.*')) {
+            return '#^'.substr($quoted, 0, -2).'#u';
+        }
+
+        return '#^'.$quoted.'\z#u';
     }
 }

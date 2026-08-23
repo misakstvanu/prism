@@ -60,8 +60,8 @@ function bootGuardedCapture(): void
         // MessageLogged listener is the only thing that buffers a log line —
         // otherwise the AC5/AC6 tests below would double-count every Log::info().
         'prism.capture.logs' => false,
-        // Replica health sampling (US-051) piggybacks a metric onto every flush;
-        // disabled here so it never inflates this file's exact event counts.
+        // Replica health sampling (US-051) ships a metric at the end of every
+        // execution; disabled here so it never inflates this file's exact counts.
         'prism.capture.metrics' => false,
     ]);
 

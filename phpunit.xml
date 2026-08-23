@@ -9,6 +9,12 @@
         <testsuite name="Feature">
             <directory>tests/Feature</directory>
         </testsuite>
+        <testsuite name="Host">
+            <directory>tests/Host</directory>
+        </testsuite>
+        <testsuite name="Otel">
+            <directory>tests/Otel</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

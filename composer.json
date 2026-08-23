@@ -9,10 +9,12 @@
         "telemetry"
     ],
     "license": "MIT",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "require": {
         "php": "^8.4",
-        "illuminate/support": "^12.0|^13.0"
+        "illuminate/support": "^12.0|^13.0",
+        "keepsuit/laravel-opentelemetry": "^2.2",
+        "laravel/nightwatch": "^1.0"
     },
     "require-dev": {
         "orchestra/testbench": "^10.0|^11.0",

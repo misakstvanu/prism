@@ -7,6 +7,7 @@ use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Flush\SpoolScheduler;
 use Misakstvanu\Prism\Jobs\DrainSpoolJob;
+use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\Transport\Transport;
 
 /**
@@ -45,6 +46,7 @@ function spoolFlusher(EventBuffer $buffer, Transport $transport): Flusher
         $transport,
         app(BatchSpool::class),
         app(SpoolScheduler::class),
+        app(SpanFlush::class),
     );
 }
 

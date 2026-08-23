@@ -8,6 +8,7 @@ use Illuminate\Contracts\Config\Repository;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Buffer\FlushedBatch;
 use Misakstvanu\Prism\Jobs\SendBatchJob;
+use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\Transport\Transport;
 
 /**
@@ -35,6 +36,12 @@ use Misakstvanu\Prism\Transport\Transport;
  * itself. It needs a queue worker and a cache store with atomic locks; without
  * either, {@see shouldSpool()} declines and the batch takes the normal path
  * rather than being lost.
+ *
+ * **The OpenTelemetry tracer is force-flushed first** (US-019). Tail sampling
+ * holds a trace's spans until its decision, which by default waits longer than
+ * a request lives, so anything still held when this runs would miss the batch
+ * its own execution shipped in. See {@see SpanFlush}, which is where the
+ * ordering is explained and where the "is there a span lane at all" gate lives.
  */
 final class Flusher
 {
@@ -44,6 +51,7 @@ final class Flusher
         private readonly Transport $transport,
         private readonly BatchSpool $spool,
         private readonly SpoolScheduler $scheduler,
+        private readonly SpanFlush $spans,
     ) {}
 
     /**
@@ -58,6 +66,11 @@ final class Flusher
      */
     public function flush(): void
     {
+        // BEFORE the empty check, not after it: an execution whose only
+        // telemetry is a span the tail-sampling decision is still holding would
+        // otherwise return on an empty buffer and force nothing out at all.
+        $this->spans->flush();
+
         if ($this->buffer->isEmpty()) {
             return;
         }

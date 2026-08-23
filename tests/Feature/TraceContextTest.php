@@ -7,6 +7,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
@@ -15,13 +16,14 @@ use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\TraceContext;
 use Misakstvanu\Prism\Transport\Transport;
+use OpenTelemetry\SDK\Trace\TracerProvider;
 
 /** Matches a canonical UUID, the shape a generated trace id takes. */
 const TRACE_UUID_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/';
 
 /**
  * A minimal queued job whose handler records the trace it runs under, so a test
- * can prove a dispatched job continues its originator's trace (US-041 AC4/AC5).
+ * can read the trace a dispatched job actually ran under.
  */
 class TraceRecorderJob implements ShouldQueue
 {
@@ -40,9 +42,10 @@ class TraceRecorderJob implements ShouldQueue
 
 /**
  * Reconfigure the app with full credentials and re-run boot() so
- * registerCapture() wires the trace middleware, the outgoing-HTTP propagation
- * and the queue payload hook (US-041). Uniquely named because Pest loads every
- * test file into one process.
+ * registerCapture() wires the queue and Octane listeners that re-anchor the
+ * fallback trace (US-041, reduced to those two by US-021 — a request opens no
+ * trace of Prism's own any more). Uniquely named because Pest loads every test
+ * file into one process.
  */
 function bootTracing(): void
 {
@@ -82,39 +85,46 @@ it('generates a trace id and reuses it until reset', function () {
     expect(TraceContext::traceId())->not->toBe($id);
 });
 
-it('honours a valid incoming trace id so a trace spans services', function () {
-    TraceContext::start('svc-a-trace-123');
-
-    expect(TraceContext::traceId())->toBe('svc-a-trace-123');
-});
-
-it('rejects an unusable incoming trace id and starts a fresh one', function (string $bad) {
-    TraceContext::start($bad);
-
-    expect(TraceContext::traceId())
-        ->not->toBe($bad)
-        ->toMatch(TRACE_UUID_PATTERN);
-})->with([
-    'spaces and punctuation' => 'not a valid id!',
-    'blank' => '   ',
-    'too long' => str_repeat('a', 200),
-]);
-
-it('starts a trace from the incoming header at the front of the request', function () {
+/*
+ * US-020 — propagation is W3C `traceparent`'s job now, and the bespoke
+ * `X-Prism-Trace-Id` header is gone from both the incoming and the outgoing
+ * path.
+ *
+ * The cases below are the *removal*, asserted from the side a host can see: an
+ * outgoing call carries no Prism header, a dispatched job's payload carries no
+ * Prism key, and an incoming Prism header is not honoured (which is the one a
+ * reader is most likely to mistake for a bug rather than a decision — it used to
+ * work). What replaced them cannot be shown here at all: the span lane is not
+ * registered in this suite, so `traceparent` is asserted end to end in
+ * `tests/Otel/W3CPropagationTest.php`, where all three providers are.
+ */
+it('ignores the removed Prism trace header on an incoming request', function () {
     bootTracing();
 
     Route::get('/trace-probe', fn () => TraceContext::traceId());
 
-    $response = $this->withHeaders([TraceContext::HEADER => 'upstream-trace-9'])
-        ->get('/trace-probe');
+    $content = $this->withHeaders(['X-Prism-Trace-Id' => 'upstream-trace-9'])
+        ->get('/trace-probe')
+        ->assertOk()
+        ->getContent();
 
-    $response->assertOk();
-    expect($response->getContent())->toBe('upstream-trace-9');
+    // A header only a Prism client understood, and nothing reads it any more —
+    // an upstream service that still sends it gets a fresh trace, exactly as if
+    // it had sent nothing.
+    expect($content)->not->toBe('upstream-trace-9')
+        ->toMatch(TRACE_UUID_PATTERN);
 });
 
-it('starts a fresh trace for a request with no incoming header', function () {
+it('still answers a request with a usable trace, with nothing opening one', function () {
     bootTracing();
 
+    // US-021 deleted the middleware that used to open a trace at the front of
+    // every request: the span lane opens the only trace there is now, and this
+    // suite does not register it. So what is asserted is the last of the three
+    // answers — the id generated lazily on first read, which is what keeps a
+    // host with the OpenTelemetry SDK switched off from leaving a request's
+    // signals unkeyed. A plain FPM process is fresh per request, which is why
+    // dropping the eager start costs that host nothing.
     Route::get('/trace-probe', fn () => TraceContext::traceId());
 
     $content = $this->get('/trace-probe')->assertOk()->getContent();
@@ -122,72 +132,121 @@ it('starts a fresh trace for a request with no incoming header', function () {
     expect($content)->toMatch(TRACE_UUID_PATTERN);
 });
 
-it('propagates the current trace id onto outgoing HTTP calls', function () {
+it('stamps no Prism trace header onto an outgoing HTTP call', function () {
     bootTracing();
     Http::fake();
 
-    TraceContext::start('outgoing-trace-5');
+    TraceContext::start();
 
     Http::get('https://downstream.test/api/resource');
 
-    Http::assertSent(fn ($request) => $request->hasHeader(TraceContext::HEADER)
-        && $request->header(TraceContext::HEADER) === ['outgoing-trace-5']);
+    Http::assertSent(fn ($request) => ! $request->hasHeader('X-Prism-Trace-Id'));
 });
 
-it('does not overwrite a trace header the caller set explicitly', function () {
-    bootTracing();
-    Http::fake();
-
-    TraceContext::start('ambient-trace');
-
-    Http::withHeaders([TraceContext::HEADER => 'caller-set-trace'])
-        ->get('https://downstream.test/x');
-
-    Http::assertSent(fn ($request) => $request->header(TraceContext::HEADER) === ['caller-set-trace']);
-});
-
-it('stamps the originating trace onto a dispatched job and continues it when the job runs', function () {
+it('stamps no Prism trace key onto a dispatched job payload', function () {
     bootTracing();
     config(['queue.default' => 'sync']);
 
-    TraceContext::start('request-trace-42');
+    TraceContext::start();
 
-    $payloadTrace = null;
-    Event::listen(JobProcessing::class, function (JobProcessing $event) use (&$payloadTrace) {
-        $payloadTrace = $event->job->payload()[TraceContext::JOB_PAYLOAD_KEY] ?? null;
+    $payload = null;
+    Event::listen(JobProcessing::class, function (JobProcessing $event) use (&$payload) {
+        $payload = $event->job->payload();
     });
 
     TraceRecorderJob::dispatch();
 
-    // AC4: the dispatch stamped the request's trace onto the job payload, and
-    // the job ran under that same trace.
-    expect($payloadTrace)->toBe('request-trace-42')
-        ->and(TraceRecorderJob::$captured)->toBe('request-trace-42');
+    expect($payload)->toBeArray()
+        ->and($payload)->not->toHaveKey('prism_trace_id');
 });
 
-it('continues a payload trace across a worker boundary regardless of the ambient trace', function () {
+it('anchors a fresh trace for each job the worker picks up', function () {
     bootTracing();
 
-    // The worker's current trace is unrelated to the job that just arrived.
-    TraceContext::start('worker-ambient-trace');
-
-    $job = Mockery::mock(Job::class);
-    $job->shouldReceive('payload')->andReturn([TraceContext::JOB_PAYLOAD_KEY => 'origin-trace-77']);
-
-    event(new JobProcessing('redis', $job));
-
-    // AC5: the job runs under the trace stamped by whoever queued it, not the
-    // worker's ambient trace.
-    expect(TraceContext::traceId())->toBe('origin-trace-77');
-});
-
-it('starts a fresh trace for a job queued without a trace id', function () {
-    bootTracing();
-
+    // A worker handles one job after another in one long-lived process, so the
+    // trace a job runs under must never be the previous job's. With no span
+    // lane there is nothing to continue from the payload, so what is asserted
+    // is the fallback: a fresh id per job.
     $job = Mockery::mock(Job::class);
     $job->shouldReceive('payload')->andReturn([]);
+    $job->shouldReceive('resolveName')->andReturn('App\\Jobs\\PriceOrder');
 
     event(new JobProcessing('redis', $job));
+    $first = TraceContext::traceId();
 
-    expect(TraceContext::traceId())->toMatch(TRACE_UUID_PATTERN);
+    event(new JobProcessing('redis', $job));
+    $second = TraceContext::traceId();
+
+    expect($first)->toMatch(TRACE_UUID_PATTERN)
+        ->and($second)->toMatch(TRACE_UUID_PATTERN)
+        ->and($second)->not->toBe($first);
 });
+
+/*
+ * US-017 — OpenTelemetry is the source of truth, and this class is where the
+ * two engines are made to agree.
+ *
+ * The order is: the active span, then the trace published into Laravel's
+ * context, then an id of this class's own. The middle answer is the one that is
+ * easy to leave out and the one that matters most — the capture engine writes
+ * its `request` record from `terminate()`, after upstream's middleware has
+ * ended the request span, and Laravel carries the context across a queue
+ * boundary where no span of ours exists at all.
+ */
+it('prefers the OpenTelemetry trace over an id of its own', function () {
+    TraceContext::start();
+
+    $tracer = TracerProvider::builder()->build()->getTracer('prism-trace-context-test');
+    $span = $tracer->spanBuilder('GET /orders')->startSpan();
+    $scope = $span->activate();
+
+    expect(TraceContext::traceId())->toBe($span->getContext()->getTraceId())
+        ->and(TraceContext::otelTraceId())->toBe($span->getContext()->getTraceId());
+
+    $scope->detach();
+    $span->end();
+});
+
+it('still answers the trace after the span that opened it has ended', function () {
+    $tracer = TracerProvider::builder()->build()->getTracer('prism-trace-context-test');
+    $span = $tracer->spanBuilder('GET /orders')->startSpan();
+    $scope = $span->activate();
+
+    $traceId = $span->getContext()->getTraceId();
+
+    // What the span processor does from `onStart`.
+    TraceContext::adopt($traceId);
+
+    $scope->detach();
+    $span->end();
+
+    // Nothing is active any more, which is exactly the state the engine writes
+    // its `request` record in.
+    expect(TraceContext::otelTraceId())->toBe($traceId)
+        ->and(Context::get(TraceContext::CONTEXT_KEY))->toBe($traceId);
+});
+
+it('answers nothing at all when OpenTelemetry has said nothing', function () {
+    // A host with the SDK switched off. Nothing to re-key a record onto, so the
+    // capture engine's own id stands and nothing is ever left unkeyed.
+    expect(TraceContext::otelTraceId())->toBeNull()
+        ->and(TraceContext::traceId())->toMatch(TRACE_UUID_PATTERN);
+});
+
+it('refuses to publish or read anything that is not a trace id', function (string $bad) {
+    TraceContext::adopt($bad);
+
+    expect(Context::get(TraceContext::CONTEXT_KEY))->toBeNull();
+
+    // And a value the host (or a tampered queue payload) put there directly is
+    // validated on the way out too, rather than becoming a row's key.
+    Context::add(TraceContext::CONTEXT_KEY, $bad);
+
+    expect(TraceContext::otelTraceId())->toBeNull();
+})->with([
+    'the engine own uuid' => '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
+    'the reserved invalid id' => '00000000000000000000000000000000',
+    'upper case hex' => 'A1B2C3D4E5F60718293A4B5C6D7E8F90',
+    'too short' => 'a1b2c3d4',
+    'blank' => '',
+]);
