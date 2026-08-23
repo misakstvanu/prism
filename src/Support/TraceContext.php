@@ -18,11 +18,8 @@ use Throwable;
  * console can correlate them into a single trace. This is the one place that
  * identifier is read from.
  *
- * **This class no longer propagates anything.** Until US-020 it carried a trace
- * across every boundary itself, over a bespoke `X-Prism-Trace-Id` header on an
- * incoming request and an outgoing HTTP call, and a `prism_trace_id` key in a
- * queued job's payload. All three are gone, and what replaced them is the W3C
- * standard the span lane already speaks:
+ * **This class propagates nothing.** Carrying a trace across a boundary is the
+ * span lane's job, over the W3C standard it already speaks (US-020):
  *
  *   - an **incoming `traceparent`** continues the upstream trace, because
  *     keepsuit's HTTP server middleware makes the request span that context's
@@ -32,11 +29,9 @@ use Throwable;
  *   - a **dispatched job** carries `traceparent` in its payload and runs under a
  *     CONSUMER span parented to the PRODUCER span that queued it.
  *
- * That is a straight upgrade rather than a rename: `X-Prism-Trace-Id` was a
- * header only a Prism client understood, so a monitored Laravel app calling a Go
- * service produced two traces. `traceparent` is spoken by every APM and every
- * language SDK, so it produces one. See the package `UPGRADING.md`, which
- * records the removal for anyone who was stamping the old header by hand.
+ * A bespoke header would be understood only by a Prism client, so a monitored
+ * Laravel app calling a Go service would produce two traces. `traceparent` is
+ * spoken by every APM and every language SDK, so it produces one.
  *
  * Every method is static and side-effect free (beyond the stored id) so a
  * listener can read the current trace on a hot path — the same stance as

@@ -57,17 +57,17 @@ use OpenTelemetry\SDK\Trace\SpanProcessorInterface;
  * is the safer one and is asserted anyway: `@api` is a promise about intent,
  * not a guarantee of signature.
  *
- * **Every failure in this file names `packages/prism/UPGRADING.md`.** A red
- * build here is not a bug in Prism; it is an upstream release that moved
- * something Prism reads, and the fix is a translation plus an entry in that
- * file saying what moved.
+ * **A red build here is not a bug in Prism**; it is an upstream release that
+ * moved something Prism reads. Each failure names the exact method, property,
+ * record field or version that moved: translate it where Prism reads it, then
+ * update the pin below to the new shape.
  */
 
-/** Where the answer to a failure in this file lives. */
+/** What a failure in this file means, said the same way every time. */
 function upstreamContractGuide(string $what): string
 {
     return $what.' — an upstream release has moved something Prism reads. '
-        .'Translate it and record the change in packages/prism/UPGRADING.md.';
+        .'Translate it where Prism reads it, then update the pin in this file.';
 }
 
 /**

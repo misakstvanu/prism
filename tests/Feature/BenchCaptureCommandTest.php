@@ -4,17 +4,16 @@ use Illuminate\Contracts\Console\Kernel;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Console\Bench\BenchResult;
 use Misakstvanu\Prism\Console\Bench\BenchTransport;
-use Misakstvanu\Prism\Console\Bench\LegacyCapturePath;
 use Misakstvanu\Prism\Console\BenchCaptureCommand;
 
 /**
  * Read a private constant off the benchmark command (US-023).
  *
- * The four configurations are declared as data, and what makes each of them the
- * thing it claims to be is the environment beside it — a wrong variable there
- * produces a configuration that boots fine, measures something real and answers
- * the wrong question, which is the one failure a benchmark cannot survive. So
- * the table is asserted directly rather than through a run.
+ * The three configurations are declared as data, and what makes each of them
+ * the thing it claims to be is the environment beside it — a wrong variable
+ * there produces a configuration that boots fine, measures something real and
+ * answers the wrong question, which is the one failure a benchmark cannot
+ * survive. So the table is asserted directly rather than through a run.
  */
 function benchConstant(string $name): mixed
 {
@@ -25,12 +24,12 @@ it('registers the benchmark command whatever the install looks like', function (
     config(['prism.enabled' => false, 'prism.token' => null]);
 
     expect(array_key_exists('prism:bench:capture', $this->app[Kernel::class]->all()))
-        ->toBeTrue('the benchmark has to be runnable on a disabled install — three of its four configurations are one');
+        ->toBeTrue('the benchmark has to be runnable on a disabled install — its baseline configuration is one');
 });
 
-describe('the four configurations', function () {
-    it('declares exactly the four the story compares', function () {
-        expect(array_keys(benchConstant('PROFILES')))->toBe(['off', 'legacy', 'nightwatch', 'otel']);
+describe('the three configurations', function () {
+    it('declares exactly the three the report compares', function () {
+        expect(array_keys(benchConstant('PROFILES')))->toBe(['off', 'nightwatch', 'otel']);
     });
 
     it('switches the capture engine off at its own variable for the baseline', function () {
@@ -38,13 +37,11 @@ describe('the four configurations', function () {
         // registers first and snapshots its config while doing so — so
         // PRISM_ENABLED=false alone leaves 38 hooks registered and a paused
         // Core. Only upstream's own variable produces a true zero.
-        foreach (['off', 'legacy'] as $profile) {
-            expect(benchConstant('PROFILES')[$profile]['env'])->toBe([
-                'PRISM_ENABLED' => 'false',
-                'NIGHTWATCH_ENABLED' => 'false',
-                'PRISM_OTEL_ENABLED' => 'false',
-            ]);
-        }
+        expect(benchConstant('PROFILES')['off']['env'])->toBe([
+            'PRISM_ENABLED' => 'false',
+            'NIGHTWATCH_ENABLED' => 'false',
+            'PRISM_OTEL_ENABLED' => 'false',
+        ]);
     });
 
     it('separates the two engine configurations by the span lane alone', function () {
@@ -55,12 +52,6 @@ describe('the four configurations', function () {
             expect(benchConstant('PROFILES')['nightwatch']['env'][$variable])
                 ->toBe(benchConstant('PROFILES')['otel']['env'][$variable], "{$variable} must not differ between the two engine configurations");
         }
-    });
-
-    it('reconstructs the old client for exactly one configuration', function () {
-        $legacy = array_keys(array_filter(benchConstant('PROFILES'), static fn (array $p): bool => $p['legacy']));
-
-        expect($legacy)->toBe(['legacy']);
     });
 
     it('forces the request shape, a fixed sampling rate and an in-process cache on every child', function () {
@@ -107,17 +98,17 @@ describe('a measurement crossing the process boundary', function () {
     });
 
     it('reads a malformed answer back as a skipped row, never as a zero', function () {
-        $result = BenchResult::fromArray(['profile' => 'legacy']);
+        $result = BenchResult::fromArray(['profile' => 'otel']);
 
         expect($result->measured)->toBeFalse();
         expect($result->meanUs)->toBe(0.0);
     });
 
     it('keeps a skipped configuration apart from one that measured nothing', function () {
-        $skipped = BenchResult::skipped('legacy', 'old client (pre-2.0)', 'no git');
+        $skipped = BenchResult::skipped('otel', 'Nightwatch + OTel spans', 'the child process produced no measurement');
 
         expect($skipped->measured)->toBeFalse();
-        expect($skipped->skipReason)->toBe('no git');
+        expect($skipped->skipReason)->toBe('the child process produced no measurement');
     });
 });
 
@@ -146,46 +137,6 @@ describe('the transport the benchmark ships into', function () {
         $transport->send(['v' => 1]);
 
         expect($transport->events())->toBe(0);
-    });
-});
-
-describe('the old client', function () {
-    it('names the commit that deleted it, so the baseline cannot move', function () {
-        // A branch-relative expression would name a different tree after every
-        // commit, and a baseline that quietly moves is worse than none.
-        expect(LegacyCapturePath::REF)->toMatch('/^[0-9a-f]{40}\^$/');
-    });
-
-    it('prints an export command naming both halves of the old capture path', function () {
-        $command = LegacyCapturePath::exportCommand('/tmp/legacy', LegacyCapturePath::REF);
-
-        expect($command)->toContain('packages/prism/src/Capture');
-        // The span stack went with the listeners and is what they push onto —
-        // exporting the directory alone produces a fatal on the first request.
-        expect($command)->toContain('packages/prism/src/Support/SpanStack.php');
-        expect($command)->toContain(LegacyCapturePath::REF);
-    });
-
-    it('refuses to invent sources when there is no repository to export from', function () {
-        $target = sys_get_temp_dir().'/prism-bench-missing-'.bin2hex(random_bytes(4));
-
-        [$directory, $problem] = LegacyCapturePath::materialise(sys_get_temp_dir(), $target, LegacyCapturePath::REF);
-
-        expect($directory)->toBeNull();
-        expect($problem)->toContain('not a git repository');
-    });
-
-    it('uses an already-populated directory as-is', function () {
-        $target = sys_get_temp_dir().'/prism-bench-'.bin2hex(random_bytes(4));
-        mkdir($target.'/Capture', 0o755, recursive: true);
-
-        [$directory, $problem] = LegacyCapturePath::materialise('/nonexistent', $target, LegacyCapturePath::REF);
-
-        expect($directory)->toBe($target);
-        expect($problem)->toBeNull();
-
-        rmdir($target.'/Capture');
-        rmdir($target);
     });
 });
 

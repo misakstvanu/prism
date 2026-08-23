@@ -40,8 +40,7 @@ use Misakstvanu\Prism\Support\Recursion;
  *     record inside one. `Core::dontSample()` is the equivalent: at
  *     `finishExecution()` the whole buffer is discarded instead of shipped, so
  *     not only the request record but every query, cache event and log line it
- *     produced goes with it. That is strictly more than the old client dropped,
- *     and it is what an ignore list is asking for.
+ *     produced goes with it, which is what an ignore list is asking for.
  *   - **Dropped at the seam** (`exceptions`). Nightwatch has no reject callback
  *     for an exception, so the earliest place Prism owns is
  *     {@see PrismIngest::write()}. The record is built either way; what this
@@ -132,9 +131,8 @@ final class RejectRules
      * Whether an outgoing call's destination is on `prism.ignore.http`.
      *
      * The destination is offered three ways — host, host and path, and the full
-     * URL without its query string — exactly as the old client offered it, so a
-     * host that already wrote `clickhouse`, `clickhouse/*` or
-     * `http://clickhouse:8123/*` keeps the answer it had. The query string is
+     * URL without its query string — so `clickhouse`, `clickhouse/*` and
+     * `http://clickhouse:8123/*` all silence the same call. The query string is
      * excluded because it varies per call and may carry a credential.
      */
     public function rejectsOutgoingRequest(OutgoingRequest $record): bool

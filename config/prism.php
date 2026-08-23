@@ -33,9 +33,9 @@ return [
     | disabled Prism leaves laravel/nightwatch dormant too rather than letting
     | a transitive dependency keep capturing on its own account.
     |
-    | Which signals are captured, and at what rate, is Nightwatch's own
-    | vocabulary now (its sampling and filtering blocks) — this package no
-    | longer declares "capture" or "sample_rates" toggles of its own.
+    | Which signals are captured, and at what rate, is the capture engine's own
+    | vocabulary (its sampling and filtering blocks) — this package declares no
+    | per-signal toggles of its own.
     |
     */
 
@@ -275,17 +275,15 @@ return [
     |--------------------------------------------------------------------------
     |
     | "capture_payload" decides whether a request's body is recorded at all. It
-    | defaults to FALSE, which is the capture engine's own default and a change
-    | from earlier versions of this package: a body used to be captured for
-    | every non-GET request, scrubbed and truncated. Off, a body is captured
-    | only when the request faulted — the case worth debugging — and no ordinary
-    | request ever carries user input off the machine. Turn it on where the
-    | debugging is worth more than the exposure; the scrub list below still
-    | applies either way.
+    | defaults to FALSE, which is the capture engine's own default: off, a body
+    | is captured only when the request faulted — the case worth debugging — and
+    | no ordinary request ever carries user input off the machine. Turn it on
+    | where the debugging is worth more than the exposure; the scrub list below
+    | still applies either way.
     |
-    | There is no size cap of Prism's own any more (US-021): the capture engine
-    | decides what a body is worth recording and how much of it, and a second
-    | limit here would be a key nothing reads.
+    | There is no size cap of Prism's own: the capture engine decides what a
+    | body is worth recording and how much of it, and a second limit here would
+    | be a key nothing reads.
     |
     */
 

@@ -17,7 +17,6 @@ use Laravel\Nightwatch\State\RequestState;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Console\Bench\BenchResult;
 use Misakstvanu\Prism\Console\Bench\BenchTransport;
-use Misakstvanu\Prism\Console\Bench\LegacyCapturePath;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
 use Misakstvanu\Prism\Nightwatch\PrismIngest;
 use Misakstvanu\Prism\Otel\SpanLane;
@@ -30,17 +29,14 @@ use Symfony\Component\Process\Process;
 use Throwable;
 
 /**
- * Times the host's request lifecycle under four capture configurations, so the
- * cost of replacing the capture engine is measured rather than assumed
- * (US-023).
+ * Times the host's request lifecycle under three capture configurations, so
+ * what capture costs a request is measured rather than assumed (US-023).
  *
- * The four configurations are the four answers worth having:
+ * The three configurations are the three answers worth having:
  *
  *   - **off** — nothing captures. Every other figure is quoted as the cost
  *     *added* on top of this one, so it is the only row that is not itself
  *     interesting.
- *   - **legacy** — the client as it was before the epic, materialised out of
- *     git ({@see LegacyCapturePath}). This is the number the change has to beat.
  *   - **nightwatch** — the capture engine alone, feeding Prism's buffer.
  *   - **otel** — the engine plus the OpenTelemetry span lane, i.e. what a
  *     default install actually runs.
@@ -48,8 +44,8 @@ use Throwable;
  * **Each configuration is a separate process, and that is not an optimisation.**
  * Which engines listen is decided during `register()` — hooks cannot be
  * un-registered, and the ingest swap, the reject callbacks and the span
- * processor are all installed before any command runs. Four configurations in
- * one process would therefore be four names for one configuration. So the
+ * processor are all installed before any command runs. Three configurations in
+ * one process would therefore be three names for one configuration. So the
  * command spawns itself once per configuration with the environment that
  * produces it (`--profile=`), parses the one JSON line each child prints, and
  * does the comparing here.
@@ -65,10 +61,13 @@ use Throwable;
  * first request and wave every later one through, and the benchmark would
  * measure capture happening once.
  *
- * **The verdict is a gate, not a note.** A configuration that adds more
- * wall-clock per request than the old client exits non-zero and says so: the
- * point of the exercise was that the new path is not more expensive, and a
- * regression recorded in a table nobody blocks on is a regression that ships.
+ * **The one verdict that is a gate** is the OTLP check: a protobuf class loaded
+ * anywhere in a child proves a span left the process as OTLP, which is the
+ * claim "nothing is exported, there is no collector to run" said out loud. The
+ * cost figures are reported rather than gated — what one captured operation
+ * costs is a property of the workload, so the per-signal attribution is the
+ * transferable number and a threshold on the headline would only ever measure
+ * this box.
  */
 class BenchCaptureCommand extends Command
 {
@@ -80,15 +79,12 @@ class BenchCaptureCommand extends Command
         {--queries=8 : Database queries the benchmarked request runs}
         {--cache=8 : Cache reads and writes the benchmarked request performs}
         {--logs=1 : Log lines the benchmarked request writes}
-        {--profiles= : Comma-separated subset of off,legacy,nightwatch,otel}
-        {--tolerance=0 : Percent by which a configuration may exceed the old client before it fails}
-        {--legacy-ref= : The git ref the old client is exported from}
-        {--legacy-source= : A directory already holding the old client sources}
+        {--profiles= : Comma-separated subset of off,nightwatch,otel}
         {--markdown : Print the report as a markdown table, ready for the README}
         {--profile= : INTERNAL — measure one configuration in this process and print its JSON}';
 
     /** @var string */
-    protected $description = 'Benchmark the per-request cost of the capture path against the old client.';
+    protected $description = 'Benchmark the per-request cost of the capture path.';
 
     /**
      * The configurations, and the environment each is produced by.
@@ -102,33 +98,25 @@ class BenchCaptureCommand extends Command
      * requests, and under an artisan command the honest answer is no, which
      * would wire the console sensors and leave the request path untouched.
      *
-     * @var array<string, array{label: string, env: array<string, string>, legacy: bool}>
+     * @var array<string, array{label: string, env: array<string, string>}>
      */
     private const PROFILES = [
         'off' => [
             'label' => 'capture off',
             'env' => ['PRISM_ENABLED' => 'false', 'NIGHTWATCH_ENABLED' => 'false', 'PRISM_OTEL_ENABLED' => 'false'],
-            'legacy' => false,
-        ],
-        'legacy' => [
-            'label' => 'old client (pre-2.0)',
-            'env' => ['PRISM_ENABLED' => 'false', 'NIGHTWATCH_ENABLED' => 'false', 'PRISM_OTEL_ENABLED' => 'false'],
-            'legacy' => true,
         ],
         'nightwatch' => [
             'label' => 'Nightwatch only',
             'env' => ['PRISM_ENABLED' => 'true', 'NIGHTWATCH_ENABLED' => 'true', 'PRISM_OTEL_ENABLED' => 'false'],
-            'legacy' => false,
         ],
         'otel' => [
             'label' => 'Nightwatch + OTel spans',
             'env' => ['PRISM_ENABLED' => 'true', 'NIGHTWATCH_ENABLED' => 'true', 'PRISM_OTEL_ENABLED' => 'true'],
-            'legacy' => false,
         ],
     ];
 
     /**
-     * Environment every child gets whatever its configuration, so the four are
+     * Environment every child gets whatever its configuration, so the three are
      * compared on one delivery strategy and one sampling rate. A sampled-out
      * execution is discarded whole, so leaving the rate to the host's `.env`
      * would let one configuration measure capture and another measure the
@@ -211,8 +199,6 @@ class BenchCaptureCommand extends Command
             return self::FAILURE;
         }
 
-        [$legacyDirectory, $legacyProblem] = $this->resolveLegacySources($requested);
-
         $this->newLine();
         $this->line('<options=bold>Prism capture benchmark</>');
         $this->line(sprintf(
@@ -231,9 +217,9 @@ class BenchCaptureCommand extends Command
         // load moves the same measurement by 40% between two runs a second
         // apart, so a sweep that finished one configuration before starting the
         // next would attribute whatever the machine did in between to whichever
-        // configuration happened to be running — and the gate would flap on
-        // ambient load rather than on the code under test. Interleaving spreads
-        // the drift across all four; taking the median round then throws away
+        // configuration happened to be running — and the report would describe
+        // ambient load rather than the code under test. Interleaving spreads
+        // the drift across all three; taking the median round then throws away
         // the excursions rather than averaging them in.
         for ($round = 0; $round < $rounds; $round++) {
             if ($rounds > 1) {
@@ -241,13 +227,7 @@ class BenchCaptureCommand extends Command
             }
 
             foreach ($requested as $name) {
-                if (self::PROFILES[$name]['legacy'] && $legacyDirectory === null) {
-                    $rows[$name][] = BenchResult::skipped($name, self::PROFILES[$name]['label'], $legacyProblem ?? 'sources unavailable');
-
-                    continue;
-                }
-
-                $rows[$name][] = $this->runChild($name, $artisan, $legacyDirectory);
+                $rows[$name][] = $this->runChild($name, $artisan);
             }
         }
 
@@ -262,11 +242,11 @@ class BenchCaptureCommand extends Command
      * Run one configuration in its own process and parse the result back.
      *
      * The child's whole stdout is kept when it fails: a configuration that
-     * cannot even boot is a real finding (a missing extension, a fatal in the
-     * reconstructed old client), and swallowing the output would turn it into
-     * an unexplained blank row.
+     * cannot even boot is a real finding (a missing extension, a fatal on the
+     * capture path), and swallowing the output would turn it into an
+     * unexplained blank row.
      */
-    private function runChild(string $name, string $artisan, ?string $legacyDirectory): BenchResult
+    private function runChild(string $name, string $artisan): BenchResult
     {
         $profile = self::PROFILES[$name];
 
@@ -279,10 +259,6 @@ class BenchCaptureCommand extends Command
             '--cache='.$this->intOption('cache'),
             '--logs='.$this->intOption('logs'),
         ];
-
-        if ($legacyDirectory !== null) {
-            $arguments[] = '--legacy-source='.$legacyDirectory;
-        }
 
         $process = new Process(
             $arguments,
@@ -373,47 +349,6 @@ class BenchCaptureCommand extends Command
         }
 
         return null;
-    }
-
-    /**
-     * Where the old client's sources are, or why they are not available.
-     *
-     * @param  list<string>  $requested
-     * @return array{0: string|null, 1: string|null}
-     */
-    private function resolveLegacySources(array $requested): array
-    {
-        $wanted = array_filter($requested, static fn (string $name): bool => self::PROFILES[$name]['legacy']);
-
-        if ($wanted === []) {
-            return [null, null];
-        }
-
-        $explicit = $this->option('legacy-source');
-
-        if (is_string($explicit) && $explicit !== '') {
-            return is_dir($explicit.'/Capture')
-                ? [$explicit, null]
-                : [null, "{$explicit} does not hold the old client's sources"];
-        }
-
-        $ref = $this->option('legacy-ref');
-        $ref = is_string($ref) && $ref !== '' ? $ref : LegacyCapturePath::REF;
-        $target = storage_path('app/prism-bench/legacy');
-
-        [$directory, $problem] = LegacyCapturePath::materialise(base_path(), $target, $ref);
-
-        if ($directory !== null) {
-            return [$directory, null];
-        }
-
-        $this->newLine();
-        $this->components->warn("The old client could not be exported from git ({$problem}).");
-        $this->line('  Export it once from a shell that has git, then run this again:');
-        $this->line('    '.LegacyCapturePath::exportCommand($target, $ref));
-        $this->newLine();
-
-        return [null, $problem];
     }
 
     /** @return list<string> */
@@ -531,14 +466,15 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * The gate (AC4). Two things fail it, and neither is a matter of degree:
-     * a configuration that costs the host more wall-clock per request than the
-     * old client did, and any sign that a span left the process as OTLP.
+     * The gate (AC4): any sign that a span left the process as OTLP.
      *
-     * A requested-but-unmeasurable old client fails too. The comparison is the
-     * whole point of the command, and reporting three numbers with nothing to
-     * compare them against, exit code zero, is precisely how a regression gets
-     * recorded as a note.
+     * That is the one claim of the install that a number cannot express and a
+     * reader cannot check — "nothing is exported, so there is no collector to
+     * run" — so it is the one thing failing here. The cost figures beside it
+     * are reported rather than thresholded: what a captured operation costs
+     * depends on the workload, so the per-signal attribution is the number
+     * worth carrying and a limit on the headline would only ever describe the
+     * box that ran it.
      *
      * @param  array<string, BenchResult>  $results
      */
@@ -552,43 +488,8 @@ class BenchCaptureCommand extends Command
             }
         }
 
-        $legacy = $results['legacy'] ?? null;
-        $baseline = $results['off'] ?? null;
-
-        if ($legacy !== null && ! $legacy->measured) {
-            $failures[] = 'The old client could not be measured, so the regression gate did not run. '
-                .'Export its sources (see above), or ask for the other configurations explicitly with --profiles.';
-        }
-
-        if ($legacy?->measured && $baseline?->measured) {
-            $tolerance = 1 + max(0.0, (float) $this->option('tolerance')) / 100;
-            $legacyAdded = $legacy->meanUs - $baseline->meanUs;
-
-            foreach ($results as $name => $result) {
-                if (! $result->measured || in_array($name, ['off', 'legacy'], true)) {
-                    continue;
-                }
-
-                $added = $result->meanUs - $baseline->meanUs;
-
-                if ($added > $legacyAdded * $tolerance) {
-                    $failures[] = sprintf(
-                        '%s adds %s per request against the old client\'s %s — a regression, not a note. '
-                        .'Attribute it before acting: re-run with --queries/--cache/--logs varied one at a '
-                        .'time, which is what says whether the cost is fixed per request or per signal, and '
-                        .'which signal. See "Capture cost" in packages/prism/README.md.',
-                        $result->label,
-                        $this->formatMicroseconds($added, signed: true),
-                        $this->formatMicroseconds($legacyAdded, signed: true),
-                    );
-                }
-            }
-        }
-
         if ($failures === []) {
-            $this->components->info($legacy?->measured && $baseline?->measured
-                ? 'The capture path is no more expensive per request than the old client.'
-                : 'No configuration failed, but the old client was not among those measured — nothing was compared.');
+            $this->components->info('No span left the process as OTLP.');
 
             return self::SUCCESS;
         }
@@ -637,10 +538,6 @@ class BenchCaptureCommand extends Command
 
         if ($application->bound(PrismServiceProvider::ACTIVE)) {
             $application->instance(Transport::class, $transport);
-        }
-
-        if (self::PROFILES[$profile]['legacy']) {
-            $this->installLegacy($transport);
         }
 
         $this->prepareWorkload();
@@ -731,21 +628,6 @@ class BenchCaptureCommand extends Command
             bufferCapacity: $buffer?->capacity() ?? 0,
             protobufTouched: $this->protobufTouched(),
         );
-    }
-
-    /**
-     * Bring the pre-2.0 client back and wire it up.
-     */
-    private function installLegacy(BenchTransport $transport): void
-    {
-        $directory = $this->option('legacy-source');
-
-        if (! is_string($directory) || ! is_dir($directory.'/Capture')) {
-            throw new RuntimeException('the old client\'s sources were not supplied — pass --legacy-source');
-        }
-
-        LegacyCapturePath::autoload($directory);
-        LegacyCapturePath::install($this->laravel, $transport);
     }
 
     /**
@@ -843,7 +725,6 @@ class BenchCaptureCommand extends Command
             'nightwatch_enabled' => $core instanceof Core && $core->enabled() && ! $core->paused(),
             'prism_ingest' => $core instanceof Core && $core->ingest instanceof PrismIngest,
             'span_processor' => $application->bound(SpanLane::class) && $application->make(SpanLane::class)->registered(),
-            'legacy_capture' => class_exists('Misakstvanu\\Prism\\Capture\\CaptureRequests', autoload: false),
         ];
     }
 

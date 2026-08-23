@@ -135,12 +135,11 @@ it('reports the token as present without printing it', function () {
 });
 
 it('reports no per-domain capture toggles, because there are none to honour', function () {
-    // US-001 moved the "which signals" vocabulary to the capture engine and
-    // dropped the `capture` block; US-021 deleted the listeners the block's
-    // remaining entries would have gated. A host that published the pre-2.0 file
-    // still HAS the block, which is exactly why this section had to go rather
-    // than stay: printing "requests ... enabled" off a key nothing reads is a
-    // report that lies to the one operator who would consult it.
+    // Which signals are captured is the capture engine's vocabulary (US-001),
+    // and US-021 deleted the listeners a `prism.capture` block would have
+    // gated — so the command prints no such section even when a host has
+    // written the keys anyway. Printing "requests ... enabled" off a key
+    // nothing reads is a report that lies to the one operator consulting it.
     configureCheck(['prism.capture' => ['requests' => true, 'queries' => false]]);
     Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
 

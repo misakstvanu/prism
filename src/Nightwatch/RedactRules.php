@@ -20,14 +20,13 @@ use Symfony\Component\HttpFoundation\HeaderBag;
 /**
  * `prism.scrub` said in the capture engine's vocabulary (US-011).
  *
- * A host still writes one list of sensitive field names under `prism.scrub`,
- * and {@see Scrubber} is still what decides whether a name is one of them. What
- * changed is where the redaction happens: the old client scrubbed the
- * structures its own listeners had collected, and there are no such listeners
- * left. `laravel/nightwatch` builds a typed record per signal and offers a
- * `redact*` callback per record type, so this class is the one place that
- * translation happens — one list, every signal, one file to read when a value
- * turns up in the console that should never have left the process.
+ * A host writes one list of sensitive field names under `prism.scrub`, and
+ * {@see Scrubber} is what decides whether a name is one of them. Where that
+ * list is applied is here: `laravel/nightwatch` builds a typed record per
+ * signal and offers a `redact*` callback per record type, so this class is the
+ * one place the translation happens — one list, every signal, one file to read
+ * when a value turns up in the console that should never have left the
+ * process.
  *
  * Unlike the reject callbacks ({@see RejectRules}) these **always run** and
  * they **mutate rather than short-circuit**: the record is still recorded, and
@@ -165,10 +164,10 @@ final class RedactRules
      * A request record: its headers, its body and its URL.
      *
      * The headers and the body are keyed structures, so the {@see Scrubber}
-     * answers them exactly as it answered the old client's — including the
-     * case-insensitivity upstream's `in_array($key, $fields, true)` does not
-     * have. The URL is rewritten because a token in a query string is a secret
-     * in the one field every screen prints.
+     * answers them — including the case-insensitivity upstream's
+     * `in_array($key, $fields, true)` does not have. The URL is rewritten
+     * because a token in a query string is a secret in the one field every
+     * screen prints.
      */
     public function redactRequest(Request $record): void
     {
@@ -185,10 +184,9 @@ final class RedactRules
     /**
      * A query record: its SQL.
      *
-     * Nightwatch captures no bindings — the old client did, and scrubbed them —
-     * so what is left to redact is a value written into the statement itself,
-     * which is what a raw `DB::statement()` produces. A `?` or `:name`
-     * placeholder is deliberately left alone.
+     * Nightwatch captures no bindings, so what is left to redact is a value
+     * written into the statement itself, which is what a raw `DB::statement()`
+     * produces. A `?` or `:name` placeholder is deliberately left alone.
      */
     public function redactQuery(Query $record): void
     {

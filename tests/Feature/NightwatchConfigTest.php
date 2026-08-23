@@ -151,10 +151,9 @@ it('derives the redaction keys the engine\'s own request sensor reads from prism
 });
 
 it('keeps request bodies off by default', function () {
-    // Upstream's default, and a deliberate change from the old client, which
-    // captured a body for every non-GET request. Off, a body is recorded only
-    // for a request that faulted — a privacy improvement and a debugging
-    // regression, so it is exposed rather than buried.
+    // Upstream's default, kept deliberately. Off, a body is recorded only for a
+    // request that faulted — the privacy-preserving answer and a debugging
+    // limitation, so the switch is exposed rather than buried.
     $config = registerPrismWith(prismConfig());
 
     expect($config->get('nightwatch.capture_request_payload'))->toBeFalse();

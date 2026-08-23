@@ -11,8 +11,8 @@ use Misakstvanu\Prism\Nightwatch\RecordTranslator;
  * produces. The two properties worth a test are the two that are silent when
  * wrong — the function label is shifted one entry against the location it is
  * paired with, and a project-relative path leaves the seam with its root marked
- * so the server's `/vendor/` and `/app/` rules read it the way they read the
- * deploy-absolute paths the old client shipped.
+ * so the server's `/vendor/` and `/app/` rules — which key on `/segment/`
+ * boundaries — can see it.
  *
  * The exception is thrown through two named functions on purpose: it is what
  * makes the shift assertable by name rather than by shape.
@@ -121,7 +121,7 @@ it('drops the argument-type list upstream appends to a source', function () {
 
     // `App\Http\Controllers\InvoiceController->show(int)` is the label plus the
     // types of the arguments it was called with; only the label is a property
-    // of the code, and only the label is what the old client recorded.
+    // of the code, and only the label is what the fingerprint hashes.
     expect($frames[1]['function'])->toBe('App\\Http\\Controllers\\InvoiceController->show');
 });
 

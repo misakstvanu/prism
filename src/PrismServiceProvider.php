@@ -1285,11 +1285,12 @@ class PrismServiceProvider extends ServiceProvider
      * engine's handler already there and replaces it rather than doubling every
      * line.
      *
-     * `prism.capture.logs` is not in the shipped config and is read for the
-     * reason `prism.capture.metrics` is, one method along: it is the pre-2.0
-     * per-domain toggle, still honoured for a host that published the old file
-     * and switched a signal off. Absent — which is every current install — it
-     * defaults to on.
+     * `prism.capture.logs` is an undeclared escape hatch — the shipped config
+     * does not carry it, and absent it defaults to on. It is here for the same
+     * reason `prism.capture.metrics` is, one method along: log attachment and
+     * replica metrics are the two signals Prism produces itself rather than
+     * reads off an engine, so they are the two a host may want off without
+     * switching the whole client off.
      */
     protected function registerLogCapture(): void
     {

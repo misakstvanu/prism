@@ -374,16 +374,15 @@ final class RecordTranslator
      * was made *from* and its `source` is what was called *there*. A stack frame,
      * as every console and every error tracker draws one, is the other pairing —
      * a location and the function *containing* it. Shifting the label one entry
-     * up restores that, and it is also the pairing the server's fingerprint has
-     * always hashed (the old client did the same shift when it built frames from
-     * `Throwable::getTrace()`), so getting it wrong changes every fingerprint in
-     * the workspace while still producing a perfectly plausible-looking stack.
-     * The last entry has no successor and so carries no function, exactly as the
-     * outermost frame of a backtrace has no caller.
+     * up restores that, and it is the pairing the server's fingerprint hashes,
+     * so getting it wrong changes every fingerprint in the workspace while still
+     * producing a perfectly plausible-looking stack. The last entry has no
+     * successor and so carries no function, exactly as the outermost frame of a
+     * backtrace has no caller.
      *
      * **`source` is `Class->method(argTypes)` and the label is the part before
-     * the bracket** — the same `class . type . function` string the old client
-     * assembled, which is why the two agree without a translation table.
+     * the bracket** — i.e. the `class . type . function` string the server's
+     * fingerprint expects, which is why no translation table is needed.
      *
      * An unparseable trace yields no frames rather than an error: the server then
      * falls back to the exception's own file, which is the same thing it does for
@@ -441,8 +440,8 @@ final class RecordTranslator
      * path and a line number.
      *
      * The path is put through {@see framePath()}; the line is 0 when the entry
-     * carried none, which is what the old client recorded for the same case and
-     * what a pseudo-location like `[internal function]` always reads as.
+     * carried none, which is what a pseudo-location like `[internal function]`
+     * always reads as.
      *
      * @return array{0: string, 1: int}
      */
@@ -495,9 +494,8 @@ final class RecordTranslator
      * orphaning every group that already existed.
      *
      * Restoring the leading slash is what makes a root-relative path say where
-     * its root is, and it is what makes the two engines' paths hash identically:
-     * the old client's deploy-absolute `/var/www/html/app/X.php` and this one's
-     * `/app/X.php` both trim to `app/X.php`.
+     * its root is, so a deploy-absolute `/var/www/html/app/X.php` and a stripped
+     * `/app/X.php` both trim to the same `app/X.php`.
      *
      * A path that is already absolute — one outside the base path, which
      * Nightwatch leaves alone — and a pseudo-location like `[internal function]`

@@ -40,12 +40,6 @@ composer require misakstvanu/prism
 The service provider (`Misakstvanu\Prism\PrismServiceProvider`) is auto-discovered — there is no
 provider to register and no kernel file to edit.
 
-> **Upgrading from 1.x?** 2.0 replaced the hand-written capture listeners with the two engines
-> above, which changes config keys, trace propagation and the request-body default. A `^1.0`
-> constraint will not carry you across it — the move is a deliberate
-> `composer require misakstvanu/prism:^2.0`. Read [`UPGRADING.md`](UPGRADING.md) first; every
-> removed key is listed there with what replaced it.
-
 **2. Set the two required variables**
 
 ```dotenv
@@ -244,9 +238,11 @@ trace crosses three boundaries as the W3C standard every APM and every language 
 - a **dispatched job** carries `traceparent` in its payload and runs under a CONSUMER span parented
   to the PRODUCER span that queued it, so a worker's records land under the request that queued them.
 
-Prism used to do all three itself, over an `X-Prism-Trace-Id` header and a `prism_trace_id` job
-payload key. Both are **removed** — see `UPGRADING.md` if you were propagating either by hand. A
-trace id is a 32-character hex string now rather than a UUID, for the same reason.
+Nothing bespoke rides along: `traceparent` is spoken by every APM and every language SDK, so a
+Laravel app calling a Go service produces one trace rather than two. A trace id is therefore a
+**32-character lowercase hex string**, not a UUID — worth knowing if you match or store one of your
+own. If you propagate the header by hand from a service Prism does not instrument, its format is
+`00-<32 hex trace id>-<16 hex span id>-<2 hex flags>`.
 
 **With the lane on, it is also the producer of two signals the capture engine watches as well.**
 Both engines see a query and an outgoing HTTP call, so leaving both alone would store one query as a
@@ -268,8 +264,8 @@ from `query.slow_threshold_ms`). Three consequences worth knowing:
   no row. Set `PRISM_OTEL_ENABLED=false` if you would rather have the engine's fuller records without
   the nesting.
 - **A Redis command is a `db` span and never a `queries` row.** Both instrumentations name the system
-  the same way, which is why one lane rule covers both — but Prism's query signal has always been
-  Laravel's `QueryExecuted`, which Redis does not raise.
+  the same way, which is why one lane rule covers both — but Prism's query signal is Laravel's
+  `QueryExecuted`, which Redis does not raise.
 
 `prism.scrub` applies to the span lane too: the statement and the outgoing URL meet the same list the
 engine's records do, so a scrub entry cannot cover one producer out of two.
@@ -481,17 +477,14 @@ One list governs every signal. A key here is redacted wherever it appears:
 | Mail subject, exception message | The value half of any `name = value` pair in the text. |
 
 A **queued job's payload is never captured at all**, so a secret dispatched inside a job cannot
-reach the console however this list is written. That is a change from earlier versions, which
-captured the payload and scrubbed it; nothing is recorded now but the job's name, id, queue,
+reach the console however this list is written: nothing is recorded but the job's name, id, queue,
 connection and outcome.
 
-Request **bodies** changed the same way, in two steps. The capture engine records a payload only
-for a request whose response was a **500**, and `request.capture_payload`
-(`PRISM_CAPTURE_REQUEST_PAYLOAD`) defaults to `false`, which means no body is recorded at all. The
-old client captured a scrubbed, truncated body for every non-GET request. That is a privacy
-improvement and a debugging regression — set `PRISM_CAPTURE_REQUEST_PAYLOAD=true` where the
-debugging is worth more, and the scrub list above still applies to whatever is captured. A request
-that *succeeded* has no body in the console at either setting.
+Request **bodies** are held back twice over. The capture engine records a payload only for a request
+whose response was a **500**, and `request.capture_payload` (`PRISM_CAPTURE_REQUEST_PAYLOAD`)
+defaults to `false`, which means no body is recorded at all. Set `PRISM_CAPTURE_REQUEST_PAYLOAD=true`
+where the debugging is worth more than the exposure; the scrub list above still applies to whatever
+is captured, and a request that *succeeded* has no body in the console at either setting.
 
 ## Manual instrumentation
 
@@ -551,43 +544,31 @@ of an execution, which is where the interval is consulted.
 
 ## Capture cost
 
-Two instrumentation engines listen where the client used to listen for itself, so what capture costs
-a request is measured rather than assumed:
+Two instrumentation engines listen on every request, so what capture costs one is measured rather
+than assumed:
 
 ```bash
 php artisan prism:bench:capture
 ```
 
-It times the same synthetic request under four configurations — nothing capturing, the pre-2.0
-client, the capture engine alone, and the capture engine plus the span lane — and reports what each
-one *adds* to the request. Each configuration runs in a process of its own, because which engines
-listen is decided during `register()`: four configurations in one process would be four names for
-one configuration. The whole sweep repeats (`--rounds`, default 3) round-robin and each row reports
-its median round, because ambient load moves the same measurement further than the difference being
+It times the same synthetic request under three configurations — nothing capturing, the capture
+engine alone, and the capture engine plus the span lane — and reports what each one *adds* to the
+request. Each configuration runs in a process of its own, because which engines listen is decided
+during `register()`: three configurations in one process would be three names for one
+configuration. The whole sweep repeats (`--rounds`, default 3) round-robin and each row reports its
+median round, because ambient load moves the same measurement further than the difference being
 looked for.
 
-**A configuration that costs more wall-clock per request than the old client fails the command**
-(non-zero exit). So does any sign that a span left the process as OTLP.
+**The command fails on one thing only: any sign that a span left the process as OTLP** (a protobuf
+class loaded anywhere in a child). That is the claim a reader cannot check for themselves — there is
+no collector to run, nothing is exported — so it is the one thing gated. The cost figures are
+reported, not thresholded: what a captured operation costs depends on the workload, so the
+per-signal attribution below is the number to carry away and a limit on the headline would only ever
+describe the box that ran it.
 
-The old client comes out of git — it was deleted when the engines replaced it — so export it once
-from a shell that has `git` before the first run:
-
-```bash
-mkdir -p storage/app/prism-bench/legacy
-git archive <the commit that deleted src/Capture>^ \
-    packages/prism/src/Capture packages/prism/src/Support/SpanStack.php \
-  | tar -x -C storage/app/prism-bench/legacy --strip-components=3
-```
-
-The command does this itself when `git` is on the PATH; when it is not, it prints the line above and
-refuses to report a verdict rather than quoting three numbers with nothing to compare them against.
-
-What comes back is the old **request** path — the middleware that timed the lifecycle and emitted its
-spans, the query and cache capturers, the span recorder they shared and the Monolog handler. The job,
-schedule and outgoing-HTTP listeners are left out because a request never fires them, and the runtime
-metrics collectors because they sample on an interval rather than per request (they cost the two
-engine configurations ~40 µs a request against the array store, which is inside the noise of
-everything below).
+The runtime metrics collectors are outside all of this — they sample on an interval rather than per
+request, and cost the two capturing configurations ~40 µs a request against the array store, inside
+the noise of everything below.
 
 ### The recorded run
 
@@ -599,35 +580,33 @@ queries, 8 cache read/writes and 1 log line:
 | configuration | per request | added | added peak mem | events/req |
 | --- | --- | --- | --- | --- |
 | capture off | 1.56 ms | — | — | 0.0 |
-| old client (pre-2.0) | 2.65 ms | +1.09 ms | +473 kB | 29.3 |
 | Nightwatch only | 3.59 ms | +2.03 ms | +862 kB | 26.0 |
 | Nightwatch + OTel spans | 6.90 ms | +5.34 ms | +2909 kB | 35.0 |
 
-Repeat sweeps on the same box put the three added figures at roughly +0.8–1.4 ms, +2.0–2.4 ms and
-+4.4–5.6 ms — quote the shape, not the second digit. What does not move is the ordering.
+Repeat sweeps on the same box put the two added figures at roughly +2.0–2.4 ms and +4.4–5.6 ms —
+quote the shape, not the second digit. What does not move is the ordering.
 
-**The default install is more expensive per request than the old client was, and the command fails
-on it** (exit 1). Varying the workload one signal at a time (200 requests × 3 rounds) says where the
-cost is, and it is not a fixed per-request overhead:
+Varying the workload one signal at a time (200 requests × 3 rounds) says where the cost is, and it
+is not a fixed per-request overhead:
 
-| workload | old client | Nightwatch | Nightwatch + OTel |
-| --- | --- | --- | --- |
-| nothing (the request alone) | +0.29 ms | +0.58 ms | +0.81 ms |
-| 8 queries | +0.58 ms | +0.99 ms | +2.60 ms |
-| 8 cache read/writes (16 events) | +1.45 ms | +1.84 ms | +2.41 ms |
+| workload | Nightwatch | Nightwatch + OTel |
+| --- | --- | --- |
+| nothing (the request alone) | +0.58 ms | +0.81 ms |
+| 8 queries | +0.99 ms | +2.60 ms |
+| 8 cache read/writes (16 events) | +1.84 ms | +2.41 ms |
 
-Subtracting the empty request, a query costs the old client ~36 µs, the capture engine ~51 µs and
-the span lane a further ~200 µs. The span lane is the bulk of the difference, and what it is buying
-is visible in the event counts: a query under the span lane produces **two** rows — the `db` bar in
-the waterfall and the `queries` row derived from it — where the old client produced one flat query
-event and a single aggregate `db` span for the whole request. Nesting is not free.
+Subtracting the empty request, a query costs the capture engine ~51 µs and the span lane a further
+~200 µs. The span lane is the bulk of the default install's cost, and what it is buying is visible
+in the event counts: a query under the span lane produces **two** rows — the `db` bar in the
+waterfall and the `queries` row derived from it — where a flat capture produces one event and no
+nesting at all. Nesting is not free.
 
 The **per-signal** figures are the transferable ones. The headline workload is deliberately
 signal-dense — 8 queries and 16 cache events inside a request whose own work is 1.5 ms — so it
 answers "what does one captured operation cost", not "what fraction of a request will this be".
 Multiply the per-signal numbers by what your own requests actually do. Peak memory moves the same
 way and for the same reason: the span lane holds a span per operation until the trace ends, which is
-~2.9 MB against the old client's ~0.5 MB on this workload.
+~2.9 MB on this workload against ~0.5 MB without it.
 
 Three findings worth keeping:
 
@@ -637,19 +616,19 @@ Three findings worth keeping:
   and measured at ~90 µs per query in a span-lane install, against a per-request query counter that
   would then read zero. It is a partial recovery of an inherent cost, not a fix.
 - **The replica-metrics interval throttle costs a cache round trip per request** in any process that
-  did not win the interval. It is not capture and predates both engines, but it measured 1.19 ms per
-  request against a Redis store — larger than everything above — which is why the benchmark runs its
-  children on the array store and says so.
+  did not win the interval. It is not capture at all, but it measured 1.19 ms per request against a
+  Redis store — larger than everything above — which is why the benchmark runs its children on the
+  array store and says so.
 - **Peak memory is bounded by the buffer, not by the request.** `PRISM_BATCH_SIZE` is what stops a
   request that issues a hundred queries holding a hundred spans: at capacity the buffer either ships
   early or drops and counts, and the benchmark reports both numbers.
 
-The lever that is already built for this is `PRISM_SAMPLE_REQUESTS`. Sampling is per **execution**
-now: a request the sampler rejects is discarded whole, spans included, so it never pays the
-per-signal costs above. Halving the rate halves the average cost of a request; there is no
-per-signal rate to tune and no half-captured trace to reassemble. Turning individual OpenTelemetry
-instrumentations off (`OTEL_INSTRUMENTATION_QUERY`, `OTEL_INSTRUMENTATION_HTTP_CLIENT`, …) is the
-other dial, and it costs that lane its nesting rather than its volume — see
+The lever that is already built for this is `PRISM_SAMPLE_REQUESTS`. Sampling is per **execution**:
+a request the sampler rejects is discarded whole, spans included, so it never pays the per-signal
+costs above. Halving the rate halves the average cost of a request; there is no per-signal rate to
+tune and no half-captured trace to reassemble. Turning individual OpenTelemetry instrumentations off
+(`OTEL_INSTRUMENTATION_QUERY`, `OTEL_INSTRUMENTATION_HTTP_CLIENT`, …) is the other dial, and it costs
+that lane its nesting rather than its volume — see
 [Span lane](#span-lane-keepsuitlaravel-opentelemetry).
 
 ## Troubleshooting
