@@ -177,9 +177,9 @@ it('ships nothing at all about a request on an ignored path', function () {
 
     // Not merely the request row: `dontSample()` discards the execution, so
     // every query, cache read and log line the ignored request produced goes
-    // with it, which is what an ignore list is asking for — so the assertion is
-    // over EVERYTHING shipped, and the route emits a log line to give it
-    // something to be wrong about.
+    // with it. That is more than the old client dropped, and it is what an
+    // ignore list is asking for — so the assertion is over EVERYTHING shipped,
+    // and the route emits a log line to give it something to be wrong about.
     //
     // The request row is the one signal that is absent either way, because the
     // engine writes it in the request-lifecycle handler that runs *after* the

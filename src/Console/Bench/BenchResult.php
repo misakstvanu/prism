@@ -9,20 +9,20 @@ namespace Misakstvanu\Prism\Console\Bench;
  * to the process that spawned it, and the row the report prints.
  *
  * It is a plain value object with an explicit array shape on both sides because
- * it crosses a process boundary as JSON: the three configurations cannot be
+ * it crosses a process boundary as JSON: the four configurations cannot be
  * compared inside one process (which engines are listening is decided during
  * `register()`, long before a command runs), so each is measured in a
  * subprocess of its own and its answer is parsed back here.
  *
- * A **skipped** result is a first-class outcome rather than a zero. A child
- * that could not boot, or printed no marker line, has measured nothing — and a
- * zero row would read as "that configuration cost nothing", which is the
+ * A **skipped** result is a first-class outcome rather than a zero. The old
+ * client is materialised out of git, which is not something every install can
+ * do — and a zero row would read as "the old client cost nothing", which is the
  * opposite of what a missing measurement means.
  */
 final class BenchResult
 {
     /**
-     * @param  string  $profile  The configuration's key (`off`, `nightwatch`, `otel`).
+     * @param  string  $profile  The configuration's key (`off`, `legacy`, …).
      * @param  string  $label  Its human-readable name, as printed.
      * @param  bool  $measured  False when the configuration could not be run.
      * @param  string|null  $skipReason  Why, when it was not.

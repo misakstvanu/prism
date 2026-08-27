@@ -21,10 +21,11 @@ use Throwable;
  * unconditionally without guarding on whether Prism is set up: a build with
  * `PRISM_ENABLED=false` simply does nothing.
  *
- * **Neither method captures anything itself**: each hands the work to the
- * engine that owns the signal, so a manual report meets exactly the sensors,
- * redact callbacks and ignore lists an automatic one does. An exception goes to
- * the capture engine, a span to the span lane.
+ * **Both methods changed producer in the capture engine replacement (US-021)
+ * while keeping their signatures**, because both used to be the manual entry
+ * points to capture listeners Prism wrote itself and no longer has. What they
+ * hand the work to is now the engine that owns the signal: an exception goes to
+ * the capture engine, a span to the span lane. See the package `UPGRADING.md`.
  */
 final class Prism
 {

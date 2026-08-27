@@ -19,7 +19,11 @@ use Illuminate\Notifications\Notification;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobQueued;
 use Illuminate\Queue\Events\JobQueueing;
+use Illuminate\Routing\Events\RouteMatched;
 use Illuminate\Routing\Route;
+use Illuminate\Routing\RouteCollection;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Testing\TestResponse;
 use Laravel\Nightwatch\Clock;
 use Laravel\Nightwatch\Compatibility;
 use Laravel\Nightwatch\Contracts\Ingest;
@@ -32,6 +36,7 @@ use Laravel\Nightwatch\Support\Uuid;
 use Laravel\Nightwatch\UserProvider;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
+use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Tests\NightwatchHostTestCase;
 use Misakstvanu\Prism\Tests\OpenTelemetryHostTestCase;
 use Misakstvanu\Prism\Tests\TestCase;
@@ -60,6 +65,142 @@ pest()->extend(NightwatchHostTestCase::class)->in('Host');
 // everything under `tests/Host` asserts the capture engine's behaviour under a
 // process that has no OpenTelemetry SDK in it at all.
 pest()->extend(OpenTelemetryHostTestCase::class)->in('Otel');
+
+/**
+ * When the default report fixture says it was sent, and — since US-008 — the
+ * instant a suite that cares about timestamps freezes its clock at.
+ *
+ * A constant rather than a literal in two places because the two are one fact:
+ * the server corrects every event in a report by the distance between `sent_at`
+ * and its own clock, so a fixture whose `sent_at` and whose test clock disagree
+ * describes a browser whose clock is out — which is a thing to assert
+ * deliberately, never to inherit.
+ */
+const REPORT_SENT_AT = '2026-08-26T10:00:00.000Z';
+
+/**
+ * A well-formed browser report body (US-006), with whatever a caller wants to
+ * be wrong about it merged over the top.
+ *
+ * It lives here rather than in one of the three files that post one because all
+ * three premises need it — the route's own suite, the parser's, and the host
+ * suite that proves the report's execution is never captured — and Pest loads
+ * every test file into one process, where a second copy of a helper is a fatal
+ * redeclare rather than a duplication anyone would notice.
+ *
+ * @param  array<string, mixed>  $overrides
+ */
+function browserReportBody(array $overrides = []): string
+{
+    return (string) json_encode([
+        'v' => 1,
+        'sdk' => ['name' => '@misakstvanu/prism-browser', 'version' => '1.0.0'],
+        'sent_at' => REPORT_SENT_AT,
+        'session' => ['id' => '5c1f2b3a4d5e6f708192a3b4c5d6e7f8', 'release' => '2026.08.3'],
+        'events' => [],
+        ...$overrides,
+    ], JSON_THROW_ON_ERROR);
+}
+
+/**
+ * POST a report the way the SDK does: a raw body, with the content type the
+ * transport that sent it decided.
+ *
+ * Never `$this->post($uri, $data)` — that sends form parameters and leaves the
+ * body empty, which the endpoint reads (correctly) as a body it cannot decode.
+ * The default content type is `fetch`'s; a beacon's `text/plain` is passed in by
+ * the tests that are about the beacon.
+ *
+ * @param  array<string, mixed>|string|null  $body  An override bag, or a raw body to send verbatim.
+ * @param  array<string, mixed>  $server
+ */
+function postBrowserReport(
+    array|string|null $body = null,
+    string $contentType = 'application/json',
+    array $server = [],
+    string $uri = '/_prism/browser',
+): TestResponse {
+    return test()->call(
+        'POST',
+        $uri,
+        server: ['CONTENT_TYPE' => $contentType, ...$server],
+        content: is_string($body) ? $body : browserReportBody($body ?? []),
+    );
+}
+
+/**
+ * One posted event, with whatever a test wants to be different about it merged
+ * over a well-formed default (US-007).
+ *
+ * Beside {@see browserReportBody()} for its reason: the report's own suite, the
+ * forwarder's and the host suite that watches what leaves over the transport all
+ * compose one, and Pest loads every test file into one process where a second
+ * copy is a fatal redeclare.
+ *
+ * @param  array<string, mixed>  $overrides
+ * @return array<string, mixed>
+ */
+function browserEventBody(string $type, array $overrides = []): array
+{
+    return [
+        'type' => $type,
+        'timestamp' => '2026-08-26T09:59:59.000Z',
+        'trace_id' => '0123456789abcdef0123456789abcdef',
+        'payload' => ['message' => 'something happened'],
+        ...$overrides,
+    ];
+}
+
+/**
+ * Give the request under test something to lose, and report back what the
+ * sampler decided about it.
+ *
+ * The browser endpoint answers 204 and does very little, so an execution that
+ * shipped its buffer would ship an empty one and every "nothing was captured"
+ * assertion would pass for the wrong reason. A listener on `RouteMatched` —
+ * which fires after the whole global middleware stack, i.e. after both the
+ * capture engine's sampler and Prism's refusal have had their say — is where a
+ * query, a cache read, an outgoing call and a log line are driven through the
+ * real `Core`, and where the sampling verdict is legible.
+ *
+ * Shared by the two host suites that assert on what a report's own request
+ * leaves behind: the one that proves the execution is refused (US-005) and the
+ * one that proves the report itself still ships (US-007).
+ */
+function browserReportExecution(): object
+{
+    $execution = new stdClass;
+    $execution->sampling = null;
+
+    app('events')->listen(RouteMatched::class, function () use ($execution): void {
+        /** @var Core<covariant RequestState> $core */
+        $core = app(Core::class);
+
+        $execution->sampling = $core->sampling();
+
+        Log::info('the browser report looked at something');
+
+        // The cache sensor times the operation, so both halves have to fire.
+        $core->cacheEvent(new RetrievingKey('redis', 'orders:5'));
+        $core->cacheEvent(new CacheHit('redis', 'orders:5', ['id' => 5]));
+
+        $core->query(new QueryExecuted(
+            sql: 'select * from "orders" where "id" = ?',
+            bindings: [5],
+            time: 12.5,
+            connection: app('db')->connection(),
+        ));
+
+        $core->outgoingRequest(
+            microtime(true) - 0.05,
+            microtime(true),
+            new Psr7Request('GET', 'https://api.example.com/v1/things'),
+            new Psr7Response(200, [], 'ok'),
+        );
+    });
+
+    return $execution;
+}
 
 /**
  * Build a real `Laravel\Nightwatch\Core` the way its own service provider does,
@@ -555,4 +696,64 @@ function nightwatchResolveRecord(?array $result): ?array
 final class PrismTestNotification extends Notification
 {
     //
+}
+
+/**
+ * Re-run the provider's boot against a fresh route table, so "the route is
+ * registered" is a claim about THIS configuration rather than about the boot
+ * Testbench already performed with the package defaults.
+ *
+ * Here rather than in one of the two files that call it because both the
+ * endpoint's own suite (US-005) and the CORS suite beside it (US-010) need it,
+ * and Pest loads every test file into one process where a helper reached for
+ * across files is an invisible dependency between two premises — and a second
+ * copy of one is a fatal redeclare.
+ *
+ * @param  array<string, mixed>  $config
+ */
+function bootBrowserEndpoint(array $config = []): void
+{
+    config($config);
+
+    app('router')->setRoutes(new RouteCollection);
+
+    app()->forgetInstance(PrismServiceProvider::ACTIVE);
+
+    (new PrismServiceProvider(app()))->boot();
+
+    // What the framework itself does from a `booted` callback: a route named
+    // AFTER it was added is invisible to `getByName()` until the lookups are
+    // rebuilt, and re-running boot() by hand happens long after `booted` fired.
+    app('router')->getRoutes()->refreshNameLookups();
+}
+
+/**
+ * A route of the browser endpoint's by name, or null when this boot registered
+ * none.
+ *
+ * Defaults to the `POST` route; the preflight (US-010) is a route of its own,
+ * because it answers a different verb inside a different middleware stack.
+ */
+function browserRoute(string $name = PrismServiceProvider::BROWSER_ROUTE): ?Route
+{
+    return app('router')->getRoutes()->getByName($name);
+}
+
+/**
+ * The middleware a route actually runs inside — groups expanded and exclusions
+ * applied, which is the only form in which "the web group minus CSRF" is a
+ * checkable claim.
+ *
+ * @return list<string>
+ */
+function browserMiddleware(?Route $route): array
+{
+    if ($route === null) {
+        return [];
+    }
+
+    return array_values(array_filter(
+        app('router')->gatherRouteMiddleware($route),
+        'is_string',
+    ));
 }

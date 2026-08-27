@@ -22,11 +22,11 @@ use Throwable;
  * The engine has a reject callback for every record type it buffers *inside* an
  * execution, and none for the execution itself — a request is not a record in a
  * batch, it is the thing the batch belongs to. `Core::dontSample()` is the
- * equivalent, and it is the bigger hammer: at `finishExecution()` an unsampled
- * execution has its whole buffer discarded, so an ignored path costs nothing at
- * all rather than merely losing its request row. That is what an ignore list is
- * asking for — a health check polled every second is not more interesting for
- * the four cache reads it made.
+ * equivalent, and it is a bigger hammer than the old client's: at
+ * `finishExecution()` an unsampled execution has its whole buffer discarded, so
+ * an ignored path costs nothing at all rather than merely losing its request
+ * row. That is what an ignore list is asking for — a health check polled every
+ * second is not more interesting for the four cache reads it made.
  *
  * **Two requests, two reasons, and only one of them is configurable.** A path on
  * the list is noise the host chose to silence. A request carrying

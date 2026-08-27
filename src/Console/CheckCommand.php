@@ -7,11 +7,15 @@ namespace Misakstvanu\Prism\Console;
 use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Config\Repository;
+use Illuminate\Routing\Route;
+use Illuminate\Routing\Router;
 use Illuminate\Support\Facades\Http;
 use Laravel\Nightwatch\Core;
+use Misakstvanu\Prism\Browser\BrowserCors;
 use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Nightwatch\PrismIngest;
 use Misakstvanu\Prism\Otel\SpanLane;
+use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
@@ -28,6 +32,9 @@ use Throwable;
  *      whether Prism's own in-process ingest is installed over it, and — said
  *      out loud, because an operator who follows the engine's own documentation
  *      will otherwise go looking for one — that no agent daemon is required.
+ *      It also reports the browser endpoint (US-011): the one part of the
+ *      install a *page* can observe, and the one whose failure an operator
+ *      first meets as a 404 in a browser console rather than as an empty screen.
  *   3. Delivery. How a finished batch leaves the process and, under the `spool`
  *      strategy, whether the cache store and queue it depends on are in place —
  *      an install that captures happily into a spool nothing drains looks
@@ -75,6 +82,16 @@ class CheckCommand extends Command
         if (! $config->get('prism.enabled')) {
             $this->warn('  Prism is disabled — PRISM_ENABLED=false.');
             $this->line('  No telemetry is captured or sent. Set PRISM_ENABLED=true to enable it.');
+            $this->newLine();
+
+            // The one line worth printing anyway (US-011). Every other check
+            // below is about what this process captures, and a disabled install
+            // captures nothing — but the browser endpoint is registered inside
+            // the host's own route table, so switching Prism off is what turns
+            // an SDK's post into a 404, in a browser console, somewhere nobody
+            // running this command is looking. Say so here rather than leave the
+            // one observable symptom unexplained.
+            $this->reportBrowserEndpoint($config);
             $this->newLine();
 
             return self::SUCCESS;
@@ -173,6 +190,7 @@ class CheckCommand extends Command
         $this->engineLine('ingest', $this->ingestDescription());
         $this->engineLine('agent', '<fg=green>not required</> — no daemon, nothing opens the agent socket');
         $this->engineLine('otel spans', $this->spanProcessorDescription());
+        $this->reportBrowserEndpoint($config);
         $this->engineLine('token', blank($config->get('prism.token'))
             ? '<fg=red>missing</> — set PRISM_TOKEN'
             : '<fg=green>present</>');
@@ -274,6 +292,100 @@ class CheckCommand extends Command
         }
 
         return '<fg=yellow>not configured</> — '.self::SPAN_PROCESSOR.' is installed but not registered';
+    }
+
+    /**
+     * The browser endpoint's own line (US-011).
+     *
+     * Every other line in this section answers a question about *this* process.
+     * This one answers the only question a page can ask: is there something at
+     * the address the SDK posts to, and is it the address I configured? An
+     * operator meets its absence as a 404 in a browser console — a symptom no
+     * console screen shows and no server log explains — so the four states it
+     * can be in are worth naming out loud.
+     *
+     * It is printed for a disabled install too ({@see handle()}), because the
+     * endpoint is registered below the `prism.enabled` gate and above the token
+     * one: a blank `PRISM_TOKEN` still answers 204, so `PRISM_ENABLED=false` is
+     * the only way a configured install stops answering at all.
+     */
+    private function reportBrowserEndpoint(Repository $config): void
+    {
+        $this->engineLine('browser', $this->browserEndpointDescription($config));
+    }
+
+    /**
+     * Where the browser endpoint is, or why it is nowhere.
+     *
+     * **The verdict comes from the route table, not from a second reading of the
+     * config**, for the reason the span-lane line's does: what an operator needs
+     * to know is what the router will actually answer, and a config value is
+     * only an input to that. It is also the only reading that survives
+     * `route:cache` — a cached table registered while the endpoint was on keeps
+     * serving it, whatever config says now — and the only one that cannot drift
+     * from {@see PrismServiceProvider::registerBrowserEndpoint()}'s own rules
+     * about a blank path.
+     *
+     * The route's own URI is what is printed, so an overridden
+     * `prism.browser.path` needs no separate handling and a normalisation the
+     * provider applies and this method did not could not disagree with it.
+     * Config is consulted only for the wording of an absence, where the router
+     * has nothing to say: the two switches produce the same missing route and
+     * they are not the same problem.
+     */
+    private function browserEndpointDescription(Repository $config): string
+    {
+        $route = $this->browserRoute();
+
+        if ($route !== null) {
+            return sprintf(
+                '<fg=green>POST /%s</> (enabled, %s)',
+                ltrim($route->uri(), '/'),
+                $this->browserOriginsDescription($config),
+            );
+        }
+
+        if (! $config->get('prism.enabled')) {
+            return '<fg=yellow>not registered</> — PRISM_ENABLED is false';
+        }
+
+        if (! $config->get('prism.browser.enabled', true)) {
+            return '<fg=yellow>disabled</> (PRISM_BROWSER_ENABLED)';
+        }
+
+        // Both switches are on and the router still has no route, which leaves
+        // exactly one cause: the path was configured to nothing, so there was no
+        // address to register. Reported rather than folded into "disabled",
+        // because the fix is a different variable.
+        return '<fg=yellow>not registered</> — prism.browser.path is blank';
+    }
+
+    /** The registered browser endpoint, or null when this install has none. */
+    private function browserRoute(): ?Route
+    {
+        $route = $this->laravel->make(Router::class)
+            ->getRoutes()
+            ->getByName(PrismServiceProvider::BROWSER_ROUTE);
+
+        return $route instanceof Route ? $route : null;
+    }
+
+    /**
+     * Who may post to it: the same-origin default, or the origins listed in
+     * `prism.browser.origins`.
+     *
+     * Read through {@see BrowserCors} rather than off the config key directly,
+     * so what is printed is what a request is actually matched against — an
+     * entry dropped for being unusable, or normalised for the comparison, is
+     * reported the way it will be applied rather than the way it was written.
+     * A frontend deployed apart from its backend fails with no symptom but a
+     * browser refusing the call, so the list is worth reading back.
+     */
+    private function browserOriginsDescription(Repository $config): string
+    {
+        $origins = BrowserCors::origins($config);
+
+        return $origins === [] ? 'same-origin' : 'origins: '.implode(', ', $origins);
     }
 
     /**

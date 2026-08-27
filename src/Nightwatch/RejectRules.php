@@ -40,7 +40,8 @@ use Misakstvanu\Prism\Support\Recursion;
  *     record inside one. `Core::dontSample()` is the equivalent: at
  *     `finishExecution()` the whole buffer is discarded instead of shipped, so
  *     not only the request record but every query, cache event and log line it
- *     produced goes with it, which is what an ignore list is asking for.
+ *     produced goes with it. That is strictly more than the old client dropped,
+ *     and it is what an ignore list is asking for.
  *   - **Dropped at the seam** (`exceptions`). Nightwatch has no reject callback
  *     for an exception, so the earliest place Prism owns is
  *     {@see PrismIngest::write()}. The record is built either way; what this
@@ -76,13 +77,51 @@ final class RejectRules
     public static function fromConfig(Repository $config): self
     {
         return new self(
-            paths: IgnoreList::patterns($config->get('prism.ignore.paths', [])),
+            paths: self::requestPaths($config),
             jobs: IgnoreList::patterns($config->get('prism.ignore.jobs', [])),
             commands: IgnoreList::patterns($config->get('prism.ignore.commands', [])),
             http: IgnoreList::patterns($config->get('prism.ignore.http', [])),
             cache: IgnoreList::patterns($config->get('prism.ignore.cache', [])),
             exceptions: IgnoreList::patterns($config->get('prism.ignore.exceptions', [])),
         );
+    }
+
+    /**
+     * `prism.ignore.paths`, plus the browser SDK's own reporting endpoint
+     * whatever the host configured it to be.
+     *
+     * The shipped `ignore.paths` already carries `_prism/*`, which covers the
+     * default. This covers a renamed one, and it is the same stance
+     * {@see cacheKeyPatterns()} takes one dimension along: a path that exists
+     * *because* Prism is installed is not something a host should have to
+     * remember to silence. Left captured, every browser report becomes a
+     * request row plus the session read, the scrub pass and the queue dispatch
+     * it made — telemetry about telemetry, on a route the page hits once per
+     * error.
+     *
+     * Only added when the endpoint is actually registered: with
+     * `browser.enabled` off there is no such route, and silencing a path the
+     * host may be serving something else on is not Prism's to do.
+     *
+     * @return list<string>
+     */
+    private static function requestPaths(Repository $config): array
+    {
+        $paths = IgnoreList::patterns($config->get('prism.ignore.paths', []));
+
+        if (! $config->get('prism.browser.enabled', true)) {
+            return $paths;
+        }
+
+        $browser = trim((string) $config->get('prism.browser.path', ''), '/');
+
+        if ($browser === '' || in_array($browser, $paths, true)) {
+            return $paths;
+        }
+
+        $paths[] = $browser;
+
+        return $paths;
     }
 
     /**
@@ -131,8 +170,9 @@ final class RejectRules
      * Whether an outgoing call's destination is on `prism.ignore.http`.
      *
      * The destination is offered three ways — host, host and path, and the full
-     * URL without its query string — so `clickhouse`, `clickhouse/*` and
-     * `http://clickhouse:8123/*` all silence the same call. The query string is
+     * URL without its query string — exactly as the old client offered it, so a
+     * host that already wrote `clickhouse`, `clickhouse/*` or
+     * `http://clickhouse:8123/*` keeps the answer it had. The query string is
      * excluded because it varies per call and may carry a credential.
      */
     public function rejectsOutgoingRequest(OutgoingRequest $record): bool

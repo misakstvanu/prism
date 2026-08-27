@@ -124,6 +124,105 @@ it('reports the span lane as not configured when the host owns the otel config, 
         ->assertExitCode(0);
 });
 
+/**
+ * The browser endpoint's line (US-011).
+ *
+ * Each wording gets a test of its own rather than a chain of matchers in one:
+ * `expectsOutputToContain` matchers are unordered and the first declared match
+ * consumes the line it matched, so two wordings asserted together can pass by
+ * matching each other's line.
+ *
+ * Every one of them establishes the state through `bootBrowserEndpoint()` — a
+ * real provider boot into a fresh route collection — rather than by setting
+ * config and trusting the command to re-derive it, because what the line
+ * reports is what the ROUTER will answer. A test that only set config would
+ * pass against a command that had quietly stopped reading the route table.
+ */
+it('reports the browser endpoint as live and same-origin', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    bootBrowserEndpoint(['prism.browser.enabled' => true, 'prism.browser.origins' => []]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('POST /_prism/browser (enabled, same-origin)')
+        ->assertExitCode(0);
+});
+
+it('reports the browser endpoint at the path the host renamed it to', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // The printed address comes from the route itself, so the leading and
+    // trailing slashes a host copies out of a browser's address bar are gone
+    // from it for the same reason they are gone from the route table.
+    bootBrowserEndpoint(['prism.browser.path' => '/telemetry/from-the-browser/']);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('POST /telemetry/from-the-browser (enabled, same-origin)')
+        ->assertExitCode(0);
+});
+
+it('lists the origins a split-origin frontend may post from', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // A frontend deployed apart from its backend fails with no symptom but a
+    // browser refusing the call, so the list is read back — in the normalised
+    // form a request is matched against, not the form it was written in.
+    bootBrowserEndpoint(['prism.browser.origins' => [
+        'https://app.example.com/',
+        'HTTPS://ADMIN.EXAMPLE.COM',
+    ]]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('(enabled, origins: https://app.example.com, https://admin.example.com)')
+        ->assertExitCode(0);
+});
+
+it('reports the browser endpoint as disabled when only the browser block is off', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    bootBrowserEndpoint(['prism.browser.enabled' => false]);
+
+    // Named by the variable that switched it off, because the fix is that
+    // variable and not the master switch reported two lines further down.
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('disabled (PRISM_BROWSER_ENABLED)')
+        ->assertExitCode(0);
+});
+
+it('reports the browser endpoint as not registered when Prism itself is off', function () {
+    configureCheck(['prism.enabled' => false]);
+    Http::fake();
+
+    bootBrowserEndpoint();
+
+    // The disabled install still prints this line: the endpoint sits below the
+    // enabled gate and above the token one, so a blank PRISM_TOKEN answers 204
+    // and PRISM_ENABLED=false is the only way a configured install 404s the SDK.
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('not registered — PRISM_ENABLED is false')
+        ->assertExitCode(0);
+
+    Http::assertNothingSent();
+});
+
+it('reports the browser endpoint as not registered when the path is blank', function () {
+    configureCheck();
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // Both switches on and no route: the only remaining cause, and a different
+    // variable to fix, so it gets a wording of its own rather than the one the
+    // browser block's switch gets.
+    bootBrowserEndpoint(['prism.browser.path' => '/']);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('not registered — prism.browser.path is blank')
+        ->assertExitCode(0);
+});
+
 it('reports the token as present without printing it', function () {
     configureCheck();
     Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
@@ -135,11 +234,12 @@ it('reports the token as present without printing it', function () {
 });
 
 it('reports no per-domain capture toggles, because there are none to honour', function () {
-    // Which signals are captured is the capture engine's vocabulary (US-001),
-    // and US-021 deleted the listeners a `prism.capture` block would have
-    // gated — so the command prints no such section even when a host has
-    // written the keys anyway. Printing "requests ... enabled" off a key
-    // nothing reads is a report that lies to the one operator consulting it.
+    // US-001 moved the "which signals" vocabulary to the capture engine and
+    // dropped the `capture` block; US-021 deleted the listeners the block's
+    // remaining entries would have gated. A host that published the pre-2.0 file
+    // still HAS the block, which is exactly why this section had to go rather
+    // than stay: printing "requests ... enabled" off a key nothing reads is a
+    // report that lies to the one operator who would consult it.
     configureCheck(['prism.capture' => ['requests' => true, 'queries' => false]]);
     Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
 

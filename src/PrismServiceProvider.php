@@ -4,15 +4,24 @@ declare(strict_types=1);
 
 namespace Misakstvanu\Prism;
 
+use Closure;
+use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
 use Illuminate\Contracts\Config\Repository;
+use Illuminate\Contracts\Container\Container;
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
 use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
+use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
+use Illuminate\Foundation\Http\Middleware\VerifyCsrfToken;
+use Illuminate\Http\Request;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Env;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\CacheInstrumentation;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\ConsoleInstrumentation;
@@ -42,12 +51,17 @@ use Laravel\Nightwatch\Records\Request as RequestRecord;
 use Laravel\Nightwatch\SensorManager;
 use Laravel\Nightwatch\State\CommandState;
 use Laravel\Nightwatch\State\RequestState;
+use Misakstvanu\Prism\Browser\BrowserCors;
+use Misakstvanu\Prism\Browser\BrowserForwarder;
+use Misakstvanu\Prism\Browser\BrowserScrubber;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Console\BenchCaptureCommand;
 use Misakstvanu\Prism\Console\CheckCommand;
 use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Flush\SpoolScheduler;
+use Misakstvanu\Prism\Http\Controllers\BrowserPreflightController;
+use Misakstvanu\Prism\Http\Controllers\BrowserReportController;
 use Misakstvanu\Prism\Http\Middleware\RejectIgnoredRequests;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
@@ -115,6 +129,56 @@ class PrismServiceProvider extends ServiceProvider
      * {@see slowTraceThreshold()} for why the fallback is not zero.
      */
     private const DEFAULT_SLOW_TRACE_MS = 2000;
+
+    /**
+     * The route name and the named rate limiter behind the browser SDK's
+     * reporting endpoint (US-005). Both are namespaced so a host can reach the
+     * route by name and cannot collide with a limiter of its own.
+     */
+    public const BROWSER_ROUTE = 'prism.browser';
+
+    public const BROWSER_LIMITER = 'prism-browser';
+
+    /**
+     * The `OPTIONS` route beside it, registered only for an install that lists
+     * `prism.browser.origins` (US-010). A separate name because it is a separate
+     * route with a middleware stack of its own — see
+     * {@see BrowserPreflightController} for why a preflight runs outside both
+     * the `web` group and the throttle.
+     */
+    public const BROWSER_PREFLIGHT_ROUTE = 'prism.browser.preflight';
+
+    /**
+     * The path the browser endpoint falls back to when `prism.browser.path` is
+     * missing or blank — the value `config/prism.php` ships, restated so a host
+     * that published the file before the key existed still gets an endpoint the
+     * SDK's own default reaches.
+     */
+    private const DEFAULT_BROWSER_PATH = '_prism/browser';
+
+    /**
+     * CSRF verification, under every name Laravel has given it.
+     *
+     * The browser endpoint runs inside the host's `web` group — it needs the
+     * session to say who is signed in — and with this excluded from it, because
+     * `navigator.sendBeacon` cannot set a header and a write-only telemetry sink
+     * has nothing forgery would win. Three names rather than one because the
+     * class has been renamed twice and which one a host's `web` group actually
+     * holds depends on its framework version: `PreventRequestForgery` is the
+     * current name and the other two are deprecated subclasses of it. Excluding
+     * a subclass would NOT exclude its parent — the router's exclusion check
+     * only walks *up* — so naming only the deprecated one an older document
+     * mentions would leave CSRF firmly in place, and the only symptom would be a
+     * 419 nothing on the page can read. A name that does not exist in the
+     * installed framework is skipped, and a host's own subclass is covered.
+     *
+     * @var list<class-string>
+     */
+    private const CSRF_MIDDLEWARE = [
+        PreventRequestForgery::class,
+        ValidateCsrfToken::class,
+        VerifyCsrfToken::class,
+    ];
 
     /**
      * Which of the span lane's instrumentations Prism turns on, and the
@@ -788,6 +852,10 @@ class PrismServiceProvider extends ServiceProvider
             return;
         }
 
+        // ABOVE the token gate, deliberately: the browser SDK must never meet a
+        // 404 from an install that is switched on. See registerBrowserEndpoint().
+        $this->registerBrowserEndpoint();
+
         // Enabled but no token: no-op and surface the reason exactly once,
         // never throwing, so the host app boots normally.
         if (blank($this->app['config']->get('prism.token'))) {
@@ -800,6 +868,119 @@ class PrismServiceProvider extends ServiceProvider
         }
 
         $this->registerCapture();
+    }
+
+    /**
+     * Register the endpoint the browser SDK posts its reports to (US-005).
+     *
+     * The point of registering it here rather than documenting a route for a
+     * host to add is that the frontend half then needs no backend code of
+     * anyone's: update the Composer package, install the npm one, and the two
+     * halves already agree on an address.
+     * {@see BrowserReportController} is the whole handler.
+     *
+     * **It sits ABOVE the token gate in {@see boot()}**, which is the one
+     * ordering decision in this method. An install that is enabled but has no
+     * `PRISM_TOKEN` still answers the SDK a 204: from the page's side a 404 is
+     * indistinguishable from a routing mistake, so the SDK would hold the report
+     * and retry it against an endpoint that will never exist. Answering and
+     * discarding is the honest failure.
+     *
+     * **The middleware is the host's own `web` group minus CSRF**, plus the
+     * named throttle below. `web` because the report is enriched server-side
+     * with who is signed in, and the session is where that is (US-008); minus
+     * CSRF because `navigator.sendBeacon` — the transport a page uses when it is
+     * being unloaded, which is exactly when the last report of a session is sent
+     * — cannot set a header, and a write-only sink that answers 204 to
+     * everything has nothing forgery would win. See {@see CSRF_MIDDLEWARE} for
+     * why that exclusion names three classes.
+     *
+     * There is deliberately **no auth middleware**. An anonymous visitor hitting
+     * a JavaScript error is the report most worth having, and requiring a
+     * session would silently limit browser telemetry to signed-in traffic.
+     *
+     * A second route joins it for a frontend that is not served from this
+     * application at all — see {@see registerBrowserPreflight()}.
+     */
+    protected function registerBrowserEndpoint(): void
+    {
+        /** @var Repository $config */
+        $config = $this->app['config'];
+
+        if (! $config->get('prism.browser.enabled', true)) {
+            return;
+        }
+
+        $path = trim((string) $config->get('prism.browser.path', self::DEFAULT_BROWSER_PATH), '/');
+
+        if ($path === '') {
+            return;
+        }
+
+        $this->registerBrowserRateLimiter($config);
+
+        Route::post($path, BrowserReportController::class)
+            ->middleware(['web', 'throttle:'.self::BROWSER_LIMITER])
+            ->withoutMiddleware(self::CSRF_MIDDLEWARE)
+            ->name(self::BROWSER_ROUTE);
+
+        $this->registerBrowserPreflight($config, $path);
+    }
+
+    /**
+     * Answer preflights for a split-origin frontend (US-010).
+     *
+     * Registered only when `prism.browser.origins` lists something, which is
+     * what keeps a same-origin install exactly as it was: with no origins there
+     * is nothing an `OPTIONS` could be answered with, and a route registered to
+     * say so would replace the router's own answer to a verb the endpoint never
+     * receives. The route is therefore the assertable form of "this install
+     * accepts cross-origin reports".
+     *
+     * It carries **no middleware at all** — not the `web` group, whose session a
+     * preflight has no cookies for, and not the throttle, which would let a rate
+     * limit meant to bound abuse refuse the question the post depends on being
+     * asked. Prism's own {@see RejectIgnoredRequests} is global rather than
+     * route middleware, so the preflight's execution is refused capture exactly
+     * as the post's is.
+     */
+    private function registerBrowserPreflight(Repository $config, string $path): void
+    {
+        if (! BrowserCors::configured($config)) {
+            return;
+        }
+
+        Route::options($path, BrowserPreflightController::class)
+            ->name(self::BROWSER_PREFLIGHT_ROUTE);
+    }
+
+    /**
+     * The named limiter the browser endpoint throttles on, keyed on the client
+     * IP.
+     *
+     * The IP rather than the session, because most reporters have no session:
+     * an anonymous visitor is exactly who this endpoint exists for. The default
+     * (120/minute) is deliberately generous — a page in a bad state reports in
+     * bursts, and per-report sampling is the SDK's job — so this bounds abuse
+     * rather than volume.
+     *
+     * `rate_limit = 0` disables throttling outright by answering `Limit::none()`
+     * rather than by leaving the middleware off the route, so the middleware
+     * stack does not change shape with a config value.
+     *
+     * The limit is read **inside** the closure. A limiter registered at boot
+     * outlives every request in a long-lived runtime, so reading it once here
+     * would pin whatever config said at the moment the process started.
+     */
+    private function registerBrowserRateLimiter(Repository $config): void
+    {
+        RateLimiter::for(self::BROWSER_LIMITER, static function (Request $request) use ($config): Limit {
+            $limit = (int) $config->get('prism.browser.rate_limit', 120);
+
+            return $limit > 0
+                ? Limit::perMinute($limit)->by($request->ip() ?? 'unknown')
+                : Limit::none();
+        });
     }
 
     /**
@@ -873,6 +1054,7 @@ class PrismServiceProvider extends ServiceProvider
         $this->registerNightwatchFiltering();
         $this->registerNightwatchRedaction();
         $this->registerNightwatchIngest();
+        $this->registerBrowserForwarder();
         $this->registerLogCapture();
         $this->registerQueueMetrics();
         $this->registerSystemMetrics();
@@ -913,6 +1095,40 @@ class PrismServiceProvider extends ServiceProvider
         // caught and never surfaces to the host application.
         $this->app->terminating(function (): void {
             $this->flush();
+        });
+    }
+
+    /**
+     * The half of the browser endpoint that ships (US-007).
+     *
+     * Bound **here**, from `registerCapture()`, while the route it serves is
+     * registered one gate earlier in {@see boot()}. The two halves answer
+     * different questions and the gap between them is the whole design: the
+     * route must exist for any install that is switched on, because from the
+     * page's side a 404 is indistinguishable from a routing mistake and the SDK
+     * would hold its reports and retry forever; but there is nothing to forward
+     * *to* without a token, and every collaborator a forwarder needs — the
+     * transport, the spool, the flush strategy — is bound in this method.
+     *
+     * So an enabled install with no token registers no forwarder,
+     * {@see BrowserReportController} finds none in the container, and the report
+     * is read, answered 204 and discarded. Nothing is buffered and nothing
+     * ships, which is the honest answer to "we accepted this and have nowhere
+     * to put it".
+     */
+    protected function registerBrowserForwarder(): void
+    {
+        $this->app->singleton(BrowserForwarder::class, static function ($app): BrowserForwarder {
+            return new BrowserForwarder(
+                self::flusherFactory($app),
+                $app->make(Repository::class),
+                // Both halves of `prism.scrub` out of the container rather than
+                // built here, so a browser report meets the very objects every
+                // PHP signal meets (US-009). {@see registerNightwatchRedaction()}
+                // binds the rules and this method's caller binds the scrubber,
+                // both above this line in `registerCapture()`.
+                new BrowserScrubber($app->make(Scrubber::class), $app->make(RedactRules::class)),
+            );
         });
     }
 
@@ -965,14 +1181,7 @@ class PrismServiceProvider extends ServiceProvider
             return new PrismIngest(
                 $app->make(EventBuffer::class),
                 $app->make(RecordTranslator::class),
-                static fn (EventBuffer $buffer): Flusher => new Flusher(
-                    $app['config'],
-                    $buffer,
-                    $app->make(Transport::class),
-                    $app->make(BatchSpool::class),
-                    $app->make(SpoolScheduler::class),
-                    $app->make(SpanFlush::class),
-                ),
+                self::flusherFactory($app),
                 static function () use ($app): string {
                     if (! $app->bound(Core::class)) {
                         return '';
@@ -992,6 +1201,36 @@ class PrismServiceProvider extends ServiceProvider
         $this->app->booted(function (): void {
             $this->installPrismIngest();
         });
+    }
+
+    /**
+     * A factory that builds a {@see Flusher} over whatever buffer it is handed.
+     *
+     * A factory rather than a flusher because two callers ship a batch that is
+     * deliberately **not** the shared buffer's: {@see PrismIngest::writeNow()},
+     * for a fatal record raised after the dying execution's buffer has been
+     * discarded, and {@see BrowserForwarder}, for a browser report whose
+     * forwarding request is one Prism has asked not to be sampled. One
+     * implementation rather than two, because a second copy would be a second
+     * answer to "which transport, which spool, which flush strategy" — and the
+     * one that drifted would be the one nobody looks at.
+     *
+     * Every dependency is resolved **inside** the returned closure, at flush
+     * time, so a long-lived runtime never holds a transport from a previous
+     * boot.
+     *
+     * @return Closure(EventBuffer): Flusher
+     */
+    private static function flusherFactory(Container $app): Closure
+    {
+        return static fn (EventBuffer $buffer): Flusher => new Flusher(
+            $app->make(Repository::class),
+            $buffer,
+            $app->make(Transport::class),
+            $app->make(BatchSpool::class),
+            $app->make(SpoolScheduler::class),
+            $app->make(SpanFlush::class),
+        );
     }
 
     /**
@@ -1285,12 +1524,11 @@ class PrismServiceProvider extends ServiceProvider
      * engine's handler already there and replaces it rather than doubling every
      * line.
      *
-     * `prism.capture.logs` is an undeclared escape hatch — the shipped config
-     * does not carry it, and absent it defaults to on. It is here for the same
-     * reason `prism.capture.metrics` is, one method along: log attachment and
-     * replica metrics are the two signals Prism produces itself rather than
-     * reads off an engine, so they are the two a host may want off without
-     * switching the whole client off.
+     * `prism.capture.logs` is not in the shipped config and is read for the
+     * reason `prism.capture.metrics` is, one method along: it is the pre-2.0
+     * per-domain toggle, still honoured for a host that published the old file
+     * and switched a signal off. Absent — which is every current install — it
+     * defaults to on.
      */
     protected function registerLogCapture(): void
     {

@@ -33,9 +33,9 @@ return [
     | disabled Prism leaves laravel/nightwatch dormant too rather than letting
     | a transitive dependency keep capturing on its own account.
     |
-    | Which signals are captured, and at what rate, is the capture engine's own
-    | vocabulary (its sampling and filtering blocks) — this package declares no
-    | per-signal toggles of its own.
+    | Which signals are captured, and at what rate, is Nightwatch's own
+    | vocabulary now (its sampling and filtering blocks) — this package no
+    | longer declares "capture" or "sample_rates" toggles of its own.
     |
     */
 
@@ -275,15 +275,17 @@ return [
     |--------------------------------------------------------------------------
     |
     | "capture_payload" decides whether a request's body is recorded at all. It
-    | defaults to FALSE, which is the capture engine's own default: off, a body
-    | is captured only when the request faulted — the case worth debugging — and
-    | no ordinary request ever carries user input off the machine. Turn it on
-    | where the debugging is worth more than the exposure; the scrub list below
-    | still applies either way.
+    | defaults to FALSE, which is the capture engine's own default and a change
+    | from earlier versions of this package: a body used to be captured for
+    | every non-GET request, scrubbed and truncated. Off, a body is captured
+    | only when the request faulted — the case worth debugging — and no ordinary
+    | request ever carries user input off the machine. Turn it on where the
+    | debugging is worth more than the exposure; the scrub list below still
+    | applies either way.
     |
-    | There is no size cap of Prism's own: the capture engine decides what a
-    | body is worth recording and how much of it, and a second limit here would
-    | be a key nothing reads.
+    | There is no size cap of Prism's own any more (US-021): the capture engine
+    | decides what a body is worth recording and how much of it, and a second
+    | limit here would be a key nothing reads.
     |
     */
 
@@ -387,6 +389,78 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Browser telemetry
+    |--------------------------------------------------------------------------
+    |
+    | The endpoint the browser SDK (@misakstvanu/prism-browser) posts to, and
+    | the limits it is held to. It is registered for you the moment this package
+    | is installed and enabled, so the frontend half needs no backend code of
+    | yours — install the npm package, point it at "path" below and browser
+    | errors, logs and page views arrive beside your server-side ones.
+    |
+    | The report goes to YOUR application rather than to the Prism workspace,
+    | and that is the whole shape of the feature. A browser cannot be given an
+    | ingest token — anything the page can read, a reader can read — and a
+    | workspace endpoint open to the page would be an unauthenticated write from
+    | an origin nobody controls. Posting here instead means the report is
+    | enriched with what only the server knows (the signed-in user, the client
+    | IP, the environment), scrubbed with the same "scrub" list every other
+    | signal meets, and shipped through the same pipeline.
+    |
+    |   enabled     Whether the route is registered at all. Off, the endpoint
+    |               does not exist and the SDK's posts 404.
+    |   path        Where it is registered. Anything under a path the host does
+    |               not already use; "_prism/" is a namespace nothing else
+    |               claims. It is excluded from capture automatically — see
+    |               "ignore.paths" below — whatever you rename it to.
+    |   max_events  Events one post may carry. Past the cap the excess is
+    |               dropped, which bounds what a page can cost the server in one
+    |               request.
+    |   max_bytes   Bytes one post may carry, measured before it is decoded.
+    |   rate_limit  Posts per client IP per minute. 0 disables throttling
+    |               entirely; the default is deliberately generous, because a
+    |               busy page in a bad state reports in bursts and the throttle
+    |               is there to bound abuse rather than to sample.
+    |   origins     Origins allowed to post cross-origin. Empty — the default —
+    |               is same-origin only, which is every install that serves its
+    |               frontend from its own domain and needs no CORS at all. List
+    |               a scheme and host ("https://app.example.com") for a frontend
+    |               deployed apart from the backend it reports to, and the route
+    |               answers OPTIONS preflights and allows credentials for that
+    |               origin alone; an unlisted one gets no CORS header, and a
+    |               listed one is echoed back rather than answered with "*",
+    |               which a browser refuses alongside credentials. Str::is
+    |               wildcards work here as they do in "ignore" below, so
+    |               "https://*.example.com" covers a fleet of preview URLs.
+    |   guard       The auth guard the signed-in user is read from; null uses
+    |               the application's default guard.
+    |   trust_client_user  Whether a user id the PAGE claims is believed when
+    |               the request carries no authenticated session. It defaults to
+    |               FALSE and should stay there: a report is an unauthenticated
+    |               write, so a client-supplied identity is a value anyone can
+    |               set to anyone. Turn it on only where the console's user
+    |               attribution is not worth trusting anyway.
+    |
+    | The route is deliberately NOT behind auth middleware: an anonymous visitor
+    | hitting a JavaScript error is exactly the report worth having. It also
+    | runs without CSRF verification, because navigator.sendBeacon cannot set a
+    | header and a write-only telemetry sink has nothing forgery would win.
+    |
+    */
+
+    'browser' => [
+        'enabled' => (bool) env('PRISM_BROWSER_ENABLED', true),
+        'path' => env('PRISM_BROWSER_PATH', '_prism/browser'),
+        'max_events' => 50,
+        'max_bytes' => 262144,
+        'rate_limit' => 120,
+        'origins' => [],
+        'guard' => null,
+        'trust_client_user' => false,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Ignore lists
     |--------------------------------------------------------------------------
     |
@@ -443,6 +517,15 @@ return [
 
     'ignore' => [
         'paths' => [
+            // The browser SDK's own reporting endpoint. A report is a request
+            // the page made *because* of telemetry, so capturing it would put a
+            // request row, its session read and its queue dispatch into the very
+            // batch it produced. The configured `browser.path` is excluded on
+            // top of this whatever it is renamed to (see RejectRules), so this
+            // entry is what covers the default and anything else under the
+            // namespace.
+            '_prism/*',
+
             'prism',
             'prism/*',
             'telescope*',
