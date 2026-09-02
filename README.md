@@ -165,7 +165,7 @@ config file, not two**:
 | `nightwatch.sampling.commands` | `prism.sample.commands` | " |
 | `nightwatch.sampling.scheduled_tasks` | `prism.sample.schedules` | " |
 | `nightwatch.sampling.exceptions` | *pinned at `1.0`* | An error is never sampled out. This is the one derived key with **no** environment escape hatch. |
-| `nightwatch.capture_request_payload` | `prism.request.capture_payload` | See [Scrubbed keys](#scrubbed-keys). |
+| `nightwatch.capture_request_payload` | `prism.request.capture_body` | The engine's own 500-only payload follows the switch Prism's request-body capture reads, so the two cannot disagree. See [Request and response bodies](#request-and-response-bodies). |
 | `nightwatch.redact_payload_fields` | `prism.scrub` | " (upstream's own defaults survive underneath) |
 | `nightwatch.redact_headers` | `prism.scrub` | " |
 
@@ -404,7 +404,10 @@ waiting.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `request.capture_payload` | `PRISM_CAPTURE_REQUEST_PAYLOAD` | `false` | Whether a request's body is recorded at all. Off, a body is captured only for a request that faulted. |
+| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | Record the body the client sent. See [Request and response bodies](#request-and-response-bodies). |
+| `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | Record the body the application sent back. |
+| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body. A cut body says so; `0` disables the cap. |
+| `request.body_content_types` | — | six types | Media types whose bodies are recorded. `text/html` is deliberately absent. This list replaces the default wholesale. |
 | `log.channels` | — | `[]` | Logging channels Prism attaches the engine's handler to. Empty = the app's default channel/stack. You do not have to add `nightwatch` to `config/logging.php` yourself. |
 | `log.level` | `PRISM_LOG_LEVEL` | `debug` | Minimum PSR-3 level captured. |
 | `query.slow_threshold_ms` | `PRISM_SLOW_QUERY_MS` | `100` | A query at/above this is marked slow, and is then kept (with its whole trace) whatever the **server's** per-workspace rules say. It does not survive the client-side rates above — those drop the execution before anything is sent. `0` disables the marker. |
@@ -642,7 +645,8 @@ One list governs every signal. A key here is redacted wherever it appears:
 
 | Where | What happens |
 | --- | --- |
-| Request body, headers, query string | The value is replaced; the field, header and parameter stay, so the shape is still legible. |
+| Request body, headers, query string | The value is replaced; the field, header and parameter stay, so the shape is still legible. A JSON or form body is matched **by key** rather than as text. |
+| Response body | Same, and by key for a JSON document — so an endpoint that answers with a credential does not put one in the console. |
 | Outgoing call query string | Same, so a credential passed to a third-party API never reaches the console. |
 | SQL statement | The value half of `password = 'x'` is replaced. A `?` or `:name` placeholder is left alone. |
 | Artisan command line | `--password=x` keeps the option and loses the value. |
@@ -654,13 +658,54 @@ reach the console however this list is written. That is a change from earlier ve
 captured the payload and scrubbed it; nothing is recorded now but the job's name, id, queue,
 connection and outcome.
 
-Request **bodies** changed the same way, in two steps. The capture engine records a payload only
-for a request whose response was a **500**, and `request.capture_payload`
-(`PRISM_CAPTURE_REQUEST_PAYLOAD`) defaults to `false`, which means no body is recorded at all. The
-old client captured a scrubbed, truncated body for every non-GET request. That is a privacy
-improvement and a debugging regression — set `PRISM_CAPTURE_REQUEST_PAYLOAD=true` where the
-debugging is worth more, and the scrub list above still applies to whatever is captured. A request
-that *succeeded* has no body in the console at either setting.
+### Request and response bodies
+
+Prism records **what an HTTP exchange carried** — the body the client sent and the body your
+application sent back — on every request, not only on one that faulted.
+
+Neither half comes from the capture engine. Its request record serialises a payload only for a
+**500** response, into a field Prism has no column for, and it has no notion of a response body at
+all (it carries `responseSize`, an integer). So Prism captures both itself, from a middleware that
+holds the request and the response at the same time.
+
+| Key | Env | Default | |
+| --- | --- | --- | --- |
+| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | The body the client sent. |
+| `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | The body your application sent back. |
+| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body. `0` disables the cap. |
+| `request.body_content_types` | — | see below | Media types worth recording. |
+
+Both default to **on**: a request body is the most useful thing to have when a bug reproduces once,
+and a response body is what says whether the fault was in what came back or in what went in. Turn
+either off where the exposure outweighs the debugging.
+
+Five rules decide what is stored, and each of them is a way of not lying to you:
+
+- **A structured body is scrubbed BY KEY, not by pattern.** A JSON or form body is decoded, run
+  through [the scrub list](#scrubbed-keys) — the same list that redacts a header or an outgoing
+  query string — and re-encoded. A `password` field is redacted because it is a field called
+  `password`, not because its value happened to look like a secret.
+- **Anything else meets the free-text rule**, the same `name = value` matcher a SQL statement and an
+  artisan command line meet. A `text/plain` or XML body has no keys to walk.
+- **Only readable media types are recorded.** `application/json` (including any `+json` vendor
+  type), `application/x-www-form-urlencoded`, `multipart/form-data`, `application/xml`, `text/xml`
+  and `text/plain`. **`text/html` is deliberately absent** — an HTML response is the rendered page,
+  the largest and least diagnostic thing an application produces. Add it to
+  `request.body_content_types` if you want it; that list replaces the default wholesale, because the
+  config merge is shallow. A streamed or file response is never recorded: its body does not exist
+  yet when the middleware sees it.
+- **A body is capped in bytes and says when it was cut.** The cut never lands inside a multi-byte
+  character, and a truncated body ends in `… [truncated]`, so what you read is never a document that
+  merely looks malformed.
+- **Uploaded file contents are never recorded, at any setting.** A multipart request is stored as
+  its ordinary fields plus a `_prism_files` entry naming, sizing and typing each upload.
+
+Prism's own traffic is exempt: a batch arriving from another install carries the internal marker
+header, and recording its body would put a whole telemetry batch inside one request row.
+
+In the console both bodies appear on the **Request detail** screen. A body that was not captured —
+capture switched off, a media type off the list, a request that carried none, or a row written
+before this version — reads as "no body captured" rather than as an empty one.
 
 ## Manual instrumentation
 
@@ -841,7 +886,9 @@ php artisan prism:check
 | You went looking for an OTLP collector to point at | There isn't one. Spans never leave the process as OTLP — all three OpenTelemetry exporters are pinned to `null` and Prism ships the spans in its own batch. |
 | You went looking for a `nightwatch:agent` daemon | There isn't one. `prism:check` says `agent: not required` for exactly this reason — Prism replaces the engine's transport, so nothing is transmitted over a socket and no daemon is installed, started or monitored. |
 | Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, batches are landing but nothing drains them: check a worker is consuming the queue named by `PRISM_FLUSH_QUEUE` (default queue), and that the endpoint is reachable **from the worker**, which is where the send now happens. |
-| Events flow but bodies/args are blank | Expected: sensitive keys are scrubbed at the source, and a body is captured only when `request.capture_payload` is on **and** the response was a 500 — both conditions, not either. A queued job's payload is never captured at all. |
+| Events flow but a body is blank | Sensitive keys are scrubbed at the source, so a redacted field is expected. A whole body missing means one of: `request.capture_body` / `request.capture_response` off, a media type not on `request.body_content_types` (`text/html` is not, by default), a streamed or file response, or a request that carried no body. See [Request and response bodies](#request-and-response-bodies). |
+| A body ends in `… [truncated]` | It was longer than `request.max_body` (64 KB by default). Raise it, or set it to `0` for no cap. |
+| A queued job's payload is blank | It is never captured at all — the engine's job records carry the name, id, queue, connection and outcome and nothing else. |
 | No telemetry after a deploy | Config cache is stale — `php artisan config:clear` (or re-run `config:cache`). |
 
 `PRISM_ENABLED=false` and an over-quota `429` are both **success** exits for `prism:check` — a

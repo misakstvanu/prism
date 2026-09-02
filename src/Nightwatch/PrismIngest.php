@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Log;
 use Laravel\Nightwatch\Contracts\Ingest;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Flush\Flusher;
+use Misakstvanu\Prism\Http\Middleware\CaptureHttpBodies;
 use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\Otel\SpanLineage;
 use Misakstvanu\Prism\Support\Recursion;
@@ -146,6 +147,11 @@ final class PrismIngest implements Ingest
      *                               which of the engine's records are duplicates of a span it has
      *                               already emitted; see {@see superseded()}. With none, nothing is
      *                               superseded and every record the engine raises is kept.
+     * @param  (Closure(): (array{request_body: string, response_body: string}|null))|null  $bodies  What this
+     *                                                                                               HTTP exchange carried, held by the middleware that saw the
+     *                                                                                               response; see {@see stampBodies()}. Read fresh per record, for
+     *                                                                                               the reason the execution id is. With none, a request row carries
+     *                                                                                               no bodies.
      */
     public function __construct(
         private readonly EventBuffer $buffer,
@@ -155,6 +161,7 @@ final class PrismIngest implements Ingest
         private readonly ?RejectRules $rules = null,
         private readonly ?SpanLineage $lineage = null,
         private readonly ?SpanLane $lane = null,
+        private readonly ?Closure $bodies = null,
     ) {}
 
     /**
@@ -327,7 +334,61 @@ final class PrismIngest implements Ingest
             return null;
         }
 
-        return $this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event)));
+        return $this->stampBodies($this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event))));
+    }
+
+    /**
+     * Put the request and response bodies onto the `request` event.
+     *
+     * The capture engine cannot supply either. Its record has a `payload` field
+     * that is filled only for a 500 and lands in no Prism column, and it has no
+     * notion of a response body at all — a `RequestRecord` carries
+     * `responseSize` and nothing else about what was sent back. So both are
+     * read by {@see CaptureHttpBodies} while
+     * the response is in hand and held until here, which is the one point that
+     * sees the record they belong to.
+     *
+     * Three refusals, each of them a way of not making something up:
+     *
+     *   - **`request` only.** A command, a job attempt and a scheduled task are
+     *     executions too, and none of them exchanged an HTTP body; stamping a
+     *     blank pair onto them would add two columns' worth of nothing to every
+     *     row. A `log` or a `query` inside a request is not the request either.
+     *   - **Nothing recorded, nothing stamped.** The recorder answers null when
+     *     both halves are empty — capture switched off, a content type nobody
+     *     can read, a body that was not there — and a key absent from the
+     *     payload leaves the column at its own `DEFAULT ''` rather than
+     *     asserting an empty body was observed.
+     *   - **A payload that already names them wins.** Nothing produces that
+     *     today, but a record carrying its own answer is a record that knows
+     *     more than this seam does.
+     *
+     * @param  array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}  $event
+     * @return array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}
+     */
+    private function stampBodies(array $event): array
+    {
+        if ($event['type'] !== 'request' || $this->bodies === null) {
+            return $event;
+        }
+
+        try {
+            $bodies = ($this->bodies)();
+        } catch (Throwable) {
+            return $event;
+        }
+
+        if ($bodies === null) {
+            return $event;
+        }
+
+        foreach ($bodies as $column => $body) {
+            if ($body !== '' && ! isset($event['payload'][$column])) {
+                $event['payload'][$column] = $body;
+            }
+        }
+
+        return $event;
     }
 
     /**

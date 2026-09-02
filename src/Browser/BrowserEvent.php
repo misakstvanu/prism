@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Misakstvanu\Prism\Browser;
 
 use DateTimeImmutable;
+use Misakstvanu\Prism\Support\Text;
 use Misakstvanu\Prism\Support\Timestamp;
 
 /**
@@ -114,7 +115,7 @@ final class BrowserEvent
             type: $type,
             timestamp: $at,
             traceId: self::traceId($raw['trace_id'] ?? null),
-            payload: self::cap(BrowserText::sanitize($payload)),
+            payload: self::cap(Text::sanitize($payload)),
         );
     }
 
@@ -156,12 +157,12 @@ final class BrowserEvent
     private static function cap(array $payload): array
     {
         if (is_string($payload['message'] ?? null)) {
-            $payload['message'] = BrowserText::truncate($payload['message'], self::MESSAGE_BYTES);
+            $payload['message'] = Text::truncate($payload['message'], self::MESSAGE_BYTES);
         }
 
         foreach (['url', 'referrer'] as $key) {
             if (is_string($payload[$key] ?? null)) {
-                $payload[$key] = BrowserText::truncate($payload[$key], self::URL_BYTES);
+                $payload[$key] = Text::truncate($payload[$key], self::URL_BYTES);
             }
         }
 
@@ -209,7 +210,7 @@ final class BrowserEvent
                 continue;
             }
 
-            $context[$key] = BrowserText::truncate(
+            $context[$key] = Text::truncate(
                 $value,
                 $key === 'url' || $key === 'referrer' ? self::URL_BYTES : self::CONTEXT_BYTES,
             );

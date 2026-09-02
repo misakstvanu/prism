@@ -14,6 +14,7 @@ use Misakstvanu\Prism\Http\Controllers\BrowserReportController;
 use Misakstvanu\Prism\Nightwatch\PrismIngest;
 use Misakstvanu\Prism\PrismServiceProvider;
 use Misakstvanu\Prism\Support\Recursion;
+use Misakstvanu\Prism\Support\Text;
 use Misakstvanu\Prism\Support\Timestamp;
 
 /**
@@ -261,10 +262,10 @@ final class BrowserForwarder
         $id = Auth::guard(is_string($guard) && $guard !== '' ? $guard : null)->id();
 
         if ($id !== null) {
-            $resolved = trim(BrowserText::clean((string) $id));
+            $resolved = trim(Text::clean((string) $id));
 
             if ($resolved !== '') {
-                return BrowserText::truncate($resolved, self::USER_ID_BYTES);
+                return Text::truncate($resolved, self::USER_ID_BYTES);
             }
         }
 
@@ -331,10 +332,10 @@ final class BrowserForwarder
      * put a NUL or a malformed UTF-8 sequence in one, and ClickHouse's row
      * parser rejects either outright — rejecting the whole insert rather than
      * the offending row, on a queue, long after the 204 that accepted it. See
-     * {@see BrowserText}.
+     * {@see Text}.
      */
     private static function header(string $value, int $bytes): string
     {
-        return BrowserText::truncate(BrowserText::clean($value), $bytes);
+        return Text::truncate(Text::clean($value), $bytes);
     }
 }

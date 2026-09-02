@@ -274,23 +274,56 @@ return [
     | Request capture
     |--------------------------------------------------------------------------
     |
-    | "capture_payload" decides whether a request's body is recorded at all. It
-    | defaults to FALSE, which is the capture engine's own default and a change
-    | from earlier versions of this package: a body used to be captured for
-    | every non-GET request, scrubbed and truncated. Off, a body is captured
-    | only when the request faulted — the case worth debugging — and no ordinary
-    | request ever carries user input off the machine. Turn it on where the
-    | debugging is worth more than the exposure; the scrub list below still
-    | applies either way.
+    | What an HTTP exchange carried: the body the client sent and the body the
+    | application sent back. Neither comes from the capture engine — its request
+    | record serialises a payload only for a 500 and has no notion of a response
+    | body at all — so Prism captures both itself, from a middleware that holds
+    | the request and the response at the same time.
     |
-    | There is no size cap of Prism's own any more (US-021): the capture engine
-    | decides what a body is worth recording and how much of it, and a second
-    | limit here would be a key nothing reads.
+    | "capture_body" and "capture_response" default to TRUE, and record every
+    | request rather than only a faulting one. That is a deliberate reversal of
+    | the previous default: a request body is the single most useful thing to
+    | have when a bug reproduces once, and a response body is what says whether
+    | the fault was in what came back or in what went in. Turn either off where
+    | the exposure outweighs the debugging — the scrub list still applies, and
+    | applies BY KEY for a JSON or form body, so a `password` field is redacted
+    | rather than pattern-matched out of the text.
+    |
+    | "max_body" caps each body in bytes. The cut never lands inside a multi-byte
+    | character and a truncated body says so, so what is stored is always
+    | insertable and never silently partial. `0` disables the cap, which is not
+    | advised: a column's cost is bytes and a request's body is whatever an
+    | unknown client decided to send.
+    |
+    | "body_content_types" is what stops a rendered image, a PDF export or a gzip
+    | stream reaching a String column. It is matched against the media type
+    | alone, so `application/json; charset=utf-8` counts and a `+json` / `+xml`
+    | vendor type resolves to its base. NOTE that "text/html" is deliberately
+    | absent: an HTML response is the rendered page, the largest and least
+    | diagnostic thing an application produces. Add it if you want it — this list
+    | REPLACES the default wholesale, because the config merge is shallow.
+    |
+    | Uploaded file CONTENTS are never recorded at any setting. A multipart
+    | request is stored as its ordinary fields plus a `_prism_files` entry naming
+    | and sizing each upload.
+    |
+    | "capture_body" also drives the capture engine's own `capture_request_payload`,
+    | so the two answers cannot disagree.
     |
     */
 
     'request' => [
-        'capture_payload' => (bool) env('PRISM_CAPTURE_REQUEST_PAYLOAD', false),
+        'capture_body' => (bool) env('PRISM_CAPTURE_REQUEST_BODY', true),
+        'capture_response' => (bool) env('PRISM_CAPTURE_RESPONSE_BODY', true),
+        'max_body' => (int) env('PRISM_MAX_BODY', 65536),
+        'body_content_types' => [
+            'application/json',
+            'application/x-www-form-urlencoded',
+            'multipart/form-data',
+            'application/xml',
+            'text/xml',
+            'text/plain',
+        ],
     ],
 
     /*

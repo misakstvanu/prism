@@ -150,18 +150,18 @@ it('derives the redaction keys the engine\'s own request sensor reads from prism
         ->toBe(['Authorization', 'Cookie', 'Proxy-Authorization', 'X-XSRF-TOKEN', 'password', 'x-tenant-secret']);
 });
 
-it('keeps request bodies off by default', function () {
-    // Upstream's default, and a deliberate change from the old client, which
-    // captured a body for every non-GET request. Off, a body is recorded only
-    // for a request that faulted — a privacy improvement and a debugging
-    // regression, so it is exposed rather than buried.
+it('points the engine\'s own payload switch at prism.request.capture_body', function () {
+    // The two must not be able to disagree: Prism captures the request body
+    // itself now, and `capture_body` is the switch that says so, so the
+    // engine's own 500-only payload follows the same answer rather than being
+    // configured beside it. Default ON — the reversal that story is about.
     $config = registerPrismWith(prismConfig());
 
-    expect($config->get('nightwatch.capture_request_payload'))->toBeFalse();
+    expect($config->get('nightwatch.capture_request_payload'))->toBeTrue();
 
-    $enabled = registerPrismWith(prismConfig(['request' => ['capture_payload' => true]]));
+    $off = registerPrismWith(prismConfig(['request' => ['capture_body' => false]]));
 
-    expect($enabled->get('nightwatch.capture_request_payload'))->toBeTrue();
+    expect($off->get('nightwatch.capture_request_payload'))->toBeFalse();
 });
 
 it('leaves the redaction keys a host answered through the environment alone', function () {

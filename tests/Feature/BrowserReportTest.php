@@ -3,7 +3,7 @@
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
 use Misakstvanu\Prism\Browser\BrowserEvent;
 use Misakstvanu\Prism\Browser\BrowserReport;
-use Misakstvanu\Prism\Browser\BrowserText;
+use Misakstvanu\Prism\Support\Text;
 
 /**
  * What the browser endpoint accepts, and what it does to it (US-006).
@@ -278,15 +278,15 @@ it('strips invalid UTF-8, which reaches the payload from the server side', funct
     // Not through the JSON body — `json_decode` refuses a malformed sequence
     // outright — but through the enrichment the host adds (US-008): a
     // `User-Agent` header is a byte string an old client can put anything in.
-    expect(BrowserText::clean("caf\xC3\xA9 \xB1\xB2 bar"))->toBe('café  bar')
-        ->and(mb_check_encoding(BrowserText::clean("\xC3\x28"), 'UTF-8'))->toBeTrue();
+    expect(Text::clean("caf\xC3\xA9 \xB1\xB2 bar"))->toBe('café  bar')
+        ->and(mb_check_encoding(Text::clean("\xC3\x28"), 'UTF-8'))->toBeTrue();
 });
 
 it('never cuts a multi-byte character in half', function () {
     // The cap is in bytes because a column's cost is bytes, but a cut through
     // the middle of a character produces exactly the invalid UTF-8 the rule
     // above exists to keep out.
-    $cut = BrowserText::truncate(str_repeat('é', 100), 51);
+    $cut = Text::truncate(str_repeat('é', 100), 51);
 
     expect(strlen($cut))->toBe(50)
         ->and(mb_check_encoding($cut, 'UTF-8'))->toBeTrue()

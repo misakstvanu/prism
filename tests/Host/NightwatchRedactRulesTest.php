@@ -82,10 +82,10 @@ it('pushes them onto the sensor nightwatch built before this provider registered
         ->and(sensorProperty('redactHeaders'))->toContain('x-tenant-secret');
 });
 
-// -- AC3: request bodies are off by default --------------------------------
+// -- AC3: the engine's own payload switch follows prism.request.capture_body --
 
-it('captures no request body by default', function () {
-    bootPrismWithScrub(['password']);
+it('switches the engine\'s own payload off with prism.request.capture_body', function () {
+    bootPrismWithScrub(['password'], ['request.capture_body' => false]);
 
     expect(config('nightwatch.capture_request_payload'))->toBeFalse()
         ->and(sensorProperty('captureRequestPayload'))->toBeFalse();
@@ -93,13 +93,15 @@ it('captures no request body by default', function () {
     captureRequest(payload: ['email' => 'a@b.test', 'password' => 'hunter2-field'], status: 500);
 
     // A body is recorded only on a 500 upstream, and this IS one — so what is
-    // missing here is the body itself, not the occasion for it.
+    // missing here is the body itself, not the occasion for it. Prism's own
+    // capture is off with the same switch; `RequestBodyCaptureTest` is where
+    // that half is asserted.
     expect(shippedEvent('request')['payload']['payload'] ?? '')
         ->toContain('NOT_ENABLED');
 });
 
-it('captures a request body when the host asks for one', function () {
-    bootPrismWithScrub(['password'], ['request.capture_payload' => true]);
+it('redacts the engine\'s own payload when it is captured', function () {
+    bootPrismWithScrub(['password'], ['request.capture_body' => true]);
 
     expect(sensorProperty('captureRequestPayload'))->toBeTrue();
 
@@ -107,7 +109,9 @@ it('captures a request body when the host asks for one', function () {
 
     $body = shippedEvent('request')['payload']['payload'] ?? '';
 
-    // The opt-in works, the benign field survives it, and the secret does not.
+    // The benign field survives the redaction and the secret does not. This is
+    // upstream's own payload field, which lands in no Prism column — it is
+    // asserted because the day it gains one, it must already be clean.
     expect($body)->toContain('a@b.test')
         ->and($body)->not->toContain('hunter2-field');
 });
@@ -115,7 +119,7 @@ it('captures a request body when the host asks for one', function () {
 // -- AC4: a password field and an Authorization header, on four signals -----
 
 it('redacts a sensitive field, header and query parameter from a request', function () {
-    bootPrismWithScrub(['password', 'token'], ['request.capture_payload' => true]);
+    bootPrismWithScrub(['password', 'token'], ['request.capture_body' => true]);
 
     captureRequest(
         url: 'https://app.test/orders?token=hunter2-url&page=2',

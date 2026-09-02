@@ -60,8 +60,10 @@ use Misakstvanu\Prism\Console\CheckCommand;
 use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Flush\SpoolScheduler;
+use Misakstvanu\Prism\Http\BodyRecorder;
 use Misakstvanu\Prism\Http\Controllers\BrowserPreflightController;
 use Misakstvanu\Prism\Http\Controllers\BrowserReportController;
+use Misakstvanu\Prism\Http\Middleware\CaptureHttpBodies;
 use Misakstvanu\Prism\Http\Middleware\RejectIgnoredRequests;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
@@ -327,10 +329,13 @@ class PrismServiceProvider extends ServiceProvider
             // `prism.scrub` is the one list, so the two keys upstream's own
             // request sensor reads are derived from it rather than kept beside
             // it (US-011). `capture_request_payload` rides along because it
-            // decides whether the first of them is consulted at all.
+            // decides whether the first of them is consulted at all — and it
+            // follows `prism.request.capture_body`, the switch Prism's own
+            // {@see BodyRecorder} reads, so a host that asked for request bodies
+            // cannot get one answer from the engine and another from Prism.
             'capture_request_payload' => [
                 'NIGHTWATCH_CAPTURE_REQUEST_PAYLOAD',
-                (bool) $config->get('prism.request.capture_payload', false),
+                (bool) $config->get('prism.request.capture_body', true),
             ],
             'redact_payload_fields' => ['NIGHTWATCH_REDACT_PAYLOAD_FIELDS', $redact->payloadFields()],
             'redact_headers' => ['NIGHTWATCH_REDACT_HEADERS', $redact->headerNames()],
@@ -1053,6 +1058,11 @@ class PrismServiceProvider extends ServiceProvider
         // build an ingest holding whatever rules the previous boot left.
         $this->registerNightwatchFiltering();
         $this->registerNightwatchRedaction();
+
+        // Bodies BEFORE the ingest: the ingest's own singleton closes over the
+        // recorder, and `installPrismIngest()` fires at once when the app is
+        // already booted (a re-boot, an Octane worker).
+        $this->registerBodyCapture();
         $this->registerNightwatchIngest();
         $this->registerBrowserForwarder();
         $this->registerLogCapture();
@@ -1074,6 +1084,7 @@ class PrismServiceProvider extends ServiceProvider
             TraceContext::start();
             Recursion::reset();
             $this->app->make(EventBuffer::class)->clear();
+            $this->app->make(BodyRecorder::class)->reset();
         });
 
         // Under Octane the app is not rebuilt between requests, so the buffer
@@ -1088,6 +1099,7 @@ class PrismServiceProvider extends ServiceProvider
             TraceContext::reset();
             Recursion::reset();
             $this->app->make(EventBuffer::class)->clear();
+            $this->app->make(BodyRecorder::class)->reset();
         });
 
         // Ship the buffer after the response has been sent to the client, off
@@ -1096,6 +1108,50 @@ class PrismServiceProvider extends ServiceProvider
         $this->app->terminating(function (): void {
             $this->flush();
         });
+    }
+
+    /**
+     * The request and response bodies of an HTTP exchange (`prism.request.*`).
+     *
+     * Two halves, and they are separated by the same gap every other capture in
+     * this package has: something has to *hold* what was seen, and something
+     * has to see it.
+     *
+     *   - {@see BodyRecorder} is the holder, a **singleton** for the reason
+     *     {@see EventBuffer} is one — a long-lived runtime keeps the container
+     *     between executions, so what makes it safe is that the middleware
+     *     clears it on the way *in* rather than that it is discarded on the way
+     *     out. It is also the object the ingest closes over, so it must be
+     *     bound before {@see registerNightwatchIngest()}.
+     *   - {@see CaptureHttpBodies} is the seam. **Pushed** onto the global
+     *     stack rather than prepended, so the response it reads is the one the
+     *     client receives — after every global middleware has had its say —
+     *     rather than the one the controller returned. Being pushed also puts
+     *     it inside {@see RejectIgnoredRequests}, which is what lets it see the
+     *     suppression scope an inbound Prism batch is wrapped in.
+     *
+     * A worker never runs the middleware and so never has a body to report,
+     * which is correct: a job is not an HTTP exchange, and {@see BodyRecorder}
+     * answers null for one. The buffer resets already registered for a job and
+     * for an Octane request clear it too — an Octane request goes on to run the
+     * middleware, and a job must not inherit whatever the last request in that
+     * process exchanged.
+     */
+    protected function registerBodyCapture(): void
+    {
+        $this->app->singleton(BodyRecorder::class, static function ($app): BodyRecorder {
+            return new BodyRecorder(
+                $app['config'],
+                $app->make(Scrubber::class),
+                $app->make(RedactRules::class),
+            );
+        });
+
+        $kernel = $this->app->make(HttpKernelContract::class);
+
+        if ($kernel instanceof FoundationHttpKernel) {
+            $kernel->pushMiddleware(CaptureHttpBodies::class);
+        }
     }
 
     /**
@@ -1195,6 +1251,7 @@ class PrismServiceProvider extends ServiceProvider
                 $app->make(RejectRules::class),
                 $app->make(SpanLineage::class),
                 $app->make(SpanLane::class),
+                static fn (): ?array => $app->make(BodyRecorder::class)->captured(),
             );
         });
 

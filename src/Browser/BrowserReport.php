@@ -7,6 +7,7 @@ namespace Misakstvanu\Prism\Browser;
 use DateTimeImmutable;
 use JsonException;
 use Misakstvanu\Prism\Http\Controllers\BrowserReportController;
+use Misakstvanu\Prism\Support\Text;
 use Misakstvanu\Prism\Support\Timestamp;
 
 /**
@@ -210,8 +211,8 @@ final class BrowserReport
             return null;
         }
 
-        $value = trim(BrowserText::clean($value));
+        $value = trim(Text::clean($value));
 
-        return $value === '' ? null : BrowserText::truncate($value, self::IDENTIFIER_BYTES);
+        return $value === '' ? null : Text::truncate($value, self::IDENTIFIER_BYTES);
     }
 }
