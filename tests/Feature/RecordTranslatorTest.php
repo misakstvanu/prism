@@ -93,8 +93,13 @@ it('maps a request onto the columns the requests table already has', function ()
     $payload = $this->translator->translate($this->records['request'])['payload'];
 
     expect($payload['method'])->toBe('GET')
-        // Nightwatch records the whole URL; the column holds the path.
+        // Nightwatch records the whole URL; the columns hold its two halves
+        // separately. `path` is the dimension the Stream tab filters and scans
+        // by, so the query is beside it rather than inside it — and it is a
+        // column at all because the detail screen's Query parameters panel used
+        // to parse it back off `path`, which by construction never has one.
         ->and($payload['path'])->toBe('/orders/5')
+        ->and($payload['query_string'])->toBe('include=lines')
         // ...and spells a route pattern with a leading slash, where Laravel's
         // own Route::uri() — and every row already in the table — does not.
         ->and($payload['route'])->toBe('orders/{order}')

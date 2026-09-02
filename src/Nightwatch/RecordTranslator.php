@@ -314,6 +314,13 @@ final class RecordTranslator
      * seven execution-stage durations ride the passthrough untouched, under the
      * names US-007's columns take.
      *
+     * `url` is read **twice**, into `path` and `query_string`, because those are
+     * two different questions: `path` is the dimension a reader filters and
+     * scans the Stream by, and mixing a query string into it would make one
+     * endpoint a different value on every request. The query is the detail
+     * screen's alone. Splitting them here rather than storing the whole URL is
+     * also what keeps `path`'s meaning byte-identical to what it has always had.
+     *
      * @param  array<string, mixed>  $r
      * @return array<string, mixed>
      */
@@ -329,6 +336,7 @@ final class RecordTranslator
             'query_count' => $this->int($r['queries'] ?? null),
             'ip' => $this->string($r['ip'] ?? null),
             'user_agent' => $this->header($r['headers'] ?? null, 'user-agent'),
+            'query_string' => $this->query($this->string($r['url'] ?? null)),
         ];
     }
 
@@ -913,6 +921,33 @@ final class RecordTranslator
         $path = parse_url($url, PHP_URL_PATH);
 
         return is_string($path) ? $path : '';
+    }
+
+    /**
+     * The query string of that same URL, without its `?`.
+     *
+     * It is stored in a column of its own rather than left on `path`, and it is
+     * the half {@see path()} used to throw away: the request detail screen has
+     * always had a Query parameters panel, and parsing it back off `path` — a
+     * value that by construction never contains a `?` — meant that panel could
+     * never draw anything.
+     *
+     * Whatever `prism.scrub` covers is **already gone by the time this runs**:
+     * upstream's own request sensor invokes the redact callbacks while it builds
+     * the record, and `RedactRules::redactRequest()` rewrites `$record->url`'s
+     * query pair by pair. That rewrite used to be work with no consequence,
+     * since the query it cleaned was discarded a moment later; this is what
+     * makes it load-bearing.
+     */
+    private function query(string $url): string
+    {
+        if ($url === '') {
+            return '';
+        }
+
+        $query = parse_url($url, PHP_URL_QUERY);
+
+        return is_string($query) ? $query : '';
     }
 
     /**

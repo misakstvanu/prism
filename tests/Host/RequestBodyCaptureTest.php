@@ -107,6 +107,24 @@ it('records the body of a request that faulted', function () {
     expect(shippedRequestPayload()['request_body'] ?? '')->toContain('a@b.test');
 });
 
+it('records the query string beside the path, not inside it', function () {
+    // A column of its own: `path` is the dimension the Stream tab filters and
+    // scans by, so a query mixed into it would make one endpoint a different
+    // value on every request. And whatever `prism.scrub` covers is already gone
+    // — the engine's own redact callback rewrites the record's URL pair by pair
+    // while it builds it, which is work that had no consequence until this
+    // column existed to keep the result.
+    Route::get('/prism-query-probe', fn () => response('ok', 200, ['Content-Type' => 'text/plain']));
+
+    $this->get('/prism-query-probe?page=2&token=secret-query-value')->assertOk();
+
+    $payload = shippedRequestPayload();
+
+    expect($payload['path'] ?? '')->toBe('/prism-query-probe')
+        ->and($payload['query_string'] ?? '')->toContain('page=2')
+        ->and($payload['query_string'] ?? '')->not->toContain('secret-query-value');
+});
+
 it('caps each body and says that it cut one', function () {
     config(['prism.request.max_body' => 40]);
 

@@ -660,8 +660,9 @@ connection and outcome.
 
 ### Request and response bodies
 
-Prism records **what an HTTP exchange carried** — the body the client sent and the body your
-application sent back — on every request, not only on one that faulted.
+Prism records **what an HTTP exchange carried** — the body the client sent, the body your
+application sent back, and the query string it was addressed with — on every request, not only on
+one that faulted.
 
 Neither half comes from the capture engine. Its request record serialises a payload only for a
 **500** response, into a field Prism has no column for, and it has no notion of a response body at
@@ -700,10 +701,17 @@ Five rules decide what is stored, and each of them is a way of not lying to you:
 - **Uploaded file contents are never recorded, at any setting.** A multipart request is stored as
   its ordinary fields plus a `_prism_files` entry naming, sizing and typing each upload.
 
+The **query string** is recorded beside the path rather than inside it, in a column of its own.
+`path` is the dimension you filter and scan the Stream tab by, so a query mixed into it would make
+one endpoint a different value on every request. It needs no switch of its own — it is part of the
+request's address, not its payload — and whatever `prism.scrub` covers is redacted pair by pair
+before it is stored, so `?token=…` reaches the console as `?token=%5BREDACTED%5D`.
+
 Prism's own traffic is exempt: a batch arriving from another install carries the internal marker
 header, and recording its body would put a whole telemetry batch inside one request row.
 
-In the console both bodies appear on the **Request detail** screen. A body that was not captured —
+In the console all three appear on the **Request detail** screen — the two body panels and the
+Query parameters panel. A body that was not captured —
 capture switched off, a media type off the list, a request that carried none, or a row written
 before this version — reads as "no body captured" rather than as an empty one.
 
