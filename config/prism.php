@@ -281,11 +281,18 @@ return [
     | Request capture
     |--------------------------------------------------------------------------
     |
-    | What an HTTP exchange carried: the body the client sent and the body the
-    | application sent back. Neither comes from the capture engine — its request
-    | record serialises a payload only for a 500 and has no notion of a response
-    | body at all — so Prism captures both itself, from a middleware that holds
-    | the request and the response at the same time.
+    | What an HTTP exchange carried: the headers it was addressed with, the body
+    | the client sent and the body the application sent back. None of the three
+    | comes usably from the capture engine — its request record serialises a
+    | payload only for a 500, has no notion of a response body at all, and words
+    | its header redaction its own way — so Prism captures all three itself,
+    | from a middleware that holds the request and the response at the same time.
+    |
+    | "capture_headers" defaults to TRUE and records the header bag on EVERY
+    | request, not only a faulting one. The scrub list applies BY KEY, so
+    | `authorization` and `cookie` read `[REDACTED]` exactly as a `password`
+    | field in a JSON body does, and any header name you add to `prism.scrub` is
+    | answered the same way.
     |
     | "capture_body" and "capture_response" default to TRUE, and record every
     | request rather than only a faulting one. That is a deliberate reversal of
@@ -296,7 +303,7 @@ return [
     | applies BY KEY for a JSON or form body, so a `password` field is redacted
     | rather than pattern-matched out of the text.
     |
-    | "max_body" caps each body in bytes. The cut never lands inside a multi-byte
+    | "max_body" caps each body — and the header bag — in bytes. The cut never lands inside a multi-byte
     | character and a truncated body says so, so what is stored is always
     | insertable and never silently partial. `0` disables the cap, which is not
     | advised: a column's cost is bytes and a request's body is whatever an
@@ -320,6 +327,7 @@ return [
     */
 
     'request' => [
+        'capture_headers' => (bool) env('PRISM_CAPTURE_REQUEST_HEADERS', true),
         'capture_body' => (bool) env('PRISM_CAPTURE_REQUEST_BODY', true),
         'capture_response' => (bool) env('PRISM_CAPTURE_RESPONSE_BODY', true),
         'max_body' => (int) env('PRISM_MAX_BODY', 65536),

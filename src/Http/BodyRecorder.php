@@ -65,6 +65,18 @@ use Throwable;
  * recorded as its non-file fields; the files are named, sized and typed in a
  * `_files` entry beside them, because a body that silently omitted the half of
  * the request that mattered would be worse than one that says what it left out.
+ *
+ * **The request headers are captured here too, and on every request.** The
+ * engine does serialise a header bag onto its own record, but it words a
+ * redaction its own way (`[47 bytes redacted]`) where every other value Prism
+ * stores says `[REDACTED]` — one console, two vocabularies for one act — and it
+ * blanks only the names it was handed rather than walking the bag by key. So
+ * the bag is read here instead, through the same {@see Scrubber} a JSON body
+ * meets, and lands in the `request_headers` column beside the two bodies. The
+ * 500-only rule that governs the engine's *payload* has never governed its
+ * headers and does not govern these: a header bag is what says how a request
+ * was addressed, and a 200 that was addressed wrongly is exactly the case it
+ * answers.
  */
 final class BodyRecorder
 {
@@ -100,6 +112,9 @@ final class BodyRecorder
         'text/plain',
     ];
 
+    /** The recorded request headers as JSON, or '' when they were not recorded. */
+    private string $requestHeaders = '';
+
     /** The recorded request body, or '' when there was none to record. */
     private string $requestBody = '';
 
@@ -122,12 +137,13 @@ final class BodyRecorder
      */
     public function reset(): void
     {
+        $this->requestHeaders = '';
         $this->requestBody = '';
         $this->responseBody = '';
     }
 
     /**
-     * Record what this exchange carried, subject to the two switches, the
+     * Record what this exchange carried, subject to the three switches, the
      * content-type allow list and the byte cap.
      *
      * Every step is guarded: reading a body means touching a stream, decoding
@@ -137,6 +153,10 @@ final class BodyRecorder
      */
     public function record(Request $request, Response $response): void
     {
+        if ($this->enabled('capture_headers')) {
+            $this->requestHeaders = $this->guard(fn (): string => $this->readHeaders($request));
+        }
+
         if ($this->enabled('capture_body')) {
             $this->requestBody = $this->guard(fn (): string => $this->readRequest($request));
         }
@@ -147,26 +167,65 @@ final class BodyRecorder
     }
 
     /**
-     * The two bodies as the `requests` columns name them, or null when neither
-     * was captured.
+     * What was recorded, as the `requests` columns name them, or null when
+     * nothing was.
      *
-     * Null rather than a pair of empty strings so the ingest can leave the
+     * Null rather than a set of empty strings so the ingest can leave the
      * payload alone entirely for an execution that is not an HTTP request —
-     * a command, a job — rather than stamping two blanks onto every one of
-     * them.
+     * a command, a job — rather than stamping three blanks onto every one of
+     * them. The ingest drops an empty value key by key, so a request that
+     * recorded headers and no body stamps only the headers.
      *
-     * @return array{request_body: string, response_body: string}|null
+     * @return array{request_headers: string, request_body: string, response_body: string}|null
      */
     public function captured(): ?array
     {
-        if ($this->requestBody === '' && $this->responseBody === '') {
+        if ($this->requestHeaders === '' && $this->requestBody === '' && $this->responseBody === '') {
             return null;
         }
 
         return [
+            'request_headers' => $this->requestHeaders,
             'request_body' => $this->requestBody,
             'response_body' => $this->responseBody,
         ];
+    }
+
+    /**
+     * The request's headers as scrubbed JSON.
+     *
+     * Symfony lower-cases every name and holds every value as a list, because a
+     * header may legally repeat. A name that carried exactly one value is
+     * flattened back to a string here — a bag whose every value is a
+     * one-element array reads as a machine's idea of a header bag rather than a
+     * reader's — while a genuinely repeated one keeps its list, so nothing is
+     * silently dropped.
+     *
+     * The {@see Scrubber} then walks it by key, which is the whole reason this
+     * is read here rather than taken off the engine's own record: `cookie` and
+     * `authorization` are keys, so they are answered by the same `prism.scrub`
+     * list and the same `[REDACTED]` wording as a `password` field in a JSON
+     * body. The cap is the bodies' cap — a header bag is small, but nothing
+     * that reaches a String column may be unbounded.
+     */
+    private function readHeaders(Request $request): string
+    {
+        /** @var array<string, mixed> $bag */
+        $bag = $request->headers->all();
+
+        $headers = [];
+
+        foreach ($bag as $name => $values) {
+            $headers[$name] = is_array($values) && count($values) === 1
+                ? reset($values)
+                : $values;
+        }
+
+        if ($headers === []) {
+            return '';
+        }
+
+        return $this->cap($this->encode($this->scrubber->scrub($headers)));
     }
 
     /**
