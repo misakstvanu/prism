@@ -58,6 +58,13 @@ PRISM_ENDPOINT=https://your-workspace.prism.app/api/ingest
 hosted endpoint; set it to your workspace's `/api/ingest` if you self-host. Everything else has a
 working default.
 
+**On a local host you can leave `PRISM_TOKEN` blank.** With `APP_ENV=local` the client captures and
+ships anyway, with no `Authorization` header at all, and a Prism hub running in *its* own `local`
+environment accepts that batch and attributes it to a default workspace — so a development console
+fills up from `composer require` plus `PRISM_APP`, with nothing minted or copied. The two halves
+must agree: a blank token against a hub that is not local is refused with a `401`, and a blank token
+on any other host is the silent no-op below.
+
 **3. Verify**
 
 ```bash
@@ -84,7 +91,9 @@ answered on the spot:
 
 `ingest` is the line to read when a workspace looks empty: it says whether Prism's own pipeline is
 installed over the engine's, which happens only when `PRISM_ENABLED` is true **and** `PRISM_TOKEN`
-is set. `otel spans` is the second half of the same question — it says whether the span processor
+is set — or the host is `local`, where the `token` line reads
+`(none — local host, hub must allow untokened ingest)` and the command carries on rather than
+failing. `otel spans` is the second half of the same question — it says whether the span processor
 that gives the Traces waterfall its nesting is registered; `not configured` costs the nesting and
 nothing else. Anything else there means records are being captured and handed to a socket ingest nothing
 is listening on — which looks exactly like a quiet application from the console.
@@ -109,7 +118,7 @@ last wording is printed even for a disabled install, where the rest of this sect
 
 | Variable | Purpose |
 | --- | --- |
-| `PRISM_TOKEN` | The ingest token minted in **Console → Settings → API tokens**. With no token the package silently no-ops and logs a single warning at boot — it never throws. |
+| `PRISM_TOKEN` | The ingest token minted in **Console → Settings → API tokens**. With no token the package silently no-ops and logs a single warning at boot — it never throws. Blank is allowed on a `local` host only, where the hub must be local too. |
 | `PRISM_APP` | The application slug this process reports as, inside the workspace the token belongs to. |
 
 ## Configuration
@@ -139,7 +148,7 @@ Publish either of those files yourself and Prism steps back from it entirely —
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `enabled` | `PRISM_ENABLED` | `true` | The kill switch. `false` registers **no** listeners and adds zero overhead — the package is inert, as if uninstalled. |
-| `token` | `PRISM_TOKEN` | `null` | Ingest token. *(required)* |
+| `token` | `PRISM_TOKEN` | `null` | Ingest token. *(required, except on a `local` host feeding a local hub — blank ships with no `Authorization` header)* |
 | `app` | `PRISM_APP` | `null` | Application slug this process reports as. *(required)* |
 | `endpoint` | `PRISM_ENDPOINT` | `https://prism.dev/api/ingest` | Where batches are POSTed. Point at your workspace's `/api/ingest` when self-hosting. |
 
@@ -888,7 +897,8 @@ php artisan prism:check
 | A `401` from the endpoint | The token is wrong, revoked, or not an **ingest**-scope token. Mint a fresh ingest token. |
 | A `429` from the endpoint | The workspace is over its monthly event quota. Connectivity and the token are fine — this is a billing state. Errors are still accepted. |
 | Nothing appears in the console | Confirm `PRISM_ENABLED` is not `false`, the path/job is not on an ignore list, and — for a worker — that a job has actually run (the batch flushes at the end of each job). |
-| `prism:check` reports `records are NOT reaching Prism` | The capture engine is running but Prism's ingest was never installed over it — which happens when `PRISM_ENABLED` is false or `PRISM_TOKEN` is blank at boot. Fix those and the `ingest` line reads `in-process`. |
+| `prism:check` reports `records are NOT reaching Prism` | The capture engine is running but Prism's ingest was never installed over it — which happens when `PRISM_ENABLED` is false, or `PRISM_TOKEN` is blank at boot on a host that is not `local`. Fix those and the `ingest` line reads `in-process`. |
+| A token-less local install gets `401`s | The hub is not running in *its* `local` environment, or it has no workspace to attribute the batch to. Token-less ingest is a local-to-local arrangement; anywhere else, set `PRISM_TOKEN`. |
 | The browser SDK's posts come back `404` | The endpoint is not registered. `prism:check`'s `browser` line says why: `PRISM_ENABLED=false` (the only switch that removes it — a blank `PRISM_TOKEN` still answers `204`), `PRISM_BROWSER_ENABLED=false`, or a blank `PRISM_BROWSER_PATH`. It also prints the address the router will answer, which is the other half of a `404`: the SDK may simply be posting somewhere else. |
 | The browser SDK's posts are refused by the browser itself | The page is on a different origin from the backend and that origin is not on `browser.origins` — `prism:check`'s `browser` line reads back the list it is matched against. See [Browser telemetry](#browser-telemetry). |
 | You went looking for an OTLP collector to point at | There isn't one. Spans never leave the process as OTLP — all three OpenTelemetry exporters are pinned to `null` and Prism ships the spans in its own batch. |

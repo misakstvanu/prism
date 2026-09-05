@@ -16,6 +16,7 @@ use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Nightwatch\PrismIngest;
 use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Support\Credentials;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
@@ -125,7 +126,11 @@ class CheckCommand extends Command
     {
         $problems = [];
 
-        if (blank($config->get('prism.token'))) {
+        // A blank token is fatal everywhere except a `local` host, where a hub
+        // in the same environment accepts token-less ingest (US-003). Reported
+        // as a state on the `token` line below rather than as a problem, since
+        // there is nothing here for anyone to fix.
+        if (! Credentials::usable($config, $this->laravel->environment())) {
             $problems[] = 'PRISM_TOKEN is not set. Mint an ingest-scoped token in the Prism console '
                 .'(Settings → API tokens) and set PRISM_TOKEN.';
         }
@@ -191,10 +196,27 @@ class CheckCommand extends Command
         $this->engineLine('agent', '<fg=green>not required</> — no daemon, nothing opens the agent socket');
         $this->engineLine('otel spans', $this->spanProcessorDescription());
         $this->reportBrowserEndpoint($config);
-        $this->engineLine('token', blank($config->get('prism.token'))
-            ? '<fg=red>missing</> — set PRISM_TOKEN'
-            : '<fg=green>present</>');
+        $this->engineLine('token', $this->tokenDescription($config));
         $this->engineLine('endpoint', (string) $config->get('prism.endpoint'));
+    }
+
+    /**
+     * The credential this process ships under — three states, not two.
+     *
+     * A blank token on a `local` host is not a fault (US-003): the hub accepts
+     * a token-less batch there and attributes it to a default workspace, so the
+     * line says what will happen and what has to be true at the other end,
+     * rather than telling an operator to go and mint something.
+     */
+    private function tokenDescription(Repository $config): string
+    {
+        if (Credentials::tokenless($config, $this->laravel->environment())) {
+            return '<fg=yellow>(none — local host, hub must allow untokened ingest)</>';
+        }
+
+        return blank($config->get('prism.token'))
+            ? '<fg=red>missing</> — set PRISM_TOKEN'
+            : '<fg=green>present</>';
     }
 
     /** One dotted label/value line of the capture-engine report. */
@@ -469,15 +491,24 @@ class CheckCommand extends Command
         $this->newLine();
         $this->line("  Sending a test event to {$endpoint} …");
 
+        $token = (string) $config->get('prism.token');
+
+        $request = Http::timeout($timeout)
+            ->connectTimeout($timeout)
+            ->acceptJson()
+            // Mark the probe as Prism's own so an active install's HTTP
+            // capture (US-046) never records this diagnostic call.
+            ->withHeaders([Recursion::MARKER_HEADER => '1']);
+
+        // No bearer at all on the token-less local path, exactly as the
+        // transport sends it: the hub's fallback is reached by a *missing*
+        // bearer, so probing with an empty one would test a different thing.
+        if ($token !== '') {
+            $request = $request->withToken($token);
+        }
+
         try {
-            $response = Http::withToken((string) $config->get('prism.token'))
-                ->timeout($timeout)
-                ->connectTimeout($timeout)
-                ->acceptJson()
-                // Mark the probe as Prism's own so an active install's HTTP
-                // capture (US-046) never records this diagnostic call.
-                ->withHeaders([Recursion::MARKER_HEADER => '1'])
-                ->post($endpoint, $this->testEnvelope($config));
+            $response = $request->post($endpoint, $this->testEnvelope($config));
         } catch (Throwable $e) {
             $this->components->error(
                 "Could not reach the ingest endpoint at {$endpoint}: {$e->getMessage()}. "
@@ -491,9 +522,12 @@ class CheckCommand extends Command
         $status = $response->status();
 
         if ($status === 401) {
-            $this->components->error(
-                'The ingest endpoint rejected the token (HTTP 401). Check PRISM_TOKEN — it may be '
-                .'revoked, mistyped, or not an ingest-scoped token.'
+            $this->components->error($token === ''
+                ? 'The ingest endpoint refused an untokened batch (HTTP 401). A hub only accepts one '
+                    .'when it is itself running in the local environment and has a workspace to '
+                    .'attribute it to — otherwise set PRISM_TOKEN.'
+                : 'The ingest endpoint rejected the token (HTTP 401). Check PRISM_TOKEN — it may be '
+                    .'revoked, mistyped, or not an ingest-scoped token.'
             );
             $this->newLine();
 
