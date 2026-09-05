@@ -12,6 +12,7 @@ use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Http\Middleware\CaptureHttpBodies;
 use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\Otel\SpanLineage;
+use Misakstvanu\Prism\Queue\JobPayloadRecorder;
 use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
@@ -153,6 +154,11 @@ final class PrismIngest implements Ingest
      *                                                                  the response; see {@see stampBodies()}. Read fresh per
      *                                                                  record, for the reason the execution id is. With none, a
      *                                                                  request row carries none of them.
+     * @param  (Closure(string): (string|null))|null  $jobPayload  What a job was asked to do, looked up by the
+     *                                                             job id the record carries and released as it is
+     *                                                             answered; held by the listeners that saw the
+     *                                                             queue events. See {@see stampJobPayload()}. With
+     *                                                             none, a job row carries no payload.
      */
     public function __construct(
         private readonly EventBuffer $buffer,
@@ -163,6 +169,7 @@ final class PrismIngest implements Ingest
         private readonly ?SpanLineage $lineage = null,
         private readonly ?SpanLane $lane = null,
         private readonly ?Closure $bodies = null,
+        private readonly ?Closure $jobPayload = null,
     ) {}
 
     /**
@@ -335,7 +342,66 @@ final class PrismIngest implements Ingest
             return null;
         }
 
-        return $this->stampBodies($this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event))));
+        return $this->stampJobPayload($this->stampBodies($this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event)))));
+    }
+
+    /**
+     * Put onto a `job` event what the job was asked to do.
+     *
+     * The capture engine reports a job by name, id, queue, connection and
+     * outcome and says nothing about its arguments — so `backup:tenant 41` and
+     * `backup:tenant 7` are one row shape with no way to tell which tenant
+     * failed. Prism's `jobs` table has had a `payload` column and the
+     * failed-job screen a panel drawn from it since long before the engine
+     * arrived; {@see JobPayloadRecorder} is what fills them, and this is the
+     * one point that sees both the held payload and the record it belongs to.
+     *
+     * **Both halves of a job's life carry it.** A dispatch and an attempt are
+     * two records — often in two processes — and each holds the payload from
+     * the queue event it saw, so the failed-jobs table's detail has it whichever
+     * row it found.
+     *
+     * Three refusals, each of them a way of not making something up:
+     *
+     *   - **`job` only.** A request, a command and a scheduled task have no
+     *     payload of this kind, and a log line raised inside a job is not the
+     *     job.
+     *   - **Nothing held, nothing stamped.** The key is looked up and answers
+     *     null for a job whose payload was never captured — the switch is off,
+     *     the process that saw the queue event was not this one — and the key
+     *     is then absent from the payload, so the column keeps its own
+     *     `DEFAULT ''` rather than asserting an empty payload was observed.
+     *   - **A record that already names one wins**, for {@see stampBodies()}'s
+     *     reason: nothing produces that today, but a record carrying its own
+     *     answer knows more than this seam does.
+     *
+     * @param  array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}  $event
+     * @return array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}
+     */
+    private function stampJobPayload(array $event): array
+    {
+        if ($event['type'] !== 'job' || $this->jobPayload === null) {
+            return $event;
+        }
+
+        /** @var mixed $uuid */
+        $uuid = $event['payload']['uuid'] ?? null;
+
+        if (! is_string($uuid) || $uuid === '' || isset($event['payload']['payload'])) {
+            return $event;
+        }
+
+        try {
+            $payload = ($this->jobPayload)($uuid);
+        } catch (Throwable) {
+            return $event;
+        }
+
+        if (is_string($payload) && $payload !== '') {
+            $event['payload']['payload'] = $payload;
+        }
+
+        return $event;
     }
 
     /**

@@ -17,6 +17,7 @@ use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Foundation\Http\Middleware\VerifyCsrfToken;
 use Illuminate\Http\Request;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Events\JobQueueing;
 use Illuminate\Support\Env;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
@@ -75,6 +76,7 @@ use Misakstvanu\Prism\Otel\PrismSpanProcessor;
 use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\Otel\SpanLineage;
+use Misakstvanu\Prism\Queue\JobPayloadRecorder;
 use Misakstvanu\Prism\Support\Credentials;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Runtime;
@@ -1073,6 +1075,7 @@ class PrismServiceProvider extends ServiceProvider
         // recorder, and `installPrismIngest()` fires at once when the app is
         // already booted (a re-boot, an Octane worker).
         $this->registerBodyCapture();
+        $this->registerJobPayloadCapture();
         $this->registerNightwatchIngest();
         $this->registerBrowserForwarder();
         $this->registerLogCapture();
@@ -1095,6 +1098,15 @@ class PrismServiceProvider extends ServiceProvider
             Recursion::reset();
             $this->app->make(EventBuffer::class)->clear();
             $this->app->make(BodyRecorder::class)->reset();
+
+            // What this job was asked to do, held for the `job-attempt` record
+            // the engine writes once the worker is finished with it. Recorded
+            // AFTER the resets above rather than from a listener of its own,
+            // because the reset that clears a worker's leftovers must not run
+            // after the capture it would clear. See
+            // {@see registerJobPayloadCapture()} for the ordering this depends
+            // on and the reason the dispatch half listens to a different event.
+            $this->app->make(JobPayloadRecorder::class)->record($this->jobPayload($event));
         });
 
         // Under Octane the app is not rebuilt between requests, so the buffer
@@ -1162,6 +1174,70 @@ class PrismServiceProvider extends ServiceProvider
         if ($kernel instanceof FoundationHttpKernel) {
             $kernel->pushMiddleware(CaptureHttpBodies::class);
         }
+    }
+
+    /**
+     * What a job was asked to do (`prism.job.*`).
+     *
+     * The same two halves body capture has — something holds what was seen,
+     * something sees it — and one trap of its own, which is the whole reason
+     * this is a method rather than two lines beside the body recorder.
+     *
+     * **The dispatch half listens to `JobQueueing`, not `JobQueued`, and it has
+     * to.** Nightwatch registers its own queue hooks during its `register()`,
+     * while Prism reaches `registerCapture()` from `boot()` — and
+     * `installed.json` sorts `laravel/nightwatch` before `misakstvanu/prism` in
+     * every host there will ever be, so upstream's listener is registered first
+     * and Laravel fires listeners in registration order. Its `JobQueued`
+     * listener therefore writes the `queued-job` record to the ingest *before*
+     * any Prism listener on the same event could hold anything, and a payload
+     * recorded a microsecond late is a payload nothing ever reads. `JobQueueing`
+     * is raised by `Queue::enqueueUsing()` immediately before `JobQueued`, with
+     * the same payload string, for every driver that raises the second one at
+     * all — so listening one event earlier is both correct and complete.
+     *
+     * The **attempt** half has no such problem: the engine writes its
+     * `job-attempt` record when the worker is *finished*, which is long after
+     * `JobProcessing`. It is recorded from the listener already registered for
+     * the buffer reset, so the reset and the capture cannot end up in the wrong
+     * order — see {@see registerCapture()}.
+     *
+     * The `sync` driver raises `JobProcessing` and never `JobQueued`, so a
+     * synchronously dispatched job carries its payload on the one record it
+     * produces.
+     */
+    protected function registerJobPayloadCapture(): void
+    {
+        $this->app->singleton(JobPayloadRecorder::class, static function ($app): JobPayloadRecorder {
+            return new JobPayloadRecorder($app['config'], $app->make(Scrubber::class));
+        });
+
+        $this->app['events']->listen(JobQueueing::class, function (JobQueueing $event): void {
+            $this->app->make(JobPayloadRecorder::class)->record($this->jobPayload($event));
+        });
+    }
+
+    /**
+     * One queue event's decoded job payload, or an empty array when it cannot
+     * be read.
+     *
+     * `payload()` throws on a document that does not decode, and a job whose
+     * payload is unreadable is not worth a host's dispatch or a worker's job —
+     * the honest answer is that nothing was captured.
+     *
+     * @return array<array-key, mixed>
+     */
+    private function jobPayload(JobQueueing|JobProcessing $event): array
+    {
+        try {
+            $payload = $event instanceof JobQueueing
+                ? $event->payload()
+                : $event->job->payload();
+        } catch (Throwable) {
+            return [];
+        }
+
+        return is_array($payload) ? $payload : [];
     }
 
     /**
@@ -1265,6 +1341,7 @@ class PrismServiceProvider extends ServiceProvider
                 $app->make(SpanLineage::class),
                 $app->make(SpanLane::class),
                 static fn (): ?array => $app->make(BodyRecorder::class)->captured(),
+                static fn (string $uuid): ?string => $app->make(JobPayloadRecorder::class)->take($uuid),
             );
         });
 

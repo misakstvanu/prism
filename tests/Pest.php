@@ -37,6 +37,7 @@ use Laravel\Nightwatch\UserProvider;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Tests\JobHostTestCase;
 use Misakstvanu\Prism\Tests\LocalIngestTestCase;
 use Misakstvanu\Prism\Tests\NightwatchHostTestCase;
 use Misakstvanu\Prism\Tests\OpenTelemetryHostTestCase;
@@ -59,6 +60,13 @@ pest()->extend(TestCase::class)->in('Feature');
 // two premises are genuinely different: everything under `tests/Feature` proves
 // the package stands up alone.
 pest()->extend(NightwatchHostTestCase::class)->in('Host');
+
+// `tests/Jobs` is the same host running as a WORKER rather than serving a
+// request. A fifth directory because Nightwatch decides at register time, from
+// `runningInConsole()`, whether to wire its request hooks or its console ones —
+// and a job attempt's sensor, its `CommandState` and its hooks all live on the
+// console side of that one answer (see {@see JobHostTestCase}).
+pest()->extend(JobHostTestCase::class)->in('Jobs');
 
 // `tests/LocalIngest` is the same host credentialled the way a laptop is: no
 // token, `APP_ENV=local`. A fourth directory because the claim is about what the

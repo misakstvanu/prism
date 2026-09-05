@@ -418,6 +418,8 @@ waiting.
 | `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | Record the body the application sent back. |
 | `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body, and per header bag. A cut value says so; `0` disables the cap. |
 | `request.body_content_types` | — | six types | Media types whose bodies are recorded. `text/html` is deliberately absent. This list replaces the default wholesale. |
+| `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record what a queued job was asked to do, scrubbed by key. See [Job payloads](#job-payloads). |
+| `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per job payload. A cut value says so; `0` disables the cap. |
 | `log.channels` | — | `[]` | Logging channels Prism attaches the engine's handler to. Empty = the app's default channel/stack. You do not have to add `nightwatch` to `config/logging.php` yourself. |
 | `log.level` | `PRISM_LOG_LEVEL` | `debug` | Minimum PSR-3 level captured. |
 | `query.slow_threshold_ms` | `PRISM_SLOW_QUERY_MS` | `100` | A query at/above this is marked slow, and is then kept (with its whole trace) whatever the **server's** per-workspace rules say. It does not survive the client-side rates above — those drop the execution before anything is sent. `0` disables the marker. |
@@ -662,11 +664,7 @@ One list governs every signal. A key here is redacted wherever it appears:
 | Artisan command line | `--password=x` keeps the option and loses the value. |
 | Cache key | `token:abc` becomes `token:[REDACTED]`; a key that is only a name (`api_key`) is untouched — the name of an entry is not a secret. |
 | Mail subject, exception message | The value half of any `name = value` pair in the text. |
-
-A **queued job's payload is never captured at all**, so a secret dispatched inside a job cannot
-reach the console however this list is written. That is a change from earlier versions, which
-captured the payload and scrubbed it; nothing is recorded now but the job's name, id, queue,
-connection and outcome.
+| Queued job payload | Matched **by key** over the job's own JSON. See [Job payloads](#job-payloads) for the one thing this cannot reach. |
 
 ### Request headers and bodies
 
@@ -732,6 +730,39 @@ In the console all three appear on the **Request detail** screen — the two bod
 Query parameters panel. A body that was not captured —
 capture switched off, a media type off the list, a request that carried none, or a row written
 before this version — reads as "no body captured" rather than as an empty one.
+
+### Job payloads
+
+Prism records **what a queued job was asked to do** — the job's own JSON payload as Laravel wrote
+it, which is its display name, the queued command's class and the serialised command itself.
+
+The capture engine does not supply it. Its `queued-job` and `job-attempt` records carry the job's
+name, id, queue, connection and outcome and nothing about its arguments, so `backup:tenant 41` and
+`backup:tenant 7` arrive as one row shape with no way to tell which tenant failed — which is the
+question a failed job raises. Prism captures the payload itself, from the framework's queue events.
+
+| Key | Env | Default | |
+| --- | --- | --- | --- |
+| `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record the payload. |
+| `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per payload. `0` disables the cap. |
+
+Three things are worth knowing:
+
+- **Both halves of a job's life carry it.** A dispatch and a worker's attempt are two rows, usually
+  written by two processes, and each holds the payload from the queue event it saw — so the failed
+  job's detail screen has it whichever row it found.
+- **It is scrubbed BY KEY**, over the decoded JSON, exactly as a JSON request body is. Every key on
+  [the scrub list](#scrubbed-keys) is answered wherever it appears in the document.
+- **The serialised command is not rewritten, and cannot be.** `data.command` is a PHP
+  `serialize()` string whose byte lengths are part of its syntax, so redacting a value inside it
+  would produce a document that no longer parses. A constructor argument you need redacted has to
+  be a **property name on the scrub list** — that is matched by key like everything else. A value
+  buried in a blob that no rule working on keys can see stays as it was; dispatch a reference
+  rather than the secret if that matters to you.
+
+A payload longer than the cap ends in `… [truncated]`, with the cut never landing inside a
+multi-byte character. In the console it appears on the **Failed job detail** screen, pretty-printed;
+a job whose payload was not captured reads as "no payload captured" rather than as an empty one.
 
 ## Manual instrumentation
 
@@ -915,6 +946,7 @@ php artisan prism:check
 | Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, batches are landing but nothing drains them: check a worker is consuming the queue named by `PRISM_FLUSH_QUEUE` (default queue), and that the endpoint is reachable **from the worker**, which is where the send now happens. |
 | Events flow but a body or the header bag is blank | Sensitive keys are scrubbed at the source, so a redacted field is expected. A missing header bag means `request.capture_headers` is off. A whole body missing means one of: `request.capture_body` / `request.capture_response` off, a media type not on `request.body_content_types` (`text/html` is not, by default), a streamed or file response, or a request that carried no body. See [Request headers and bodies](#request-headers-and-bodies). |
 | A body ends in `… [truncated]` | It was longer than `request.max_body` (64 KB by default). Raise it, or set it to `0` for no cap. |
+| A failed job shows no payload | `job.capture_payload` is off, or the row was written before this version. A payload ending in `… [truncated]` was longer than `job.max_payload`. See [Job payloads](#job-payloads). |
 | A queued job's payload is blank | It is never captured at all — the engine's job records carry the name, id, queue, connection and outcome and nothing else. |
 | No telemetry after a deploy | Config cache is stale — `php artisan config:clear` (or re-run `config:cache`). |
 
