@@ -764,6 +764,23 @@ A payload longer than the cap ends in `… [truncated]`, with the cut never land
 multi-byte character. In the console it appears on the **Failed job detail** screen, pretty-printed;
 a job whose payload was not captured reads as "no payload captured" rather than as an empty one.
 
+### Command lines
+
+A command row carries **the whole invocation** — `backup:run 41 --only-db --disk=s3`, not just
+`backup:run` — so two runs of one command are distinguishable. The capture engine reports it: it
+builds the line from the input the console kernel handed it, which for `php artisan …` is the raw
+argument list as it was typed.
+
+Two rules apply on the way out, and neither is configurable:
+
+- **It is redacted against [the scrub list](#scrubbed-keys)**, so `--password=hunter2` ships as
+  `--password=[REDACTED]`. The option's own name survives, so the run stays readable.
+- **It is capped at 4 KB**, ending in `… [truncated]` when it was cut. Nothing upstream bounds this
+  field and the column behind it has no cap of its own, so one command invoked with a document as an
+  argument would otherwise be stored whole, on every run.
+
+There is no Commands screen yet; the line is in the `commands` table and on the wire.
+
 ## Manual instrumentation
 
 Automatic capture covers the common signals. Two static helpers on `Misakstvanu\Prism\Prism` let

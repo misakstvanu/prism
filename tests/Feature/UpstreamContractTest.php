@@ -27,6 +27,8 @@ use Misakstvanu\Prism\Otel\PrismSpanProcessor;
 use Monolog\Level;
 use Monolog\LogRecord;
 use OpenTelemetry\SDK\Trace\SpanProcessorInterface;
+use Symfony\Component\Console\Input\ArgvInput;
+use Symfony\Component\Console\Input\ArrayInput;
 
 /**
  * The upstream surface this package is built on, pinned so a `composer update`
@@ -426,6 +428,35 @@ it('pins every per-type field the translator reads', function () {
             );
         }
     }
+});
+
+it('pins a command record as the whole invocation rather than the command name', function () {
+    // The real CLI shape. Upstream builds the field from the input the console
+    // kernel handed it, and for `php artisan …` that is an `ArgvInput` whose
+    // raw tokens are the line as it was typed, minus the script name.
+    $argv = nightwatchCommandRecord(new ArgvInput(['artisan', 'backup:run', '41', '--only-db', '--disk=s3']));
+
+    expect($argv['command'])->toBe('backup:run 41 --only-db --disk=s3', upstreamContractGuide(
+        'a command record no longer carries the arguments and options it was invoked with. '
+        .'Prism reports the line straight off this field, so it would now need a holder of its own — '
+        .'a CommandStarting listener recording `(string) $event->input`, stamped in PrismIngest — '
+        .'the way a job payload and an HTTP body are already captured',
+    ));
+
+    // The other branch: anything that is not an `ArgvInput` — `Artisan::call()`,
+    // a scheduler run — is formatted rather than raw. Different spelling, same
+    // claim, which is why the pin covers both.
+    $array = nightwatchCommandRecord(new ArrayInput(['command' => 'backup:run', 'tenant' => '41', '--disk' => 's3']));
+
+    // `toContain()` is variadic, so a message passed to it would be asserted as
+    // a second needle — the boolean form is how this suite carries a message.
+    expect(str_contains($array['command'], '41'))->toBeTrue(
+        upstreamContractGuide('a non-argv command record no longer carries its arguments'),
+    );
+
+    expect(str_contains($array['command'], '--disk=s3'))->toBeTrue(
+        upstreamContractGuide('a non-argv command record no longer carries its options'),
+    );
 });
 
 it('pins the record version each type is at, per type', function () {

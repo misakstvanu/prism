@@ -37,7 +37,7 @@ use Laravel\Nightwatch\UserProvider;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
 use Misakstvanu\Prism\PrismServiceProvider;
-use Misakstvanu\Prism\Tests\JobHostTestCase;
+use Misakstvanu\Prism\Tests\ConsoleHostTestCase;
 use Misakstvanu\Prism\Tests\LocalIngestTestCase;
 use Misakstvanu\Prism\Tests\NightwatchHostTestCase;
 use Misakstvanu\Prism\Tests\OpenTelemetryHostTestCase;
@@ -45,6 +45,7 @@ use Misakstvanu\Prism\Tests\TestCase;
 use Monolog\Level;
 use Monolog\LogRecord;
 use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\SentMessage as SymfonySentMessage;
@@ -62,11 +63,14 @@ pest()->extend(TestCase::class)->in('Feature');
 pest()->extend(NightwatchHostTestCase::class)->in('Host');
 
 // `tests/Jobs` is the same host running as a WORKER rather than serving a
-// request. A fifth directory because Nightwatch decides at register time, from
+// request, and `tests/Commands` the same host running one plain artisan
+// command. Two directories because Nightwatch decides at register time, from
 // `runningInConsole()`, whether to wire its request hooks or its console ones —
-// and a job attempt's sensor, its `CommandState` and its hooks all live on the
-// console side of that one answer (see {@see JobHostTestCase}).
-pest()->extend(JobHostTestCase::class)->in('Jobs');
+// and a job attempt's sensor, its `CommandState`, the command record itself and
+// every hook behind them live on the console side of that one answer (see
+// {@see ConsoleHostTestCase}).
+pest()->extend(ConsoleHostTestCase::class)->in('Jobs');
+pest()->extend(ConsoleHostTestCase::class)->in('Commands');
 
 // `tests/LocalIngest` is the same host credentialled the way a laptop is: no
 // token, `APP_ENV=local`. A fourth directory because the claim is about what the
@@ -682,6 +686,43 @@ function nightwatchQueueJobStub(): object
             return false;
         }
     };
+}
+
+/**
+ * One `command` record, from the real sensor, for an input the caller chooses.
+ *
+ * Separate from {@see nightwatchRecords()} because that fixture's command is
+ * bare (`list`, no arguments) and the question here is precisely what an
+ * invocation WITH arguments comes out as. Upstream reads the input two ways —
+ * the raw argv tokens when the console kernel handed it an `ArgvInput`, which
+ * is every real CLI run, and the formatted parameters otherwise — so a caller
+ * that wants to pin the real shape passes an `ArgvInput` and one that wants the
+ * other branch passes an `ArrayInput`.
+ *
+ * @return array<string, mixed>
+ */
+function nightwatchCommandRecord(InputInterface $input, int $exitCode = 0, string $name = 'list'): array
+{
+    $state = new CommandState(
+        timestamp: microtime(true),
+        trace: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        id: 'execution-5678',
+        deploy: 'deploy-7',
+        server: 'worker-01',
+        currentExecutionStageStartedAtMicrotime: microtime(true),
+        user: new UserProvider(
+            withAuth: fn (callable $callback) => $callback(app('auth')),
+            userDetailsResolverResolver: fn () => null,
+            reportResolver: fn () => static fn (Authenticatable $user) => null,
+        ),
+        artisan: new ConsoleApplication(app(), app('events'), app()->version()),
+        name: $name,
+    );
+
+    $manager = nightwatchSensorManager($state, new Clock, new Location(basePath: base_path(), publicPath: public_path()));
+
+    /** @var array<string, mixed> */
+    return nightwatchResolveRecord($manager->command($input, $exitCode));
 }
 
 /**

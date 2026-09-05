@@ -55,9 +55,10 @@ abstract class NightwatchHostTestCase extends TestCase
      * Whether this case pretends the process is serving an HTTP request.
      *
      * True for every suite whose subject is a request. A suite whose subject is
-     * a **worker** answers false, because the engine's job-attempt hooks and
-     * its `CommandState` exist only on the console side of that one register-time
-     * decision — see {@see JobHostTestCase}.
+     * a **worker** or an **artisan command** answers false, because the engine's
+     * job-attempt hooks, its command hooks and its `CommandState` exist only on
+     * the console side of that one register-time decision — see
+     * {@see ConsoleHostTestCase}.
      */
     protected function forcesRequestMode(): bool
     {

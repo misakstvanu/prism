@@ -15,6 +15,9 @@
         <testsuite name="Jobs">
             <directory>tests/Jobs</directory>
         </testsuite>
+        <testsuite name="Commands">
+            <directory>tests/Commands</directory>
+        </testsuite>
         <testsuite name="LocalIngest">
             <directory>tests/LocalIngest</directory>
         </testsuite>

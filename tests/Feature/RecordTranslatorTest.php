@@ -3,6 +3,8 @@
 declare(strict_types=1);
 
 use Misakstvanu\Prism\Nightwatch\RecordTranslator;
+use Misakstvanu\Prism\Support\Text;
+use Symfony\Component\Console\Input\ArgvInput;
 
 /**
  * The seam between Nightwatch's records and Prism's wire format (US-002).
@@ -193,6 +195,30 @@ it('turns a scheduled task status back into the exit code the crons screen count
         ->and($processed['host'])->toBe('worker-01')
         ->and($processed['exit_code'])->toBe(0)
         ->and($failed['exit_code'])->toBe(1);
+});
+
+it('carries a command line onto the event whole', function () {
+    $record = nightwatchCommandRecord(new ArgvInput(['artisan', 'backup:run', '41', '--only-db', '--disk=s3']));
+
+    // The arguments and the options are what make two runs of one command
+    // distinguishable, and `commands.command` is the only column that holds
+    // them — `name` is the signature the console groups runs by.
+    expect($this->translator->translate($record)['payload']['command'])
+        ->toBe('backup:run 41 --only-db --disk=s3');
+});
+
+it('caps a command line and says that it cut one', function () {
+    $record = nightwatchCommandRecord(new ArgvInput(['artisan', 'import:rows', str_repeat('x', 5000)]));
+
+    $line = $this->translator->translate($record)['payload']['command'];
+
+    // The one unbounded string a command record carries: upstream builds it
+    // from the invocation and caps it nowhere, and `commands.command` is a
+    // plain `String` column. 4 KB is far past any line a person types, and the
+    // marker is what keeps a cut line from reading as a shorter invocation.
+    expect(strlen($line))->toBe(4096 + strlen(Text::TRUNCATED))
+        ->and($line)->toStartWith('import:rows x')
+        ->and($line)->toEndWith(Text::TRUNCATED);
 });
 
 it('turns a cache event into the cache span lane, operation and all', function () {
