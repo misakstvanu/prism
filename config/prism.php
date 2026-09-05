@@ -343,6 +343,44 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Job payload capture
+    |--------------------------------------------------------------------------
+    |
+    | What a queued job was asked to do. The capture engine reports a job by
+    | name, id, queue, connection and outcome and says nothing about its
+    | arguments, so `backup:tenant 41` and `backup:tenant 7` arrive as one row
+    | shape with no way to tell which tenant failed — which is exactly the
+    | question a failed job raises. Prism captures the payload itself, from the
+    | queue events, and stores it in the "payload" column the failed-job screen
+    | already draws a panel from.
+    |
+    | "capture_payload" defaults to TRUE and covers BOTH halves of a job's life:
+    | the dispatch and the worker's attempt each hold the payload from the queue
+    | event they saw, so the detail screen has it whichever row it found.
+    |
+    | The payload is the job's own JSON as Laravel queued it — its display name,
+    | the command class and the serialised command — run through the scrub list
+    | BY KEY, exactly as a JSON request body is. NOTE that the serialised
+    | command is a PHP `serialize()` string whose byte lengths are part of its
+    | syntax: nothing rewrites values inside it, because doing so would produce
+    | a document that no longer parses. A constructor argument you need redacted
+    | has to be a property name you add to "scrub"; a blob that is beyond a rule
+    | working on keys stays as it was.
+    |
+    | "max_payload" caps it in bytes. The cut never lands inside a multi-byte
+    | character and a truncated payload says so, so what is stored is always
+    | insertable and never silently partial. `0` disables the cap, which is not
+    | advised.
+    |
+    */
+
+    'job' => [
+        'capture_payload' => (bool) env('PRISM_CAPTURE_JOB_PAYLOAD', true),
+        'max_payload' => (int) env('PRISM_MAX_JOB_PAYLOAD', 65536),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Log capture
     |--------------------------------------------------------------------------
     |

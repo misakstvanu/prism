@@ -35,7 +35,11 @@ abstract class NightwatchHostTestCase extends TestCase
         // and a test driving a request through the kernel would exercise
         // nothing at all, which is the quiet way for a lifecycle assertion to
         // become vacuous.
-        Env::getRepository()->set('NIGHTWATCH_FORCE_REQUEST', '1');
+        if ($this->forcesRequestMode()) {
+            Env::getRepository()->set('NIGHTWATCH_FORCE_REQUEST', '1');
+        } else {
+            Env::getRepository()->clear('NIGHTWATCH_FORCE_REQUEST');
+        }
 
         parent::setUp();
     }
@@ -45,6 +49,19 @@ abstract class NightwatchHostTestCase extends TestCase
         parent::tearDown();
 
         Env::getRepository()->clear('NIGHTWATCH_FORCE_REQUEST');
+    }
+
+    /**
+     * Whether this case pretends the process is serving an HTTP request.
+     *
+     * True for every suite whose subject is a request. A suite whose subject is
+     * a **worker** answers false, because the engine's job-attempt hooks and
+     * its `CommandState` exist only on the console side of that one register-time
+     * decision — see {@see JobHostTestCase}.
+     */
+    protected function forcesRequestMode(): bool
+    {
+        return true;
     }
 
     /**

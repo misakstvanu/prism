@@ -80,8 +80,14 @@ use Throwable;
  */
 final class BodyRecorder
 {
-    /** Appended to a body the cap cut, so a reader knows the document is partial. */
-    public const TRUNCATED = '… [truncated]';
+    /**
+     * Appended to a body the cap cut, so a reader knows the document is partial.
+     *
+     * {@see Text::TRUNCATED} is the one definition — a job payload is cut the
+     * same way — and this name is kept because it is what callers already ask
+     * for.
+     */
+    public const TRUNCATED = Text::TRUNCATED;
 
     /**
      * The key an uploaded file's metadata is recorded under, inside the

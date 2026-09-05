@@ -43,6 +43,16 @@ namespace Misakstvanu\Prism\Support;
 final class Text
 {
     /**
+     * Appended to a value a byte cap cut, so a reader knows the document is
+     * partial rather than malformed.
+     *
+     * It lives here rather than beside either caller because two captures cut
+     * the same way — an HTTP body and a job payload — and a reader who has
+     * learnt what one marker means must not meet a second spelling of it.
+     */
+    public const TRUNCATED = '… [truncated]';
+
+    /**
      * Strip NUL bytes and anything that is not valid UTF-8.
      *
      * The encoding check is what keeps this cheap: a well-formed string — which
