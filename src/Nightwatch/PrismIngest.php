@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Support\Facades\Log;
 use Laravel\Nightwatch\Contracts\Ingest;
 use Misakstvanu\Prism\Buffer\EventBuffer;
+use Misakstvanu\Prism\Delivery\RecipientRecorder;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Http\Middleware\CaptureHttpBodies;
 use Misakstvanu\Prism\Otel\SpanLane;
@@ -159,6 +160,12 @@ final class PrismIngest implements Ingest
      *                                                             answered; held by the listeners that saw the
      *                                                             queue events. See {@see stampJobPayload()}. With
      *                                                             none, a job row carries no payload.
+     * @param  (Closure(string, string): (array<string, string>|null))|null  $recipients  Who an outbound message
+     *                                                                                    was addressed to, looked up by the signal and the
+     *                                                                                    class the record carries and released as it is
+     *                                                                                    answered; held by the listeners that saw the
+     *                                                                                    sending events. See {@see stampRecipients()}. With
+     *                                                                                    none, a mail or notification row carries no names.
      */
     public function __construct(
         private readonly EventBuffer $buffer,
@@ -170,6 +177,7 @@ final class PrismIngest implements Ingest
         private readonly ?SpanLane $lane = null,
         private readonly ?Closure $bodies = null,
         private readonly ?Closure $jobPayload = null,
+        private readonly ?Closure $recipients = null,
     ) {}
 
     /**
@@ -342,7 +350,7 @@ final class PrismIngest implements Ingest
             return null;
         }
 
-        return $this->stampJobPayload($this->stampBodies($this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event)))));
+        return $this->stampRecipients($this->stampJobPayload($this->stampBodies($this->stampSpanLineage($this->stampExecutionId($this->stampTraceId($event))))));
     }
 
     /**
@@ -399,6 +407,79 @@ final class PrismIngest implements Ingest
 
         if (is_string($payload) && $payload !== '') {
             $event['payload']['payload'] = $payload;
+        }
+
+        return $event;
+    }
+
+    /**
+     * Put onto a `mail` or `notification` event who it was addressed to.
+     *
+     * The capture engine reports a message by mailer, class, subject and three
+     * recipient *counts*, and a notification by channel and class — so "this
+     * went to three people" is the most either row can say, and "did the
+     * customer get it" is unanswerable. {@see RecipientRecorder} holds the
+     * names from the framework's sending events, and this is the one point that
+     * sees both what was held and the record it belongs to.
+     *
+     * **Keyed by the record's own `class` field**, which is the only thing the
+     * two sides share: a message carries no id of any kind. Within one
+     * execution the framework sends in order, so the holder is a per-class FIFO
+     * and each record claims the entry pushed for it — see
+     * {@see RecipientRecorder} for what keeps the two keys spelt the same way.
+     *
+     * Three refusals, each of them a way of not making something up:
+     *
+     *   - **`mail` and `notification` only.** Every other signal is either an
+     *     execution or something raised inside one, and none of them was
+     *     addressed to anybody.
+     *   - **Nothing held, nothing stamped.** The lookup answers null for a send
+     *     whose addresses were never captured — the switch is off, the process
+     *     that saw the sending event was not this one — and the keys are then
+     *     absent from the payload, so the columns keep their own `DEFAULT ''`
+     *     rather than asserting an empty list was observed. An empty value is
+     *     skipped on its own besides, which is what leaves an on-demand
+     *     notifiable's absent id out rather than storing a bare `#`.
+     *   - **A record that already names them wins**, for {@see stampBodies()}'s
+     *     reason: nothing produces that today, but a record carrying its own
+     *     answer knows more than this seam does.
+     *
+     * @param  array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}  $event
+     * @return array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}
+     */
+    private function stampRecipients(array $event): array
+    {
+        if ($this->recipients === null) {
+            return $event;
+        }
+
+        $type = $event['type'];
+
+        if ($type !== RecipientRecorder::MAIL && $type !== RecipientRecorder::NOTIFICATION) {
+            return $event;
+        }
+
+        /** @var mixed $class */
+        $class = $event['payload']['class'] ?? '';
+
+        if (! is_string($class)) {
+            return $event;
+        }
+
+        try {
+            $columns = ($this->recipients)($type, $class);
+        } catch (Throwable) {
+            return $event;
+        }
+
+        if ($columns === null) {
+            return $event;
+        }
+
+        foreach ($columns as $column => $value) {
+            if ($value !== '' && ! isset($event['payload'][$column])) {
+                $event['payload'][$column] = $value;
+            }
         }
 
         return $event;
