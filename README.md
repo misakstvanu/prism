@@ -420,6 +420,8 @@ waiting.
 | `request.body_content_types` | — | six types | Media types whose bodies are recorded. `text/html` is deliberately absent. This list replaces the default wholesale. |
 | `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record what a queued job was asked to do, scrubbed by key. See [Job payloads](#job-payloads). |
 | `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per job payload. A cut value says so; `0` disables the cap. |
+| `mail.capture_recipients` | `PRISM_CAPTURE_MAIL_RECIPIENTS` | `true` | Record the To, Cc and Bcc addresses of every message. See [Mail and notification recipients](#mail-and-notification-recipients). |
+| `notification.capture_recipients` | `PRISM_CAPTURE_NOTIFICATION_RECIPIENTS` | `true` | Record what a notification was addressed to and where its channel routed. |
 | `log.channels` | — | `[]` | Logging channels Prism attaches the engine's handler to. Empty = the app's default channel/stack. You do not have to add `nightwatch` to `config/logging.php` yourself. |
 | `log.level` | `PRISM_LOG_LEVEL` | `debug` | Minimum PSR-3 level captured. |
 | `query.slow_threshold_ms` | `PRISM_SLOW_QUERY_MS` | `100` | A query at/above this is marked slow, and is then kept (with its whole trace) whatever the **server's** per-workspace rules say. It does not survive the client-side rates above — those drop the execution before anything is sent. `0` disables the marker. |
@@ -665,6 +667,7 @@ One list governs every signal. A key here is redacted wherever it appears:
 | Cache key | `token:abc` becomes `token:[REDACTED]`; a key that is only a name (`api_key`) is untouched — the name of an entry is not a secret. |
 | Mail subject, exception message | The value half of any `name = value` pair in the text. |
 | Queued job payload | Matched **by key** over the job's own JSON. See [Job payloads](#job-payloads) for the one thing this cannot reach. |
+| Mail and notification recipients | An address is replaced when the list's own name (`to`, `cc`, `bcc`, `recipients`) or `email` is on the list. The list keeps its length, so it still agrees with the counts stored beside it. |
 
 ### Request headers and bodies
 
@@ -763,6 +766,40 @@ Three things are worth knowing:
 A payload longer than the cap ends in `… [truncated]`, with the cut never landing inside a
 multi-byte character. In the console it appears on the **Failed job detail** screen, pretty-printed;
 a job whose payload was not captured reads as "no payload captured" rather than as an empty one.
+
+### Mail and notification recipients
+
+Prism records **who an outbound message went to** — the To, Cc and Bcc addresses of every mail, and
+for a notification the notifiable it was addressed to plus the addresses its channel routed to.
+
+The capture engine does not supply any of it. Its `mail` record carries the mailer, the mailable
+class, the subject and three recipient *counts*; its `notification` record carries the channel and
+the class. So the most either row can say is that something went to three people, and "did the
+customer get the receipt" — the question a mail screen is opened for — is unanswerable. Prism
+captures the names itself, from the framework's `MessageSending` and `NotificationSending` events.
+
+| Key | Env | Default | |
+| --- | --- | --- | --- |
+| `mail.capture_recipients` | `PRISM_CAPTURE_MAIL_RECIPIENTS` | `true` | Record the three address lists. |
+| `notification.capture_recipients` | `PRISM_CAPTURE_NOTIFICATION_RECIPIENTS` | `true` | Record the notifiable and the channel's routed addresses. |
+
+Four things are worth knowing:
+
+- **A notification is recorded per channel.** One sent over mail and Slack is two rows with two
+  answers, because the Slack delivery routed to a webhook rather than to the email beside it. A
+  channel that routes to something with no address in it — `database` routes to a relation — stores
+  an empty list rather than a guess.
+- **The notifiable is an identity, not an address.** It is stored as `Class#id`; an on-demand
+  notifiable (`Notification::route(…)`) has no key and reads as its class alone.
+- **Addresses are scrubbed, and a redacted list keeps its length.** Put the list's own name (`to`,
+  `cc`, `bcc`, `recipients`) or `email` on [the scrub list](#scrubbed-keys) and every address is
+  stored as `[REDACTED]` — one per address, so the list still agrees with the counts stored beside
+  it.
+- **At most 50 addresses per list are kept.** A send wider than that is a mailing rather than a
+  message, and the counts beside the names still report the true width.
+
+A message whose recipients were not captured — capture switched off, or a row written before this
+version — reads as an empty list rather than as a message that went to nobody.
 
 ### Command lines
 

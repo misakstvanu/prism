@@ -16,6 +16,8 @@ use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Foundation\Http\Middleware\VerifyCsrfToken;
 use Illuminate\Http\Request;
+use Illuminate\Mail\Events\MessageSending;
+use Illuminate\Notifications\Events\NotificationSending;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\JobQueueing;
 use Illuminate\Support\Env;
@@ -58,6 +60,7 @@ use Misakstvanu\Prism\Browser\BrowserScrubber;
 use Misakstvanu\Prism\Buffer\EventBuffer;
 use Misakstvanu\Prism\Console\BenchCaptureCommand;
 use Misakstvanu\Prism\Console\CheckCommand;
+use Misakstvanu\Prism\Delivery\RecipientRecorder;
 use Misakstvanu\Prism\Flush\BatchSpool;
 use Misakstvanu\Prism\Flush\Flusher;
 use Misakstvanu\Prism\Flush\SpoolScheduler;
@@ -1076,6 +1079,7 @@ class PrismServiceProvider extends ServiceProvider
         // already booted (a re-boot, an Octane worker).
         $this->registerBodyCapture();
         $this->registerJobPayloadCapture();
+        $this->registerRecipientCapture();
         $this->registerNightwatchIngest();
         $this->registerBrowserForwarder();
         $this->registerLogCapture();
@@ -1098,6 +1102,7 @@ class PrismServiceProvider extends ServiceProvider
             Recursion::reset();
             $this->app->make(EventBuffer::class)->clear();
             $this->app->make(BodyRecorder::class)->reset();
+            $this->app->make(RecipientRecorder::class)->reset();
 
             // What this job was asked to do, held for the `job-attempt` record
             // the engine writes once the worker is finished with it. Recorded
@@ -1122,6 +1127,7 @@ class PrismServiceProvider extends ServiceProvider
             Recursion::reset();
             $this->app->make(EventBuffer::class)->clear();
             $this->app->make(BodyRecorder::class)->reset();
+            $this->app->make(RecipientRecorder::class)->reset();
         });
 
         // Ship the buffer after the response has been sent to the client, off
@@ -1214,6 +1220,47 @@ class PrismServiceProvider extends ServiceProvider
 
         $this->app['events']->listen(JobQueueing::class, function (JobQueueing $event): void {
             $this->app->make(JobPayloadRecorder::class)->record($this->jobPayload($event));
+        });
+    }
+
+    /**
+     * Who an outbound message was addressed to (`prism.mail.*`,
+     * `prism.notification.*`).
+     *
+     * The same two halves job-payload capture has — something holds what was
+     * seen, something sees it — and the same ordering reason for listening one
+     * event early.
+     *
+     * **Both halves listen to the `…Sending` event, not the `…Sent` one, and
+     * they have to.** Upstream writes its `mail` / `notification` record from
+     * its own listener on `MessageSent` / `NotificationSent`, synchronously,
+     * and it registered that listener during its `register()` while Prism
+     * reaches `registerCapture()` from `boot()` — `installed.json` sorts
+     * `laravel/nightwatch` before `misakstvanu/prism` in every host there will
+     * ever be, and Laravel fires listeners in registration order. A Prism
+     * listener on the same event would therefore run after the record had
+     * already been written and stamped, and addresses recorded a microsecond
+     * late are addresses nothing ever reads. The framework raises `Sending`
+     * immediately before the send and `Sent` immediately after it, so listening
+     * one event earlier is both correct and complete.
+     *
+     * A send that raised `Sending` and never `Sent` — a listener returning
+     * false, a transport that threw — leaves an entry nothing claims; see
+     * {@see RecipientRecorder} for the bound that keeps that from growing, and
+     * {@see registerCapture()} for the reset a worker performs between jobs.
+     */
+    protected function registerRecipientCapture(): void
+    {
+        $this->app->singleton(RecipientRecorder::class, static function ($app): RecipientRecorder {
+            return new RecipientRecorder($app['config'], $app->make(Scrubber::class));
+        });
+
+        $this->app['events']->listen(MessageSending::class, function (MessageSending $event): void {
+            $this->app->make(RecipientRecorder::class)->recordMail($event);
+        });
+
+        $this->app['events']->listen(NotificationSending::class, function (NotificationSending $event): void {
+            $this->app->make(RecipientRecorder::class)->recordNotification($event);
         });
     }
 
@@ -1342,6 +1389,7 @@ class PrismServiceProvider extends ServiceProvider
                 $app->make(SpanLane::class),
                 static fn (): ?array => $app->make(BodyRecorder::class)->captured(),
                 static fn (string $uuid): ?string => $app->make(JobPayloadRecorder::class)->take($uuid),
+                static fn (string $signal, string $class): ?array => $app->make(RecipientRecorder::class)->take($signal, $class),
             );
         });
 

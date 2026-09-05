@@ -381,6 +381,47 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Mail and notification recipients
+    |--------------------------------------------------------------------------
+    |
+    | Who an outbound message went to. The capture engine reports a message by
+    | its mailer, mailable class, subject and three recipient COUNTS, and a
+    | notification by its channel and class — so the most either row can say is
+    | that something went to three people. "Did the customer get the receipt" is
+    | the question a mail screen is opened for, and only the names answer it, so
+    | Prism captures them itself from the framework's sending events.
+    |
+    | Both default to TRUE.
+    |
+    | "mail.capture_recipients" records the To, Cc and Bcc addresses of every
+    | message, as three lists beside the counts already stored.
+    |
+    | "notification.capture_recipients" records what the notification was
+    | addressed to — the notifiable as "Class#id" (an on-demand notifiable has
+    | no id and reads as its class alone) and the addresses THIS CHANNEL routed
+    | to. Per channel, because a notification sent over mail and Slack is two
+    | rows: the routed address of the Slack delivery is a webhook, not the email
+    | beside it. A channel that routes to something with no address in it — the
+    | "database" channel routes to a relation — stores an empty list.
+    |
+    | Addresses meet the scrub list like everything else, matched against the
+    | list's own name ("to", "cc", "bcc", "recipients") and against "email". A
+    | redacted list KEEPS ITS LENGTH, so it still agrees with the counts stored
+    | beside it. At most 50 addresses per list are kept: a send wider than that
+    | is a mailing rather than a message.
+    |
+    */
+
+    'mail' => [
+        'capture_recipients' => (bool) env('PRISM_CAPTURE_MAIL_RECIPIENTS', true),
+    ],
+
+    'notification' => [
+        'capture_recipients' => (bool) env('PRISM_CAPTURE_NOTIFICATION_RECIPIENTS', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Log capture
     |--------------------------------------------------------------------------
     |
