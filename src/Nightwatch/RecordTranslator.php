@@ -8,6 +8,7 @@ use BackedEnum;
 use JsonSerializable;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
+use Misakstvanu\Prism\Support\Text;
 use Misakstvanu\Prism\Support\Timestamp;
 use Throwable;
 
@@ -194,6 +195,21 @@ final class RecordTranslator
 
     /** How deep {@see normalizeValue()} will walk a nested record value. */
     private const MAX_DEPTH = 16;
+
+    /**
+     * How many bytes of a command line are kept.
+     *
+     * The one unbounded string a `command` record carries. Upstream builds it
+     * from the invocation itself — the raw argv tokens of a real CLI run — and
+     * caps it nowhere, while `commands.command` is a plain `String` column with
+     * no cap of its own either. An artisan command invoked with a document as
+     * an argument would therefore ride the wire and land in ClickHouse whole,
+     * once per run. 4 KB is far past any line a person types and far short of
+     * anything worth paying for; the marker is appended after the cut, so a
+     * truncated line says that it was cut rather than merely looking like a
+     * shorter invocation.
+     */
+    private const MAX_COMMAND_BYTES = 4096;
 
     /**
      * Translate one Nightwatch record into one Prism event, or null when there is
@@ -670,8 +686,22 @@ final class RecordTranslator
 
     /**
      * The `commands` columns (US-006 creates the table). The record's own
-     * `class`, `name`, `command` and `exit_code` already read correctly and ride
-     * the passthrough; only the two unit conversions are restated.
+     * `class`, `name` and `exit_code` already read correctly and ride the
+     * passthrough; the two unit conversions and the one cap are restated.
+     *
+     * **`command` is the whole invocation, and it already is** — upstream's
+     * command sensor builds it from the input the console kernel handed it:
+     * the raw argv tokens for a real CLI run (`backup:run 41 --disk=s3`), the
+     * formatted parameters for anything else. So there is nothing to capture
+     * here that the engine does not report, and no holder of Prism's own — the
+     * shape a job payload or an HTTP body needs — is warranted. What upstream
+     * does not do is bound it, which is why the line is restated rather than
+     * left to the passthrough.
+     *
+     * The value has already met `prism.scrub`: the engine applies Prism's
+     * `redactCommand` callback to the record before the resolver that builds
+     * this array runs, so `--password=hunter2` arrives redacted and the cut
+     * below can never land inside a secret.
      *
      * @param  array<string, mixed>  $r
      * @return array<string, mixed>
@@ -679,9 +709,29 @@ final class RecordTranslator
     private function commandPayload(array $r): array
     {
         return [
+            'command' => $this->commandLine($r['command'] ?? null),
             'duration_ms' => $this->milliseconds($r['duration'] ?? null),
             'memory_mb' => $this->megabytes($r['peak_memory_usage'] ?? null),
         ];
+    }
+
+    /**
+     * A command line, made safe to insert and bounded.
+     *
+     * {@see Text::clean()} first, because the cap is in bytes and the cut has
+     * to happen on a string whose bytes are already valid UTF-8 — an argv token
+     * is whatever a shell handed the process, and ClickHouse's `JSONEachRow`
+     * refuses the whole insert over one invalid byte, not the row.
+     */
+    private function commandLine(mixed $value): string
+    {
+        $line = Text::clean($this->string($value));
+
+        if (strlen($line) <= self::MAX_COMMAND_BYTES) {
+            return $line;
+        }
+
+        return Text::truncate($line, self::MAX_COMMAND_BYTES).Text::TRUNCATED;
     }
 
     /**
