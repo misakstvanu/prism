@@ -174,7 +174,7 @@ config file, not two**:
 | `nightwatch.sampling.commands` | `prism.sample.commands` | " |
 | `nightwatch.sampling.scheduled_tasks` | `prism.sample.schedules` | " |
 | `nightwatch.sampling.exceptions` | *pinned at `1.0`* | An error is never sampled out. This is the one derived key with **no** environment escape hatch. |
-| `nightwatch.capture_request_payload` | `prism.request.capture_body` | The engine's own 500-only payload follows the switch Prism's request-body capture reads, so the two cannot disagree. See [Request and response bodies](#request-and-response-bodies). |
+| `nightwatch.capture_request_payload` | `prism.request.capture_body` | The engine's own 500-only payload follows the switch Prism's request-body capture reads, so the two cannot disagree. See [Request headers and bodies](#request-headers-and-bodies). |
 | `nightwatch.redact_payload_fields` | `prism.scrub` | " (upstream's own defaults survive underneath) |
 | `nightwatch.redact_headers` | `prism.scrub` | " |
 
@@ -413,9 +413,10 @@ waiting.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | Record the body the client sent. See [Request and response bodies](#request-and-response-bodies). |
+| `request.capture_headers` | `PRISM_CAPTURE_REQUEST_HEADERS` | `true` | Record the headers the request was addressed with, scrubbed by key. See [Request headers and bodies](#request-headers-and-bodies). |
+| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | Record the body the client sent. See [Request headers and bodies](#request-headers-and-bodies). |
 | `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | Record the body the application sent back. |
-| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body. A cut body says so; `0` disables the cap. |
+| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body, and per header bag. A cut value says so; `0` disables the cap. |
 | `request.body_content_types` | — | six types | Media types whose bodies are recorded. `text/html` is deliberately absent. This list replaces the default wholesale. |
 | `log.channels` | — | `[]` | Logging channels Prism attaches the engine's handler to. Empty = the app's default channel/stack. You do not have to add `nightwatch` to `config/logging.php` yourself. |
 | `log.level` | `PRISM_LOG_LEVEL` | `debug` | Minimum PSR-3 level captured. |
@@ -667,29 +668,37 @@ reach the console however this list is written. That is a change from earlier ve
 captured the payload and scrubbed it; nothing is recorded now but the job's name, id, queue,
 connection and outcome.
 
-### Request and response bodies
+### Request headers and bodies
 
-Prism records **what an HTTP exchange carried** — the body the client sent, the body your
-application sent back, and the query string it was addressed with — on every request, not only on
-one that faulted.
+Prism records **what an HTTP exchange carried** — the headers it was addressed with, the body the
+client sent, the body your application sent back, and the query string — on every request, not only
+on one that faulted.
 
-Neither half comes from the capture engine. Its request record serialises a payload only for a
-**500** response, into a field Prism has no column for, and it has no notion of a response body at
-all (it carries `responseSize`, an integer). So Prism captures both itself, from a middleware that
+None of it comes usably from the capture engine. Its request record serialises a payload only for a
+**500** response, into a field Prism has no column for; it has no notion of a response body at all
+(it carries `responseSize`, an integer); and it redacts its header bag in a wording of its own
+rather than through your scrub list. So Prism captures all three itself, from a middleware that
 holds the request and the response at the same time.
 
 | Key | Env | Default | |
 | --- | --- | --- | --- |
+| `request.capture_headers` | `PRISM_CAPTURE_REQUEST_HEADERS` | `true` | The headers the request was addressed with. |
 | `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | The body the client sent. |
 | `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | The body your application sent back. |
-| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body. `0` disables the cap. |
-| `request.body_content_types` | — | see below | Media types worth recording. |
+| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body, and per header bag. `0` disables the cap. |
+| `request.body_content_types` | — | see below | Media types whose **bodies** are recorded. |
 
-Both default to **on**: a request body is the most useful thing to have when a bug reproduces once,
-and a response body is what says whether the fault was in what came back or in what went in. Turn
-either off where the exposure outweighs the debugging.
+All three default to **on**: a request body is the most useful thing to have when a bug reproduces
+once, a response body is what says whether the fault was in what came back or in what went in, and
+the headers are what say how the request was addressed. Turn any of them off where the exposure
+outweighs the debugging.
 
-Five rules decide what is stored, and each of them is a way of not lying to you:
+Six rules decide what is stored, and each of them is a way of not lying to you:
+
+- **The header bag is scrubbed BY KEY, like a structured body.** `authorization` and `cookie` are on
+  [the scrub list](#scrubbed-keys) by default and read `[REDACTED]`; add any header name of your own
+  to that same list. The media-type allow list below does **not** apply to headers — every request
+  has them, and they are what says how one was addressed.
 
 - **A structured body is scrubbed BY KEY, not by pattern.** A JSON or form body is decoded, run
   through [the scrub list](#scrubbed-keys) — the same list that redacts a header or an outgoing
@@ -904,7 +913,7 @@ php artisan prism:check
 | You went looking for an OTLP collector to point at | There isn't one. Spans never leave the process as OTLP — all three OpenTelemetry exporters are pinned to `null` and Prism ships the spans in its own batch. |
 | You went looking for a `nightwatch:agent` daemon | There isn't one. `prism:check` says `agent: not required` for exactly this reason — Prism replaces the engine's transport, so nothing is transmitted over a socket and no daemon is installed, started or monitored. |
 | Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, batches are landing but nothing drains them: check a worker is consuming the queue named by `PRISM_FLUSH_QUEUE` (default queue), and that the endpoint is reachable **from the worker**, which is where the send now happens. |
-| Events flow but a body is blank | Sensitive keys are scrubbed at the source, so a redacted field is expected. A whole body missing means one of: `request.capture_body` / `request.capture_response` off, a media type not on `request.body_content_types` (`text/html` is not, by default), a streamed or file response, or a request that carried no body. See [Request and response bodies](#request-and-response-bodies). |
+| Events flow but a body or the header bag is blank | Sensitive keys are scrubbed at the source, so a redacted field is expected. A missing header bag means `request.capture_headers` is off. A whole body missing means one of: `request.capture_body` / `request.capture_response` off, a media type not on `request.body_content_types` (`text/html` is not, by default), a streamed or file response, or a request that carried no body. See [Request headers and bodies](#request-headers-and-bodies). |
 | A body ends in `… [truncated]` | It was longer than `request.max_body` (64 KB by default). Raise it, or set it to `0` for no cap. |
 | A queued job's payload is blank | It is never captured at all — the engine's job records carry the name, id, queue, connection and outcome and nothing else. |
 | No telemetry after a deploy | Config cache is stale — `php artisan config:clear` (or re-run `config:cache`). |

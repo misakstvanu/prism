@@ -107,6 +107,58 @@ it('records the body of a request that faulted', function () {
     expect(shippedRequestPayload()['request_body'] ?? '')->toContain('a@b.test');
 });
 
+it('records the header bag of every request, scrubbed by key', function () {
+    // The scrub list is what decides, and it decides BY KEY — which is the
+    // whole reason the bag is read here rather than taken off the engine's own
+    // record, whose redaction says `[47 bytes redacted]` where every other
+    // value Prism stores says `[REDACTED]`.
+    config(['prism.scrub' => ['authorization', 'cookie']]);
+
+    Route::get('/prism-header-probe', fn () => response('ok', 200, ['Content-Type' => 'text/plain']));
+
+    // A 200, deliberately: the engine serialises its own payload only for a
+    // 500, and that rule has never governed headers. A request that was
+    // addressed wrongly and answered 200 is exactly what this panel answers.
+    $this->withHeaders([
+        'Authorization' => 'Bearer secret-header-value',
+        'Cookie' => 'session=secret-cookie-value',
+        'X-Request-Origin' => 'checkout',
+    ])->get('/prism-header-probe')->assertOk();
+
+    $headers = shippedRequestPayload()['request_headers'] ?? '';
+
+    expect($headers)->toContain('x-request-origin')
+        ->and($headers)->toContain('checkout')
+        ->and($headers)->not->toContain('secret-header-value')
+        ->and($headers)->not->toContain('secret-cookie-value');
+
+    // Decoded rather than matched as text, because what has to hold is that
+    // the KEY was answered — a substring assertion would pass for a bag whose
+    // `[REDACTED]` belonged to some other header entirely.
+    /** @var array<string, mixed> $decoded */
+    $decoded = json_decode($headers, true);
+
+    expect($decoded['authorization'] ?? null)->toBe('[REDACTED]')
+        ->and($decoded['cookie'] ?? null)->toBe('[REDACTED]')
+        // A name that carried one value is flattened back to a string; the bag
+        // is for a reader, not for a machine.
+        ->and($decoded['x-request-origin'] ?? null)->toBe('checkout');
+});
+
+it('records no headers when the switch is off', function () {
+    config(['prism.request.capture_headers' => false]);
+
+    Route::get('/prism-header-off-probe', fn () => response('ok', 200, ['Content-Type' => 'text/plain']));
+
+    $this->withHeaders(['X-Request-Origin' => 'checkout'])
+        ->get('/prism-header-off-probe')
+        ->assertOk();
+
+    // ABSENT, not empty — the column keeps its own `DEFAULT ''` rather than
+    // being told an empty bag was observed.
+    expect(shippedRequestPayload())->not->toHaveKey('request_headers');
+});
+
 it('records the query string beside the path, not inside it', function () {
     // A column of its own: `path` is the dimension the Stream tab filters and
     // scans by, so a query mixed into it would make one endpoint a different
