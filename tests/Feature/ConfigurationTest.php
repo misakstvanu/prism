@@ -70,6 +70,34 @@ it('warns exactly once and no-ops when enabled without a token', function () {
     Log::shouldHaveReceived('warning')->once();
 });
 
+it('wires capture with a blank token on a local host', function () {
+    // The hub's own fallback (US-002) accepts a token-less batch in the `local`
+    // environment, so a `local` client is allowed to ship without a credential —
+    // which is what fills a development console from `composer require` plus
+    // PRISM_APP alone.
+    Log::spy();
+    config(['prism.enabled' => true, 'prism.token' => null, 'prism.app' => 'demo']);
+    app()->instance('env', 'local');
+
+    bootPrism();
+
+    expect(app()->bound(PrismServiceProvider::ACTIVE))->toBeTrue();
+    Log::shouldNotHaveReceived('warning');
+});
+
+it('still no-ops and warns with a blank token outside a local host', function () {
+    // The exception is the environment, not the token: a staging or production
+    // host with no credential is the misconfiguration the warning exists for.
+    Log::spy();
+    config(['prism.enabled' => true, 'prism.token' => null, 'prism.app' => 'demo']);
+    app()->instance('env', 'production');
+
+    bootPrism();
+
+    expect(app()->bound(PrismServiceProvider::ACTIVE))->toBeFalse();
+    Log::shouldHaveReceived('warning')->once();
+});
+
 it('does not throw when enabled without a token', function () {
     config(['prism.enabled' => true, 'prism.token' => null]);
 

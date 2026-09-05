@@ -37,6 +37,7 @@ use Laravel\Nightwatch\UserProvider;
 use Misakstvanu\Prism\Metrics\QueueMetrics;
 use Misakstvanu\Prism\Metrics\SystemMetrics;
 use Misakstvanu\Prism\PrismServiceProvider;
+use Misakstvanu\Prism\Tests\LocalIngestTestCase;
 use Misakstvanu\Prism\Tests\NightwatchHostTestCase;
 use Misakstvanu\Prism\Tests\OpenTelemetryHostTestCase;
 use Misakstvanu\Prism\Tests\TestCase;
@@ -58,6 +59,13 @@ pest()->extend(TestCase::class)->in('Feature');
 // two premises are genuinely different: everything under `tests/Feature` proves
 // the package stands up alone.
 pest()->extend(NightwatchHostTestCase::class)->in('Host');
+
+// `tests/LocalIngest` is the same host credentialled the way a laptop is: no
+// token, `APP_ENV=local`. A fourth directory because the claim is about what the
+// provider does while it BOOTS — blanking the token after the application exists
+// would assert against capture that is already wired (see
+// {@see LocalIngestTestCase}).
+pest()->extend(LocalIngestTestCase::class)->in('LocalIngest');
 
 // `tests/Otel` is the same host with the span lane's own provider added, in the
 // order `installed.json` forces: keepsuit, then Nightwatch, then Prism. It is a

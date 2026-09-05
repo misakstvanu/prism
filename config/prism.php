@@ -53,6 +53,13 @@ return [
     | never throws — so a missing variable degrades cleanly instead of
     | breaking the host application.
     |
+    | A blank token is allowed on a LOCAL host only: with APP_ENV=local the
+    | client captures and ships with no Authorization header at all, and the
+    | hub must be running in its own local environment to accept that batch
+    | and attribute it to a default workspace (PRISM_INGEST_DEFAULT_ORGANIZATION
+    | there). Anywhere else a blank token is the no-op above. "prism:check"
+    | reports the token-less local path as a state rather than a failure.
+    |
     */
 
     'token' => env('PRISM_TOKEN'),

@@ -126,6 +126,28 @@ it('gzips and posts the envelope with the bearer token', function () {
     expect($decoded)->toBe(['v' => 1, 'events' => [['type' => 'log', 'timestamp' => 't']]]);
 });
 
+it('omits the Authorization header when no token is configured', function () {
+    // The token-less `local` path (US-003). A `Bearer ` with nothing after it
+    // is worse than no header at all: the hub's fallback is reached by a
+    // MISSING bearer, so an empty one would be refused by the very install this
+    // path exists for.
+    config([
+        'prism.token' => null,
+        'prism.endpoint' => 'https://prism.test/api/ingest',
+    ]);
+
+    $history = [];
+    $transport = mockedTransport([new GuzzleResponse(202, [], '{"accepted":1}')], $history);
+
+    expect($transport->send(['v' => 1, 'events' => []]))->toBeTrue();
+
+    $request = $history[0]['request'];
+
+    expect($request->hasHeader('Authorization'))->toBeFalse()
+        // Everything else about the send is unchanged.
+        ->and($request->getHeaderLine('Content-Encoding'))->toBe('gzip');
+});
+
 it('counts and swallows a non-2xx response, logging at debug', function () {
     Log::spy();
 

@@ -75,6 +75,7 @@ use Misakstvanu\Prism\Otel\PrismSpanProcessor;
 use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\Otel\SpanLane;
 use Misakstvanu\Prism\Otel\SpanLineage;
+use Misakstvanu\Prism\Support\Credentials;
 use Misakstvanu\Prism\Support\Recursion;
 use Misakstvanu\Prism\Support\Runtime;
 use Misakstvanu\Prism\Support\Scrubber;
@@ -100,9 +101,11 @@ use Throwable;
  *   - `prism.enabled` is the master switch. When false, boot returns before
  *     touching the event system, so a disabled install registers no listeners
  *     at all and adds zero overhead.
- *   - `prism.token` must be set. When it is missing the package silently
- *     no-ops and logs one warning at boot — it never throws — because a client
- *     with nowhere to send telemetry has nothing to do.
+ *   - `prism.token` must be set, unless the host runs in the `local`
+ *     environment, where a hub accepts token-less ingest (US-003). When it is
+ *     missing anywhere else the package silently no-ops and logs one warning at
+ *     boot — it never throws — because a client with nowhere to send telemetry
+ *     has nothing to do. {@see Credentials} owns the rule.
  *
  * `registerCapture()` is the seam later stories fill: the event buffer
  * (US-037), async flush (US-038), trace propagation (US-041), exception
@@ -782,14 +785,16 @@ class PrismServiceProvider extends ServiceProvider
      * ordering that makes the whole derivation a `register()` + `booting()`
      * affair. Idempotent, because it runs twice.
      *
-     * The token is part of the condition, not an afterthought: an enabled
-     * install with no token never reaches `registerCapture()`, so nothing binds
-     * the buffer the processor writes into and nothing ships what it collects.
-     * Registering it there would fill a buffer no flush will ever drain.
+     * The credential is part of the condition, not an afterthought: an install
+     * that never reaches `registerCapture()` binds no buffer for the processor
+     * to write into and ships nothing it collects, so registering it there would
+     * fill a buffer no flush will ever drain. It is the same question the boot
+     * gate asks — {@see Credentials::usable()} — which is why a token-less
+     * `local` host gets the span lane like any other configured install.
      */
     private function registerSpanProcessor(Repository $config, bool $enabled): void
     {
-        if (! $enabled || blank($config->get('prism.token'))) {
+        if (! $enabled || ! Credentials::usable($config, $this->app->environment())) {
             return;
         }
 
@@ -863,7 +868,12 @@ class PrismServiceProvider extends ServiceProvider
 
         // Enabled but no token: no-op and surface the reason exactly once,
         // never throwing, so the host app boots normally.
-        if (blank($this->app['config']->get('prism.token'))) {
+        //
+        // Unless this is a `local` host (US-003). A hub running in the `local`
+        // environment accepts a token-less batch and attributes it to a default
+        // workspace, so capture runs here with no credential and the transport
+        // omits the Authorization header. {@see Credentials} owns the rule.
+        if (! Credentials::usable($this->app['config'], $this->app->environment())) {
             Log::warning(
                 'Prism is enabled but PRISM_TOKEN is not set — telemetry capture is disabled. '
                 .'Set PRISM_TOKEN (and PRISM_APP) to enable it, or PRISM_ENABLED=false to silence this warning.'
@@ -1166,11 +1176,14 @@ class PrismServiceProvider extends ServiceProvider
      * *to* without a token, and every collaborator a forwarder needs — the
      * transport, the spool, the flush strategy — is bound in this method.
      *
-     * So an enabled install with no token registers no forwarder,
+     * So an install that cannot ship — enabled, no token, and not a `local`
+     * host ({@see Credentials::usable()}) — registers no forwarder,
      * {@see BrowserReportController} finds none in the container, and the report
      * is read, answered 204 and discarded. Nothing is buffered and nothing
      * ships, which is the honest answer to "we accepted this and have nowhere
-     * to put it".
+     * to put it". On a token-less `local` host there *is* somewhere to put it,
+     * so the forwarder is bound with everything else and browser reports
+     * forward like every other signal (US-003).
      */
     protected function registerBrowserForwarder(): void
     {

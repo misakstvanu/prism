@@ -233,6 +233,47 @@ it('reports the token as present without printing it', function () {
         ->assertExitCode(0);
 });
 
+it('reports a blank token on a local host as a state, not a failure', function () {
+    // The token-less local path (US-003): the hub accepts an untokened batch in
+    // its own `local` environment, so there is nothing here for anyone to fix
+    // and the command carries on to the live check.
+    configureCheck(['prism.token' => null]);
+    app()->instance('env', 'local');
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    // One wording per test: `expectsOutputToContain` matchers are unordered and
+    // the first declared match consumes the line it matched.
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('(none — local host, hub must allow untokened ingest)')
+        ->assertExitCode(0);
+});
+
+it('probes with no bearer at all on the token-less local path', function () {
+    // Exactly as the transport ships it: the hub's fallback is reached by a
+    // MISSING bearer, so probing with an empty one would test a different thing
+    // from what the client will do.
+    configureCheck(['prism.token' => null]);
+    app()->instance('env', 'local');
+    Http::fake(['prism.test/*' => Http::response(['accepted' => 1], 202)]);
+
+    $this->artisan('prism:check')->assertExitCode(0);
+
+    Http::assertSent(fn (Request $request): bool => ! $request->hasHeader('Authorization'));
+});
+
+it('names the untokened batch when a hub refuses it', function () {
+    // A 401 here is not "check PRISM_TOKEN" — there is none to check. What went
+    // wrong is at the other end: the hub is not local, or has no workspace to
+    // attribute the batch to.
+    configureCheck(['prism.token' => null]);
+    app()->instance('env', 'local');
+    Http::fake(['prism.test/*' => Http::response([], 401)]);
+
+    $this->artisan('prism:check')
+        ->expectsOutputToContain('refused an untokened batch')
+        ->assertExitCode(1);
+});
+
 it('reports no per-domain capture toggles, because there are none to honour', function () {
     // US-001 moved the "which signals" vocabulary to the capture engine and
     // dropped the `capture` block; US-021 deleted the listeners the block's

@@ -12,6 +12,9 @@
         <testsuite name="Host">
             <directory>tests/Host</directory>
         </testsuite>
+        <testsuite name="LocalIngest">
+            <directory>tests/LocalIngest</directory>
+        </testsuite>
         <testsuite name="Otel">
             <directory>tests/Otel</directory>
         </testsuite>

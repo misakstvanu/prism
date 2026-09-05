@@ -17,7 +17,8 @@ use Throwable;
  * Ships batches over HTTP to the Prism ingest endpoint (US-038).
  *
  * The payload is JSON-encoded, gzipped and POSTed with the bearer ingest token
- * under a short timeout (default 2s). Three properties make it safe on a hot
+ * — or, on a token-less `local` host, with no `Authorization` header at all
+ * ({@see headers()}) — under a short timeout (default 2s). Three properties make it safe on a hot
  * path:
  *
  *   - Connection reuse. The Guzzle client is built once and held for the life
@@ -61,17 +62,7 @@ final class HttpTransport implements Transport
             }
 
             $response = $this->client()->request('POST', $this->endpoint(), [
-                RequestOptions::HEADERS => [
-                    'Authorization' => 'Bearer '.$this->token(),
-                    'Content-Type' => 'application/json',
-                    'Content-Encoding' => 'gzip',
-                    'Accept' => 'application/json',
-                    'Connection' => 'keep-alive',
-                    // Marks this POST as Prism's own so the client's HTTP capture
-                    // (US-046) skips it rather than recording the ingest send as
-                    // an outgoing request and shipping it in turn (US-039 AC1).
-                    Recursion::MARKER_HEADER => '1',
-                ],
+                RequestOptions::HEADERS => $this->headers(),
                 RequestOptions::BODY => $gzipped,
                 RequestOptions::TIMEOUT => $this->timeout(),
                 RequestOptions::CONNECT_TIMEOUT => $this->timeout(),
@@ -90,6 +81,41 @@ final class HttpTransport implements Transport
         } catch (Throwable $e) {
             return $this->fail('Prism batch send failed: '.$e->getMessage());
         }
+    }
+
+    /**
+     * The headers a batch travels under.
+     *
+     * `Authorization` is present only when a token is configured. A blank one
+     * reaches this method on exactly one path — a `local` host shipping to a
+     * hub that accepts token-less ingest (US-003) — and there a `Bearer `
+     * header with nothing after it is worse than none: the hub's fallback is
+     * reached by a *missing* bearer, so sending an empty one would be refused
+     * by the very install the path exists for. The rule deciding when that path
+     * is allowed lives in the client's `Credentials` helper.
+     *
+     * @return array<string, string>
+     */
+    private function headers(): array
+    {
+        $headers = [
+            'Content-Type' => 'application/json',
+            'Content-Encoding' => 'gzip',
+            'Accept' => 'application/json',
+            'Connection' => 'keep-alive',
+            // Marks this POST as Prism's own so the client's HTTP capture
+            // (US-046) skips it rather than recording the ingest send as
+            // an outgoing request and shipping it in turn (US-039 AC1).
+            Recursion::MARKER_HEADER => '1',
+        ];
+
+        $token = $this->token();
+
+        if ($token !== '') {
+            $headers['Authorization'] = 'Bearer '.$token;
+        }
+
+        return $headers;
     }
 
     /** Count a failure, log it at debug level, and report the send as failed. */
