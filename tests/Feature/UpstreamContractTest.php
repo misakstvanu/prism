@@ -59,17 +59,16 @@ use Symfony\Component\Console\Input\ArrayInput;
  * is the safer one and is asserted anyway: `@api` is a promise about intent,
  * not a guarantee of signature.
  *
- * **Every failure in this file names `packages/prism/UPGRADING.md`.** A red
- * build here is not a bug in Prism; it is an upstream release that moved
- * something Prism reads, and the fix is a translation plus an entry in that
- * file saying what moved.
+ * **A red build here is not a bug in Prism.** It is an upstream release that
+ * moved something Prism reads, and the fix is a translation where Prism reads
+ * it plus an updated pin in this file.
  */
 
 /** Where the answer to a failure in this file lives. */
 function upstreamContractGuide(string $what): string
 {
     return $what.' — an upstream release has moved something Prism reads. '
-        .'Translate it and record the change in packages/prism/UPGRADING.md.';
+        .'Translate it where Prism reads it and update the pin in this file.';
 }
 
 /**

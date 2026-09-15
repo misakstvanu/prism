@@ -25,7 +25,7 @@ use Throwable;
  * while keeping their signatures** — both were the manual entry points to
  * capture listeners Prism wrote itself and no longer has. The work now goes to
  * the engine that owns the signal: an exception to the capture engine, a span
- * to the span lane. See the package `UPGRADING.md`.
+ * to the span lane.
  */
 final class Prism
 {
