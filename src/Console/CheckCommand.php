@@ -21,37 +21,18 @@ use Misakstvanu\Prism\Support\Recursion;
 use Throwable;
 
 /**
- * Verifies the Prism client is correctly wired up before a team trusts it
- * (US-052) — a one-shot preflight for `php artisan prism:check`.
- *
- * It runs five checks and reports each in plain language:
- *
- *   1. Configuration. The two required variables (PRISM_TOKEN, PRISM_APP) are
- *      present and the endpoint is a valid URL. A missing or malformed value
- *      names the exact variable at fault, so the fix is obvious.
- *   2. Capture engine (US-005). Which engine is capturing, at which version,
- *      whether Prism's own in-process ingest is installed over it, and — said
- *      out loud, because an operator who follows the engine's own documentation
- *      will otherwise go looking for one — that no agent daemon is required.
- *      It also reports the browser endpoint (US-011): the one part of the
- *      install a *page* can observe, and the one whose failure an operator
- *      first meets as a 404 in a browser console rather than as an empty screen.
- *   3. Delivery. How a finished batch leaves the process and, under the `spool`
- *      strategy, whether the cache store and queue it depends on are in place —
- *      an install that captures happily into a spool nothing drains looks
- *      identical to a healthy one from the inside.
- *   4. Connectivity + token. A single test event is POSTed to the configured
- *      ingest endpoint with the bearer token. An unreachable host, a rejected
- *      token and an accepted event are three distinct, clearly-labelled outcomes.
- *   5. Acceptance. The endpoint's `{ accepted }` count is inspected so the
- *      command confirms the event was actually stored, not merely that the POST
- *      returned 2xx.
- *
- * The command is registered unconditionally (even for a disabled or
- * token-less install) precisely so it can diagnose a broken one. It exits
- * non-zero on any failure so it is usable as a gate in CI and deploy pipelines
- * (AC4); a deliberate `PRISM_ENABLED=false` is reported and treated as success,
- * because an opt-out is not a misconfiguration.
+ * One-shot preflight for `php artisan prism:check` (US-052) — five checks before a team trusts the client:
+ *   1. Configuration. PRISM_TOKEN and PRISM_APP present, endpoint a valid URL, each problem naming the
+ *      exact variable at fault.
+ *   2. Capture engine (US-005). Which engine, which version, whether Prism's own in-process ingest sits
+ *      over it, that no agent daemon is required, plus the browser endpoint (US-011).
+ *   3. Delivery. How a batch leaves, and under `spool` whether its cache store and queue are in place.
+ *   4. Connectivity + token. One test event POSTed to the configured ingest endpoint with the bearer token,
+ *      so unreachable host, rejected token and accepted event are three distinct, clearly-labelled outcomes.
+ *   5. Acceptance. The `{ accepted }` count confirms the event was stored, not merely that the POST was 2xx.
+ * Registered unconditionally (even for a disabled or token-less install) so it can diagnose a broken one, and
+ * exits non-zero on any failure, so it works as a CI/deploy gate (AC4). A deliberate `PRISM_ENABLED=false` is
+ * reported and treated as success: an opt-out is not a misconfiguration.
  */
 class CheckCommand extends Command
 {
@@ -62,11 +43,9 @@ class CheckCommand extends Command
     protected $description = 'Verify the Prism client is configured and can reach the ingest endpoint.';
 
     /**
-     * Prism's OpenTelemetry span processor, named as a string rather than
-     * imported: the report has to work for an install where the span lane is
-     * not there at all — a host that took `keepsuit/laravel-opentelemetry` out
-     * of its tree, or one that published `config/opentelemetry.php` and
-     * therefore registers the processor itself or not at all.
+     * Prism's OpenTelemetry span processor as a string, not an import: the report has to work where the span
+     * lane is not there at all — `keepsuit/laravel-opentelemetry` taken out of the tree, or a host that
+     * published `config/opentelemetry.php` and therefore registers the processor itself or not at all.
      */
     private const SPAN_PROCESSOR = 'Misakstvanu\\Prism\\Otel\\PrismSpanProcessor';
 
@@ -76,22 +55,16 @@ class CheckCommand extends Command
         $this->line('<options=bold>Prism install verification</>');
         $this->newLine();
 
-        // A deliberate opt-out — the master switch off. Nothing is captured or
-        // sent, so there is nothing to verify. Report it clearly and succeed:
-        // a disabled install is a choice, not a fault, and failing CI on it
-        // would be surprising.
+        // A deliberate opt-out — the master switch off, nothing captured or sent, nothing to verify. Report
+        // and succeed: a disabled install is a choice, not a fault, and failing CI on it would be surprising.
         if (! $config->get('prism.enabled')) {
             $this->warn('  Prism is disabled — PRISM_ENABLED=false.');
             $this->line('  No telemetry is captured or sent. Set PRISM_ENABLED=true to enable it.');
             $this->newLine();
 
-            // The one line worth printing anyway (US-011). Every other check
-            // below is about what this process captures, and a disabled install
-            // captures nothing — but the browser endpoint is registered inside
-            // the host's own route table, so switching Prism off is what turns
-            // an SDK's post into a 404, in a browser console, somewhere nobody
-            // running this command is looking. Say so here rather than leave the
-            // one observable symptom unexplained.
+            // Printed anyway (US-011): every other check below is about what this process captures and a
+            // disabled install captures nothing, but the endpoint is registered inside the host's own route
+            // table — switching Prism off turns an SDK's post into a 404, where nobody here is looking.
             $this->reportBrowserEndpoint($config);
             $this->newLine();
 
@@ -103,9 +76,8 @@ class CheckCommand extends Command
         $this->reportCaptureEngine($config);
         $this->reportDelivery($config, $spool);
 
-        // A configuration fault means the live checks cannot even run (no token
-        // to authenticate with, no endpoint to reach). Report every problem at
-        // once so the user can fix them in one pass, and exit non-zero.
+        // A configuration fault means the live checks cannot even run (no token to authenticate with, no
+        // endpoint to reach). Report every problem at once so they are fixed in one pass, and exit non-zero.
         if ($problems !== []) {
             $this->reportProblems($problems);
 
@@ -116,9 +88,8 @@ class CheckCommand extends Command
     }
 
     /**
-     * Validate the required configuration, returning one actionable message per
-     * problem found — each naming the specific variable or condition at fault
-     * (AC3). An empty list means the configuration is sound.
+     * One actionable message per configuration problem, each naming the variable or condition at fault
+     * (AC3); an empty list means the configuration is sound.
      *
      * @return list<string>
      */
@@ -126,10 +97,8 @@ class CheckCommand extends Command
     {
         $problems = [];
 
-        // A blank token is fatal everywhere except a `local` host, where a hub
-        // in the same environment accepts token-less ingest (US-003). Reported
-        // as a state on the `token` line below rather than as a problem, since
-        // there is nothing here for anyone to fix.
+        // A blank token is fatal everywhere except a `local` host, where a hub in the same environment
+        // accepts token-less ingest (US-003) — a state on the `token` line below, not a problem to fix here.
         if (! Credentials::usable($config, $this->laravel->environment())) {
             $problems[] = 'PRISM_TOKEN is not set. Mint an ingest-scoped token in the Prism console '
                 .'(Settings → API tokens) and set PRISM_TOKEN.';
@@ -155,36 +124,21 @@ class CheckCommand extends Command
     }
 
     /**
-     * Report what is actually capturing in this process, and where its records
-     * go (US-005).
-     *
-     * Four of the six lines exist because the interesting failures here are
-     * silent ones:
-     *
-     *   - **engine** names `laravel/nightwatch` and its installed version. The
-     *     record shapes Prism translates are versioned per type upstream, so
-     *     "which version is in this tree" is the first thing worth knowing when
-     *     a screen has quietly emptied.
-     *   - **ingest** says whether `Core::$ingest` is Prism's. It is what the
-     *     provider assigns at boot, and it is assigned only on the enabled +
-     *     token path — so an install that is capturing happily into the
-     *     engine's own socket ingest, with nothing reaching Prism, is visible
-     *     here rather than inferred from an empty console.
-     *   - **agent** says `not required`, unconditionally and out loud. The
-     *     engine's own documentation tells an operator to run a `nightwatch:agent`
-     *     daemon; Prism replaces the ingest wholesale, so that daemon is not a
-     *     thing to install, start, monitor or debug. An operator who goes
-     *     looking for it has already lost an afternoon.
-     *   - **otel spans** reports whether the span processor is registered —
-     *     which is the whole of the span lane, and the half of "is this
-     *     install complete" the `ingest` line does not answer. Its absence is
-     *     a state, not a fault: spans keep arriving from the engine's own
-     *     records, flat, so the line reports and the command carries on.
-     *
-     * The last two restate the token and the endpoint beside them, because the
-     * token is what decides whether the ingest above was installed at all, and
-     * the endpoint is the address the connectivity check below actually reaches
-     * for — the three answers explain each other and are worth reading together.
+     * What is capturing here and where its records go (US-005); four of the six lines exist because the
+     * interesting failures are silent:
+     *   - **engine** names `laravel/nightwatch` and its installed version; the record shapes Prism translates
+     *     are versioned per type upstream, so that version is the first thing to know when a screen empties.
+     *   - **ingest** says whether `Core::$ingest` is Prism's — assigned by the provider at boot, only on the
+     *     enabled + token path, so an install still capturing into the engine's own socket ingest, with
+     *     nothing reaching Prism, is visible here rather than inferred from an empty console.
+     *   - **agent** says `not required`, unconditionally and out loud: the engine's own documentation tells an
+     *     operator to run a `nightwatch:agent` daemon, but Prism replaces the ingest wholesale — nothing to
+     *     install, start, monitor or debug.
+     *   - **otel spans** reports whether the span processor is registered — the whole span lane, and the half
+     *     of "is this install complete" the `ingest` line does not answer. Its absence is a state, not a
+     *     fault: spans keep arriving from the engine's own records, flat, so the command carries on.
+     * The last two restate the token (which decides whether that ingest was installed at all) and the
+     * endpoint (what the connectivity check below reaches for), so the three answers explain each other.
      */
     private function reportCaptureEngine(Repository $config): void
     {
@@ -201,12 +155,9 @@ class CheckCommand extends Command
     }
 
     /**
-     * The credential this process ships under — three states, not two.
-     *
-     * A blank token on a `local` host is not a fault (US-003): the hub accepts
-     * a token-less batch there and attributes it to a default workspace, so the
-     * line says what will happen and what has to be true at the other end,
-     * rather than telling an operator to go and mint something.
+     * The credential this process ships under — three states, not two. A blank token on a `local` host is
+     * not a fault (US-003): the hub accepts a token-less batch there and attributes it to a default
+     * workspace, so the line says what will happen and what must be true at the other end.
      */
     private function tokenDescription(Repository $config): string
     {
@@ -226,13 +177,9 @@ class CheckCommand extends Command
     }
 
     /**
-     * The capture engine and the version of it installed in this tree.
-     *
-     * The version comes from Composer's runtime API rather than from a constant
-     * of the engine's own, so it reports what is *installed* rather than what
-     * the package believes about itself — and its absence (a classmap-only
-     * autoloader, a tree assembled by hand) is reported as an unknown version
-     * rather than as a failure.
+     * The capture engine and the version installed in this tree, from Composer's runtime API rather than a
+     * constant of the engine's own — what is *installed*, not what the package believes about itself; its
+     * absence (a classmap-only autoloader, a hand-assembled tree) is an unknown version, not a failure.
      */
     private function engineDescription(): string
     {
@@ -260,9 +207,8 @@ class CheckCommand extends Command
     }
 
     /**
-     * Whether Prism's own in-process pipeline is installed over the engine's
-     * ingest — the single fact that decides whether anything captured in this
-     * process ever reaches the workspace.
+     * Whether Prism's own in-process pipeline is installed over the engine's ingest — the single fact that
+     * decides whether anything captured in this process ever reaches the workspace.
      */
     private function ingestDescription(): string
     {
@@ -284,17 +230,12 @@ class CheckCommand extends Command
     }
 
     /**
-     * The OpenTelemetry span lane, which is what contributes the parent/child
-     * span tree — the one thing the capture engine's completion-only records
-     * cannot express.
-     *
-     * Two different absences, and the second is the one worth a sentence: no
-     * class at all means the span package is not in the tree, while a class
-     * that is installed and not registered means the host published
-     * `config/opentelemetry.php` (so Prism wrote nothing, deliberately) and has
-     * not added the processor to `traces.processors` itself. Either way the
-     * command succeeds: spans still arrive from the engine's own records, so a
-     * missing processor is a flatter waterfall rather than a broken install.
+     * The OpenTelemetry span lane contributes the parent/child span tree — the one thing the capture engine's
+     * completion-only records cannot express. Two absences: no class at all means the span package is not in
+     * the tree; installed and not registered means the host published `config/opentelemetry.php` (so Prism
+     * deliberately wrote nothing) and has not added the processor to `traces.processors` itself. Either way
+     * the command succeeds — spans still arrive from the engine's own records, so a missing processor is a
+     * flatter waterfall, not a broken install.
      */
     private function spanProcessorDescription(): string
     {
@@ -302,13 +243,10 @@ class CheckCommand extends Command
             return '<fg=yellow>not configured</> — spans come from the capture engine\'s own records';
         }
 
-        // The verdict comes from {@see SpanLane} rather than from a second
-        // reading of the config, because since US-018 it decides behaviour as
-        // well as wording: with the processor registered, the engine's own
-        // `query` and `outgoing-request` records are dropped in favour of the
-        // spans. A line that could disagree with that decision would be the
-        // one place an operator looks to find out why the Queries screen is
-        // empty.
+        // The verdict comes from {@see SpanLane}, not a second reading of the config: since US-018 it
+        // decides behaviour as well as wording — with the processor registered the engine's own `query` and
+        // `outgoing-request` records are dropped in favour of the spans, and a line that could disagree
+        // with that decision is the one place an operator looks to find out why Queries is empty.
         if ($this->laravel->make(SpanLane::class)->registered()) {
             return '<fg=green>configured</>';
         }
@@ -317,19 +255,12 @@ class CheckCommand extends Command
     }
 
     /**
-     * The browser endpoint's own line (US-011).
-     *
-     * Every other line in this section answers a question about *this* process.
-     * This one answers the only question a page can ask: is there something at
-     * the address the SDK posts to, and is it the address I configured? An
-     * operator meets its absence as a 404 in a browser console — a symptom no
-     * console screen shows and no server log explains — so the four states it
-     * can be in are worth naming out loud.
-     *
-     * It is printed for a disabled install too ({@see handle()}), because the
-     * endpoint is registered below the `prism.enabled` gate and above the token
-     * one: a blank `PRISM_TOKEN` still answers 204, so `PRISM_ENABLED=false` is
-     * the only way a configured install stops answering at all.
+     * The browser endpoint's line (US-011). Every other line is about *this* process; this one answers what
+     * a page can ask: is there something at the address the SDK posts to, and is it the one I configured? Its
+     * absence reaches an operator as a 404 in a browser console, a symptom no console screen or server log
+     * shows, so all four states are named out loud. Printed for a disabled install too ({@see handle()}): the
+     * endpoint is registered below the `prism.enabled` gate and above the token one, and a blank `PRISM_TOKEN`
+     * still answers 204, so `PRISM_ENABLED=false` is the only way a configured install stops answering at all.
      */
     private function reportBrowserEndpoint(Repository $config): void
     {
@@ -337,23 +268,15 @@ class CheckCommand extends Command
     }
 
     /**
-     * Where the browser endpoint is, or why it is nowhere.
-     *
-     * **The verdict comes from the route table, not from a second reading of the
-     * config**, for the reason the span-lane line's does: what an operator needs
-     * to know is what the router will actually answer, and a config value is
-     * only an input to that. It is also the only reading that survives
-     * `route:cache` — a cached table registered while the endpoint was on keeps
-     * serving it, whatever config says now — and the only one that cannot drift
-     * from {@see PrismServiceProvider::registerBrowserEndpoint()}'s own rules
-     * about a blank path.
-     *
-     * The route's own URI is what is printed, so an overridden
-     * `prism.browser.path` needs no separate handling and a normalisation the
-     * provider applies and this method did not could not disagree with it.
-     * Config is consulted only for the wording of an absence, where the router
-     * has nothing to say: the two switches produce the same missing route and
-     * they are not the same problem.
+     * Where the browser endpoint is, or why it is nowhere. **The verdict comes from the route table, not a
+     * second reading of the config**, for the span-lane line's reason: what matters is what the router will
+     * answer, config being only an input to it. It is also the only reading that survives `route:cache`, which
+     * keeps serving a table built while the endpoint was on whatever config says now, and the only one that
+     * cannot drift from {@see PrismServiceProvider::registerBrowserEndpoint()}'s own rules about a blank path.
+     * The route's own URI is printed, so an overridden `prism.browser.path` needs no separate handling and the
+     * provider's normalisation cannot disagree with one this method did not. Config is consulted only for the
+     * wording of an absence, where the router has nothing to say: the two switches produce the same missing
+     * route and are not the same problem.
      */
     private function browserEndpointDescription(Repository $config): string
     {
@@ -375,10 +298,8 @@ class CheckCommand extends Command
             return '<fg=yellow>disabled</> (PRISM_BROWSER_ENABLED)';
         }
 
-        // Both switches are on and the router still has no route, which leaves
-        // exactly one cause: the path was configured to nothing, so there was no
-        // address to register. Reported rather than folded into "disabled",
-        // because the fix is a different variable.
+        // Both switches on and still no route leaves exactly one cause: the path was configured to nothing,
+        // so there was no address to register. Not folded into "disabled" — the fix is a different variable.
         return '<fg=yellow>not registered</> — prism.browser.path is blank';
     }
 
@@ -393,15 +314,10 @@ class CheckCommand extends Command
     }
 
     /**
-     * Who may post to it: the same-origin default, or the origins listed in
-     * `prism.browser.origins`.
-     *
-     * Read through {@see BrowserCors} rather than off the config key directly,
-     * so what is printed is what a request is actually matched against — an
-     * entry dropped for being unusable, or normalised for the comparison, is
-     * reported the way it will be applied rather than the way it was written.
-     * A frontend deployed apart from its backend fails with no symptom but a
-     * browser refusing the call, so the list is worth reading back.
+     * Who may post to it: the same-origin default, or the origins in `prism.browser.origins`, read through
+     * {@see BrowserCors} rather than off the config key, so an entry dropped for being unusable, or normalised
+     * for the comparison, is reported as it will be matched, not as written. A frontend deployed apart from its
+     * backend fails with no symptom but a browser refusing the call, so the list is worth reading back.
      */
     private function browserOriginsDescription(Repository $config): string
     {
@@ -411,14 +327,10 @@ class CheckCommand extends Command
     }
 
     /**
-     * Report how batches leave this process, and — under the `spool` strategy —
-     * whether the two things a spool depends on are actually in place.
-     *
-     * A spool that cannot be drained is the quietest way for an install to go
-     * silent: capture keeps working, batches keep landing in the cache, and
-     * nothing ever ships. Both preconditions are reported explicitly, with the
-     * fallback spelled out, so that state is visible here rather than inferred
-     * from an empty console.
+     * How batches leave this process and, under `spool`, whether the two things a spool depends on are in
+     * place. A spool that cannot be drained is the quietest way for an install to go silent: capture keeps
+     * working, batches keep landing in the cache, nothing ever ships. Both preconditions are reported
+     * explicitly, with the fallback spelled out, so that state is visible here.
      */
     private function reportDelivery(Repository $config, BatchSpool $spool): void
     {
@@ -477,11 +389,10 @@ class CheckCommand extends Command
     }
 
     /**
-     * POST one test event to the ingest endpoint to prove connectivity, the
-     * token and end-to-end acceptance in a single round trip (AC1/AC2). The
-     * three failure modes — unreachable host, rejected token, non-accepting
-     * response — each produce a distinct, actionable message and a non-zero
-     * exit; a `202` whose `accepted` count includes the event is success.
+     * POST one test event to the ingest endpoint to prove connectivity, the token and end-to-end acceptance
+     * in a single round trip (AC1/AC2). The three failure modes — unreachable host, rejected token,
+     * non-accepting response — each produce a distinct, actionable message and a non-zero exit; a `202`
+     * whose `accepted` count includes the event is success.
      */
     private function sendTestEvent(Repository $config): int
     {
@@ -496,13 +407,11 @@ class CheckCommand extends Command
         $request = Http::timeout($timeout)
             ->connectTimeout($timeout)
             ->acceptJson()
-            // Mark the probe as Prism's own so an active install's HTTP
-            // capture (US-046) never records this diagnostic call.
+            // Marks the probe as Prism's own so an active install's HTTP capture (US-046) never records it.
             ->withHeaders([Recursion::MARKER_HEADER => '1']);
 
-        // No bearer at all on the token-less local path, exactly as the
-        // transport sends it: the hub's fallback is reached by a *missing*
-        // bearer, so probing with an empty one would test a different thing.
+        // No bearer at all on the token-less local path, exactly as the transport sends it: the hub's
+        // fallback is reached by a *missing* bearer, so probing with an empty one would test another thing.
         if ($token !== '') {
             $request = $request->withToken($token);
         }
@@ -534,10 +443,9 @@ class CheckCommand extends Command
             return self::FAILURE;
         }
 
-        // Over quota (US-030): the endpoint is reachable and the token is valid,
-        // but the workspace has exhausted its monthly event allowance so the
-        // event was not stored. That is an operational state, not a wiring fault
-        // — report it and succeed, so a deploy gate is not tripped by billing.
+        // Over quota (US-030): reachable and the token valid, but the workspace has exhausted its monthly
+        // event allowance so the event was not stored. An operational state, not a wiring fault — report
+        // and succeed, so a deploy gate is not tripped by billing.
         if ($status === 429) {
             $this->components->warn(
                 'Connected and authenticated, but the workspace is over its monthly event quota '
@@ -581,10 +489,9 @@ class CheckCommand extends Command
     }
 
     /**
-     * The minimal versioned envelope carrying one innocuous `log` event, in the
-     * exact wire shape the server validates (US-026). A `log` is the least
-     * intrusive signal to inject; its string `timestamp` and known type are what
-     * make the server accept it.
+     * The minimal versioned envelope carrying one innocuous `log` event, in the exact wire shape the server
+     * validates (US-026): the least intrusive signal to inject, whose string `timestamp` and known type are
+     * what make the server accept it.
      *
      * @return array<string, mixed>
      */

@@ -11,19 +11,18 @@ use Misakstvanu\Prism\Transport\Transport;
  * The transport the capture benchmark runs against (US-023): it counts what a
  * run would have shipped and sends nothing.
  *
- * A benchmark that let {@see HttpTransport} do its
- * job would be timing a network round trip — one whose latency dwarfs the whole
- * capture path and varies by more between two runs than the difference the
- * benchmark exists to measure. Standing in for it here is not a shortcut: the
- * question is what capture costs the *host's request*, and delivery is
- * deliberately off that path already (the flush runs in a `terminating`
- * callback, after the response has gone).
+ * Letting {@see HttpTransport} do its job would time a network round trip,
+ * whose latency dwarfs the whole capture path and varies more between two runs
+ * than the difference being measured. Not a shortcut: the question is what
+ * capture costs the *host's request*, and delivery is deliberately off that
+ * path already (the flush runs in a `terminating` callback, after the response
+ * has gone).
  *
- * Counting the events is the other half of the reason. "Events emitted per
- * request" is one of the three figures the benchmark reports, and the envelope
- * arriving here is the only place the number is true for a whole execution —
- * the buffer has been drained by then, and the per-signal counters upstream
- * keeps describe records, not the Prism events they translated into.
+ * Counting the events is the other half. "Events emitted per request" is one of
+ * the three figures the benchmark reports, and the envelope arriving here is
+ * the only place the number is true for a whole execution — the buffer has been
+ * drained by then, and the per-signal counters upstream keeps describe records,
+ * not the Prism events they translated into.
  */
 final class BenchTransport implements Transport
 {
@@ -32,9 +31,8 @@ final class BenchTransport implements Transport
     private int $events = 0;
 
     /**
-     * Count one envelope and its events, then report success — a `false` here
-     * would be read as a delivery failure by anything watching, and nothing
-     * failed.
+     * Count one envelope and its events, then report success — a `false` would
+     * be read as a delivery failure by anything watching, and nothing failed.
      *
      * @param  array<string, mixed>  $envelope
      */
@@ -52,11 +50,10 @@ final class BenchTransport implements Transport
     }
 
     /**
-     * Drop everything counted so far.
-     *
-     * Called between the warm-up and the timed run: warm-up executions ship
-     * real batches too, and counting them would inflate the per-request figure
-     * by however many warm-up iterations were asked for.
+     * Drop everything counted so far. Called between the warm-up and the timed
+     * run: warm-up executions ship real batches too, and counting them would
+     * inflate the per-request figure by however many warm-up iterations were
+     * asked for.
      */
     public function reset(): void
     {

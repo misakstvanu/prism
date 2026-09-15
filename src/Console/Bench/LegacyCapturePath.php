@@ -30,39 +30,35 @@ use Symfony\Component\Process\Process;
 use Throwable;
 
 /**
- * The pre-2.0 capture path, brought back from git so the benchmark has
- * something to compare against (US-023).
+ * The pre-2.0 capture path, brought back from git as the benchmark's baseline
+ * (US-023).
  *
- * **Why this exists at all.** The epic replaced Prism's own nine capture
- * listeners with two upstream engines, and the one question that decides
- * whether that was worth doing is what it costs the host's request. "Cheaper
- * than before" is not a claim that can be made from the new tree — the old
- * listeners were deleted (US-021), and a number remembered from before the
- * change describes a different machine on a different day. So the old client is
- * reconstructed here, in the same process, against the same workload, on the
- * same box, minutes apart from the new one.
+ * **Why.** The epic replaced Prism's own nine capture listeners with two
+ * upstream engines, and whether that was worth doing turns on what capture
+ * costs the host's request. "Cheaper than before" cannot be claimed from the
+ * new tree — the old listeners were deleted (US-021), and a number remembered
+ * from before describes a different machine on a different day — so the old
+ * client is reconstructed here: same process, workload and box, minutes apart
+ * from the new one.
  *
- * **What is reconstructed, and what is not.** Only the request path: the
- * middleware that times the lifecycle and emits its spans, the query capturer,
- * the cache capturer, the span recorder they share and the Monolog handler.
- * Jobs, scheduled tasks and outgoing HTTP are left out because the benchmark
- * times requests — a listener that never fires costs a `listen()` call at boot
- * and nothing per request, so including them would change no figure while
- * adding four more ways for the reconstruction to be wrong.
+ * **The request path only**: the middleware that times the lifecycle and emits
+ * its spans, the query capturer, the cache capturer, the span recorder they
+ * share, the Monolog handler. Jobs, scheduled tasks and outgoing HTTP are left
+ * out because the benchmark times requests — a listener that never fires costs
+ * a `listen()` call at boot and nothing per request, so they change no figure
+ * and add four more ways for the reconstruction to be wrong.
  *
- * **Two deliberate deviations, both in the old client's favour or neutral.**
- * The middleware is pushed onto the *global* stack rather than appended to the
- * `web`/`api` groups, because the benchmark's route belongs to no group and
- * both engines it is being compared against are global too — appending to a
- * group the route is not in would have measured the old client doing nothing.
- * And the flush is registered as an ordinary `terminating` callback, exactly as
- * the old provider registered it.
+ * **Two deliberate deviations, neutral or in the old client's favour.** The
+ * middleware is pushed onto the *global* stack, not appended to `web`/`api`:
+ * the benchmark's route belongs to no group and both engines it is compared
+ * against are global, so a group the route is not in would have measured the
+ * old client doing nothing. And the flush is an ordinary `terminating`
+ * callback, exactly as the old provider registered it.
  *
- * The sources are materialised out of git rather than vendored into the
- * package: 2,600 lines of deleted code carried forward as a fixture would be
- * 2,600 lines nobody maintains, and the one property this needs — that it is
- * *the old client*, not somebody's recollection of it — is exactly what a git
- * ref guarantees and a copy does not.
+ * Materialised from git rather than vendored: 2,600 lines of deleted code as a
+ * fixture is 2,600 lines nobody maintains, and the one property this needs —
+ * that it is *the old client*, not somebody's recollection of it — is what a
+ * git ref guarantees and a copy does not.
  */
 final class LegacyCapturePath
 {
@@ -70,9 +66,9 @@ final class LegacyCapturePath
      * The commit that deleted `packages/prism/src/Capture/` (US-021); its
      * parent is therefore the last tree in which the old client was whole.
      *
-     * Pinned as a full sha rather than a branch-relative expression because a
-     * benchmark's baseline has to name one tree forever — `HEAD~n` moves with
-     * every commit, and a baseline that quietly moves is worse than none.
+     * A full sha, not a branch-relative expression: a baseline has to name one
+     * tree forever — `HEAD~n` moves with every commit, and a baseline that
+     * quietly moves is worse than none.
      */
     public const REF = 'f17de137ddfbeaa8bc4812179ef45432de8ba41c^';
 
@@ -89,9 +85,9 @@ final class LegacyCapturePath
      * Materialise the old client's sources into `$target`, returning the
      * directory on success or an explanation on failure.
      *
-     * An already-populated target is used as-is. That is what makes the command
-     * usable where `git` is not on the PATH — the container this project runs
-     * its PHP in has no git binary, so the export is run once from the host into
+     * An already-populated target is used as-is, which is what makes the
+     * command usable with no `git` on the PATH: the container this project runs
+     * its PHP in has no git binary, so the export runs once from the host into
      * the shared tree and every later run finds it there.
      *
      * @return array{0: string|null, 1: string|null} `[directory, failure reason]`
@@ -110,9 +106,9 @@ final class LegacyCapturePath
             return [null, "could not create {$target}"];
         }
 
-        // `git archive | tar -x` rather than a checkout: it writes only the
-        // paths asked for, touches no index and cannot disturb the working
-        // tree the benchmark is about to measure.
+        // `git archive | tar -x`, not a checkout: writes only the paths asked
+        // for, touches no index, cannot disturb the working tree the benchmark
+        // is about to measure.
         $command = sprintf(
             'git archive %s %s | tar -x -C %s --strip-components=%d',
             escapeshellarg($ref),
@@ -133,9 +129,8 @@ final class LegacyCapturePath
 
     /**
      * The one-line command an operator can run themselves when this process
-     * cannot (no git binary, an export that failed) — printed rather than
-     * guessed at, because the alternative is a benchmark that silently drops
-     * its baseline.
+     * cannot (no git binary, a failed export) — printed rather than guessed at:
+     * the alternative is a benchmark that silently drops its baseline.
      */
     public static function exportCommand(string $target, string $ref): string
     {
@@ -156,8 +151,8 @@ final class LegacyCapturePath
      * classmap is generated from the tree as it stood when `dump-autoload` last
      * ran, so it can still hold entries for files US-021 deleted — and a
      * classmap hit is an unconditional `include` of a path that is no longer
-     * there, which is a fatal rather than a miss the next autoloader gets to
-     * answer. Going first sidesteps that entirely.
+     * there, i.e. a fatal rather than a miss the next autoloader answers.
+     * Going first sidesteps it.
      *
      * Nothing here can shadow a class the package still ships: the loader
      * returns without acting unless the file exists in the materialised
@@ -188,9 +183,8 @@ final class LegacyCapturePath
      * The bindings are the old `registerCapture()`'s, in its order, minus the
      * pieces no request touches. `PrismServiceProvider::ACTIVE` is bound first
      * and is load-bearing: every old capturer asks the container for it before
-     * recording, so without it the whole reconstruction would run and buffer
-     * nothing — a baseline of zero, which would then make any new figure look
-     * like a regression.
+     * recording, so without it the reconstruction would run and buffer nothing
+     * — a baseline of zero, making any new figure look like a regression.
      */
     public static function install(Application $app, BenchTransport $transport): void
     {
@@ -218,9 +212,9 @@ final class LegacyCapturePath
         });
 
         // Named as strings, never imported: these classes do not exist in this
-        // tree at all, and a `use` of one would be a broken import in a file
-        // that has to keep parsing, linting and autoloading on an install that
-        // never runs the benchmark. They resolve through the loader above.
+        // tree at all, and a `use` would be a broken import in a file that has
+        // to keep parsing, linting and autoloading on an install that never
+        // runs the benchmark. They resolve through the loader above.
         $spanRecorder = 'Misakstvanu\\Prism\\Capture\\SpanRecorder';
         $captureRequests = 'Misakstvanu\\Prism\\Capture\\CaptureRequests';
         $queryCapture = 'Misakstvanu\\Prism\\Capture\\QueryCapture';
@@ -264,9 +258,9 @@ final class LegacyCapturePath
         }
 
         // Two listeners on one event, exactly as the old provider had it: the
-        // middleware's own counter (which the request event reports and the `db`
-        // waterfall span is built from) and the per-query capturer. Their being
-        // separate is part of what is being measured.
+        // middleware's own counter (reported by the request event, and what the
+        // `db` waterfall span is built from) and the per-query capturer. Their
+        // being separate is part of what is measured.
         $app['events']->listen(QueryExecuted::class, static function (QueryExecuted $event) use ($app, $captureRequests): void {
             if (Recursion::suppressed()) {
                 return;
@@ -300,9 +294,8 @@ final class LegacyCapturePath
     /**
      * Push the old Monolog handler onto the app's default channel, stripping
      * any earlier copy of the same class first — the stack-channel rule: a
-     * Laravel stack is built out of its children's handler instances, so
-     * pushing onto one that already carries the handler captures every line
-     * twice.
+     * Laravel stack is built from its children's handler instances, so pushing
+     * onto one that already carries the handler captures every line twice.
      */
     private static function attachLogHandler(Application $app, string $handlerClass): void
     {

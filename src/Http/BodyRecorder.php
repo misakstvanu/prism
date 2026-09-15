@@ -17,95 +17,58 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
 
 /**
- * The request and response bodies of the execution being recorded.
+ * The request and response bodies of the execution being recorded, and its request headers.
  *
- * **The capture engine has no answer here, which is why this class exists.**
- * Nightwatch's request record carries a `payload` field, but it is serialised
- * only when the response was a **500**, only for a supported content type, and
- * it lands in no Prism column — and there is no response body in its model at
- * all: a `RequestRecord` carries `responseSize`, an integer, and nothing else
- * about what was sent back. Both halves of "what did this request actually
- * exchange" therefore have to be captured by Prism, which is what
- * {@see Middleware\CaptureHttpBodies} does and what this holds.
+ * The capture engine answers none of it: Nightwatch's request record serialises a `payload` only on a
+ * **500**, only for a supported content type, into no Prism column, and models no response body at all
+ * (`RequestRecord` carries `responseSize`, an integer, nothing else). {@see Middleware\CaptureHttpBodies}
+ * captures, this holds — a **holder, not a listener**, filled with the response in hand and read back by
+ * {@see PrismIngest} when the engine writes its `request` record from `terminate()`, long after the stack
+ * unwound. A singleton, not scoped, for the event buffer's reason (a long-lived runtime — Octane, a queue
+ * worker — keeps the container between executions), so safety comes from {@see reset()} at the *start* of
+ * every request, not from discard at the end; a worker never runs the middleware, so never has a body to
+ * report (a job is not an HTTP exchange). Four rules then decide what is recorded, each a way of not lying:
+ *   - A JSON or form body is decoded, walked by key by the {@see Scrubber} — the same `prism.scrub` list
+ *     that redacts a header or an outgoing query string — and re-encoded; raw bytes would mean scrubbing a
+ *     secret out of text with a regex, the weaker rule.
+ *   - Anything else is free text: a `text/plain` or XML body has no keys to walk, so it meets
+ *     {@see RedactRules::redactText()}, the `name = value` matcher a SQL statement and an artisan command
+ *     line also meet, so a key added to `prism.scrub` covers all of them.
+ *   - A content type nobody can read is not recorded: `prism.request.body_content_types` keeps a rendered
+ *     image, a PDF export, a gzip stream and, by default, rendered HTML out of a `String` column.
+ *   - A body is capped in bytes and says when it was cut: {@see Text::truncate()} never cuts mid-character,
+ *     and the appended marker stops a reader seeing a JSON document that merely *looks* malformed.
  *
- * It is a **holder, not a listener**: the middleware fills it while the
- * response is in hand and {@see PrismIngest}
- * reads it back when the engine finally writes its `request` record, which
- * happens from `terminate()` — long after the middleware stack has unwound.
- * A singleton rather than a scoped binding for the same reason the event buffer
- * is one: a long-lived runtime (Octane, a queue worker) keeps the container
- * between executions, so what makes this safe is that {@see reset()} runs at
- * the *start* of every request rather than that the object is thrown away at
- * the end of one. A worker never runs the middleware at all and so never has a
- * body to report, which is correct — a job is not an HTTP exchange.
- *
- * Four rules decide what is recorded, and each of them is a way of not lying:
- *
- *   - **Structured bodies are recorded as scrubbed JSON, not as raw bytes.** A
- *     JSON or form body is decoded, run through the {@see Scrubber} by key —
- *     the same object, and so the same `prism.scrub` list, that redacts a
- *     header or an outgoing query string — and re-encoded. Recording the raw
- *     bytes instead would mean scrubbing a secret out of text with a regex,
- *     which is the weaker rule; here the key is a key.
- *   - **Anything else is free text, and meets the free-text rule.** A
- *     `text/plain` or XML body has no keys to walk, so it goes through
- *     {@see RedactRules::redactText()} — the same `name = value` matcher a SQL
- *     statement and an artisan command line meet, so a host that adds a key to
- *     `prism.scrub` gets all of them for it.
- *   - **A content type nobody can read is not recorded.** The allow list
- *     (`prism.request.body_content_types`) is what keeps a rendered image, a
- *     PDF export or a gzip stream out of a `String` column, and what keeps the
- *     default from quietly storing every HTML document the application renders.
- *   - **A body is capped in bytes and says when it was cut.** Truncation is
- *     {@see Text::truncate()} so the cut never lands mid-character, and the
- *     marker is appended so a reader is never shown a JSON document that merely
- *     *looks* malformed.
- *
- * Uploaded **file contents are never recorded**. A multipart request is
- * recorded as its non-file fields; the files are named, sized and typed in a
- * `_files` entry beside them, because a body that silently omitted the half of
- * the request that mattered would be worse than one that says what it left out.
- *
- * **The request headers are captured here too, and on every request.** The
- * engine does serialise a header bag onto its own record, but it words a
- * redaction its own way (`[47 bytes redacted]`) where every other value Prism
- * stores says `[REDACTED]` — one console, two vocabularies for one act — and it
- * blanks only the names it was handed rather than walking the bag by key. So
- * the bag is read here instead, through the same {@see Scrubber} a JSON body
- * meets, and lands in the `request_headers` column beside the two bodies. The
- * 500-only rule that governs the engine's *payload* has never governed its
- * headers and does not govern these: a header bag is what says how a request
- * was addressed, and a 200 that was addressed wrongly is exactly the case it
- * answers.
+ * Uploaded **file contents are never recorded**: a multipart request is recorded as its non-file fields,
+ * the files named, sized and typed in a `_files` entry beside them — a body silently omitting the half of
+ * the request that mattered would be worse than one saying what it left out. **The request headers are
+ * captured here too, and on every request**: the 500-only rule governs the engine's *payload*, never its
+ * headers, and a 200 addressed wrongly is exactly the case a header bag answers. The engine does serialise
+ * a bag onto its own record, but words a redaction `[47 bytes redacted]` against the `[REDACTED]` every
+ * other value Prism stores says — one console, two vocabularies for one act — and blanks only the names it
+ * was handed rather than walking the bag by key, so the bag is read here through the same {@see Scrubber}
+ * a JSON body meets, into the `request_headers` column beside the two bodies.
  */
 final class BodyRecorder
 {
     /**
-     * Appended to a body the cap cut, so a reader knows the document is partial.
-     *
-     * {@see Text::TRUNCATED} is the one definition — a job payload is cut the
-     * same way — and this name is kept because it is what callers already ask
-     * for.
+     * Appended to a body the cap cut, so a reader knows the document is partial. {@see Text::TRUNCATED} is
+     * the one definition (a job payload is cut the same way); kept under this name because callers ask for it.
      */
     public const TRUNCATED = Text::TRUNCATED;
 
     /**
-     * The key an uploaded file's metadata is recorded under, inside the
-     * recorded body. Prefixed like upstream's own `_nightwatch_files` so it
-     * cannot be mistaken for a field the client actually sent.
+     * The key an uploaded file's metadata is recorded under, inside the recorded body. Prefixed
+     * like upstream's own `_nightwatch_files` so it cannot be mistaken for a field the client sent.
      */
     private const FILES_KEY = '_prism_files';
 
     /**
-     * Content types whose bodies are worth recording, when the host has not
-     * said otherwise. Matched against the media type alone (parameters such as
-     * `charset=` are ignored) with `+json` / `+xml` suffixes recognised, so
-     * `application/problem+json` is a JSON body.
-     *
-     * `text/html` is deliberately **absent**: an HTML response is the rendered
-     * page, which is the largest and least diagnostic thing an application
-     * produces, and storing 64 KB of markup per request would price the whole
-     * feature out. A host that wants it adds it.
+     * Content types whose bodies are worth recording, when the host has not said otherwise. Matched on
+     * the media type alone (parameters such as `charset=` ignored) with `+json` / `+xml` suffixes
+     * recognised, so `application/problem+json` is a JSON body. `text/html` is deliberately **absent**:
+     * the rendered page is the largest and least diagnostic thing an application produces, and 64 KB of
+     * markup per request would price the whole feature out. A host that wants it adds it.
      *
      * @var list<string>
      */
@@ -134,12 +97,8 @@ final class BodyRecorder
     ) {}
 
     /**
-     * Forget the previous execution's bodies.
-     *
-     * Called at the *start* of a request rather than the end of one, which is
-     * what makes a stale body impossible in a long-lived runtime: a request
-     * that never reaches {@see record()} — one that died mid-stack — leaves
-     * nothing behind for the next request to report as its own.
+     * Forget the previous execution's bodies at the *start* of a request, not the end: one dying mid-stack
+     * before {@see record()} leaves nothing for the next to report as its own in a long-lived runtime.
      */
     public function reset(): void
     {
@@ -149,13 +108,10 @@ final class BodyRecorder
     }
 
     /**
-     * Record what this exchange carried, subject to the three switches, the
-     * content-type allow list and the byte cap.
-     *
-     * Every step is guarded: reading a body means touching a stream, decoding
-     * client-supplied bytes and encoding whatever came back, and none of that
-     * is worth a host's request. A failure leaves the body empty, which reads
-     * on the screen exactly as "nothing was captured" — the honest answer.
+     * Record what this exchange carried, subject to the three switches, the content-type allow list and
+     * the byte cap. Every step is guarded — reading a body touches a stream, decodes client-supplied bytes
+     * and encodes what came back, none of it worth a host's request — and a failure leaves the body empty,
+     * reading as the honest "nothing was captured".
      */
     public function record(Request $request, Response $response): void
     {
@@ -173,13 +129,9 @@ final class BodyRecorder
     }
 
     /**
-     * What was recorded, as the `requests` columns name them, or null when
-     * nothing was.
-     *
-     * Null rather than a set of empty strings so the ingest can leave the
-     * payload alone entirely for an execution that is not an HTTP request —
-     * a command, a job — rather than stamping three blanks onto every one of
-     * them. The ingest drops an empty value key by key, so a request that
+     * What was recorded, as the `requests` columns name them, or null when nothing was — null rather than
+     * blanks so the ingest leaves an execution that is not an HTTP request (a command, a job) alone instead
+     * of stamping three blanks onto every one; it drops an empty value key by key, so a request that
      * recorded headers and no body stamps only the headers.
      *
      * @return array{request_headers: string, request_body: string, response_body: string}|null
@@ -198,21 +150,13 @@ final class BodyRecorder
     }
 
     /**
-     * The request's headers as scrubbed JSON.
-     *
-     * Symfony lower-cases every name and holds every value as a list, because a
-     * header may legally repeat. A name that carried exactly one value is
-     * flattened back to a string here — a bag whose every value is a
-     * one-element array reads as a machine's idea of a header bag rather than a
-     * reader's — while a genuinely repeated one keeps its list, so nothing is
-     * silently dropped.
-     *
-     * The {@see Scrubber} then walks it by key, which is the whole reason this
-     * is read here rather than taken off the engine's own record: `cookie` and
-     * `authorization` are keys, so they are answered by the same `prism.scrub`
-     * list and the same `[REDACTED]` wording as a `password` field in a JSON
-     * body. The cap is the bodies' cap — a header bag is small, but nothing
-     * that reaches a String column may be unbounded.
+     * Headers as scrubbed JSON. Symfony lower-cases every name and lists every value, since a header may
+     * legally repeat; a one-value name is flattened back to a string (one-element arrays read as a
+     * machine's header bag, not a reader's), a repeated one keeps its list, so nothing is silently dropped.
+     * The {@see Scrubber} then walks it by key — why it is read here, not off the engine's own record:
+     * `cookie` and `authorization` are keys, meeting the same `prism.scrub` list and `[REDACTED]` wording
+     * as a JSON body's `password` field. The cap is the bodies': nothing reaching a String column may be
+     * unbounded.
      */
     private function readHeaders(Request $request): string
     {
@@ -235,14 +179,10 @@ final class BodyRecorder
     }
 
     /**
-     * The request body: its parsed fields where it has any, its raw text where
-     * it does not.
-     *
-     * `$request->request` is the POST bag, and Laravel points it at the decoded
-     * JSON document for a JSON request (`Request::createFromBase()`), so one
-     * read covers both of the shapes a client actually sends structured data
-     * in. That is also what makes the strong scrub available: the fields are
-     * keys before they are text.
+     * The request body: its parsed fields where it has any, its raw text where it does not.
+     * `$request->request` is the POST bag, which Laravel points at the decoded JSON document for a JSON
+     * request (`Request::createFromBase()`), so one read covers both shapes a client sends structured data
+     * in and buys the strong scrub: the fields are keys before they are text.
      */
     private function readRequest(Request $request): string
     {
@@ -270,13 +210,9 @@ final class BodyRecorder
     }
 
     /**
-     * The response body.
-     *
-     * A streamed response has no content to read — its body is produced by a
-     * callback while it is being sent, i.e. after every middleware has
-     * returned — and a file response's content is the file, which is exactly
-     * what this must never put in a column. Both answer '' rather than
-     * something that merely looks like a body.
+     * The response body. A streamed response has no content to read (a callback produces its body while it
+     * is being sent, after every middleware has returned) and a file response's content is the file, which
+     * this must never put in a column; both answer '' rather than something that merely looks like a body.
      */
     private function readResponse(Response $response): string
     {
@@ -298,15 +234,11 @@ final class BodyRecorder
     }
 
     /**
-     * A response body meets the keyed rule when it is JSON and the free-text
-     * rule when it is not.
-     *
-     * The decode is what buys the strong scrub on the way *out* as well as the
-     * way in: an API answering `{"token": "…"}` has a key to match, and a regex
-     * over the serialised document would be answering a weaker question about
-     * the same bytes. A document that does not decode to a structure — a bare
-     * JSON scalar, malformed output, plain text — falls back rather than being
-     * dropped.
+     * A response body meets the keyed rule when JSON and the free-text rule when not. The decode buys the
+     * strong scrub on the way *out* as well as in: an API answering `{"token": "…"}` has a key to match,
+     * where a regex over the serialised document answers a weaker question about the same bytes. A body
+     * that does not decode to a structure (a bare JSON scalar, malformed output, plain text) falls back,
+     * never dropped.
      */
     private function redactBody(string $content): string
     {
@@ -320,12 +252,9 @@ final class BodyRecorder
     }
 
     /**
-     * Uploaded files as name, size and client-reported type — never contents.
-     *
-     * A field may hold many files (`documents[]`), and a nested one may hold
-     * more, so this walks rather than reading the first: an upload that was
-     * silently left out of the record is the half of the request a reader most
-     * needs to know arrived.
+     * Uploaded files as name, size and client-reported type — never contents. A field may hold many files
+     * (`documents[]`) and a nested one may hold more, so this walks rather than reading the first: an
+     * upload silently left out is the half of the request a reader most needs to know arrived.
      *
      * @param  array<array-key, mixed>|null  $files
      * @return array<string, array{name: string, size: int, type: string}>
@@ -361,15 +290,11 @@ final class BodyRecorder
     }
 
     /**
-     * Whether a content type is one whose body is worth a column.
-     *
-     * The media type alone is compared — `application/json; charset=utf-8` is
-     * `application/json` — and a `+json` / `+xml` suffix resolves to its base
-     * type, so a vendor media type is recognised without the host having to
-     * list every one it uses. A request that declared no type at all (a GET,
-     * most beacons) has no body worth reading and is refused here rather than
-     * further down, which is what keeps `getContent()` off the hot path for
-     * the majority of requests.
+     * Whether a content type is one whose body is worth a column. The media type alone is compared
+     * (`application/json; charset=utf-8` is `application/json`) and a `+json` / `+xml` suffix resolves to
+     * its base type, so a vendor media type is recognised without the host listing every one it uses. A
+     * request that declared no type at all (a GET, most beacons) has no body worth reading and is refused
+     * here rather than further down, keeping `getContent()` off the hot path for most requests.
      */
     private function recordable(?string $contentType): bool
     {
@@ -393,9 +318,8 @@ final class BodyRecorder
     }
 
     /**
-     * The allow list, lower-cased. A host that replaces it replaces it whole —
-     * the config merge is shallow, which is the same rule every other list in
-     * `config/prism.php` follows.
+     * The allow list, lower-cased. A host that replaces it replaces it whole — the config merge is
+     * shallow, the rule every other list in `config/prism.php` follows.
      *
      * @return list<string>
      */
@@ -421,12 +345,9 @@ final class BodyRecorder
     }
 
     /**
-     * Make a string safe to insert, and bound its cost.
-     *
-     * {@see Text::clean} first, because the cap is in bytes and the cut has to
-     * happen on a string whose bytes are already valid UTF-8; the marker is
-     * appended after the cut rather than budgeted inside it, so the cap is a
-     * cap on the *body* and reads as the number the host configured.
+     * Make a string safe to insert, and bound its cost. {@see Text::clean} first: the cap is in bytes, so
+     * the cut must happen on bytes that are already valid UTF-8. The marker is appended after the cut, not
+     * budgeted inside it, so the cap caps the *body* and reads as the number the host configured.
      */
     private function cap(string $value): string
     {

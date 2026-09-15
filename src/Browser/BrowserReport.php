@@ -23,27 +23,21 @@ use Misakstvanu\Prism\Support\Timestamp;
  * ```
  *
  * **The body is decoded by hand rather than through the request's own JSON
- * accessor**, because the transport a page uses decides the content type and
- * only one of the two is JSON: `navigator.sendBeacon` — the only transport that
- * survives a page being closed, which is when the last report of a session is
- * sent — posts `text/plain` and cannot be told otherwise. A parse keyed on the
- * header would therefore work in every hand test and silently drop the reports
- * that matter most.
+ * accessor**: the transport a page uses decides the content type and only one of
+ * the two is JSON — `navigator.sendBeacon`, the only transport that survives a
+ * page being closed (when the last report of a session is sent), posts
+ * `text/plain` and cannot be told otherwise. A parse keyed on the header works
+ * in every hand test and silently drops the reports that matter most.
  *
- * Parsing is deliberately in two steps, and {@see BrowserReportController} spends
- * the gap between them:
- *
- *   - {@see tryParse} answers the envelope: is this a report at all. It is cheap
- *     and it says nothing about the events beyond how many arrived, which is
- *     what lets the caller refuse an oversized batch (413) before any per-event
- *     work is done.
- *   - {@see filter} answers what is worth forwarding, dropping and counting the
- *     events that are not (see {@see BrowserEvent}).
- *
- * Both are total: neither throws, on any input, from any origin. The endpoint is
- * open to the internet by construction — an anonymous visitor hitting a
- * JavaScript error is the report most worth having — so every refusal here is a
- * return value.
+ * Parsing is deliberately in two steps, and {@see BrowserReportController}
+ * spends the gap between them: {@see tryParse} answers the envelope — is this a
+ * report at all — cheaply, saying nothing about the events beyond how many
+ * arrived, which lets the caller refuse an oversized batch (413) before any
+ * per-event work; {@see filter} then answers what is worth forwarding, dropping
+ * and counting the events that are not (see {@see BrowserEvent}). Both are
+ * total: neither throws, on any input, from any origin. The endpoint is open to
+ * the internet by construction — an anonymous visitor hitting a JavaScript error
+ * is the report most worth having — so every refusal here is a return value.
  */
 final class BrowserReport
 {
@@ -51,12 +45,11 @@ final class BrowserReport
     public const VERSION = 1;
 
     /**
-     * The longest an identifier from the page may be, in bytes.
-     *
-     * The session id, the release name and the user hint are all short, bounded
-     * values by construction — a UUID, a version string, a primary key — so a
-     * long one is a page being careless rather than a value with meaning. They
-     * are cut rather than refused for the same reason every other cap is.
+     * The longest an identifier from the page may be, in bytes. Session id,
+     * release name and user hint are short bounded values by construction — a
+     * UUID, a version string, a primary key — so a long one is a page being
+     * careless rather than a value with meaning. Cut rather than refused, for
+     * the reason every other cap is.
      */
     private const IDENTIFIER_BYTES = 256;
 
@@ -76,12 +69,10 @@ final class BrowserReport
 
     /**
      * Whether a body is JSON at all — the caller's 400, told apart from its 422.
-     *
      * `json_validate()` walks the bytes without building anything, so asking
-     * this before {@see tryParse} costs a scan rather than a second decode. The
-     * distinction is worth keeping: "I could not read this" and "I read it and
-     * it is not a report" are different failures, and the SDK's own error
-     * handling (US-014) is the reader.
+     * this before {@see tryParse} costs a scan rather than a second decode. "I
+     * could not read this" and "I read it and it is not a report" are different
+     * failures, and the SDK's own error handling (US-014) reads them.
      */
     public static function isDecodable(string $body): bool
     {
@@ -90,12 +81,10 @@ final class BrowserReport
 
     /**
      * Read the envelope, or null when the body is not a version 1 report.
-     *
-     * `sent_at` is required and must be legible because it is not decoration:
-     * the offset between it and the server's own clock is what corrects every
-     * timestamp in the report (US-008), and browser clocks are wrong often
-     * enough that the correction is the point. A report that cannot say when it
-     * was sent has no offset to be corrected by.
+     * `sent_at` is required and must be legible: the offset between it and the
+     * server's own clock corrects every timestamp in the report (US-008), and
+     * browser clocks are wrong often enough that the correction is the point. A
+     * report that cannot say when it was sent has no offset to be corrected by.
      */
     public static function tryParse(string $body): ?self
     {
@@ -159,11 +148,10 @@ final class BrowserReport
     }
 
     /**
-     * The same report, narrowed to the events worth forwarding.
-     *
-     * A new instance rather than a mutation, so the report a forwarder is handed
-     * is by construction the filtered one — there is no ordering in which an
-     * unvalidated event can reach the pipeline.
+     * The same report, narrowed to the events worth forwarding. A new instance
+     * rather than a mutation, so the report a forwarder is handed is by
+     * construction the filtered one: no ordering lets an unvalidated event reach
+     * the pipeline.
      */
     public function filter(): self
     {
@@ -195,11 +183,9 @@ final class BrowserReport
 
     /**
      * A short identifier the page supplied, cleaned and cut, or null when it
-     * supplied nothing usable.
-     *
-     * A number is accepted as well as a string because a `user.id` is a primary
-     * key on the other side of the wire and JSON has one number type — a page
-     * writing `{"id": 42}` means the same thing as one writing `{"id": "42"}`.
+     * supplied nothing usable. A number is accepted as well as a string: a
+     * `user.id` is a primary key on the other side of the wire and JSON has one
+     * number type, so `{"id": 42}` means what `{"id": "42"}` means.
      */
     private static function identifier(mixed $value): ?string
     {

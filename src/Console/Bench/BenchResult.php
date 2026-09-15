@@ -8,16 +8,16 @@ namespace Misakstvanu\Prism\Console\Bench;
  * One configuration's measurement (US-023) — what a child process reports back
  * to the process that spawned it, and the row the report prints.
  *
- * It is a plain value object with an explicit array shape on both sides because
- * it crosses a process boundary as JSON: the four configurations cannot be
+ * A plain value object with an explicit array shape on both sides because it
+ * crosses a process boundary as JSON: the four configurations cannot be
  * compared inside one process (which engines are listening is decided during
- * `register()`, long before a command runs), so each is measured in a
- * subprocess of its own and its answer is parsed back here.
+ * `register()`, long before a command runs), so each is measured in its own
+ * subprocess and its answer parsed back here.
  *
- * A **skipped** result is a first-class outcome rather than a zero. The old
- * client is materialised out of git, which is not something every install can
- * do — and a zero row would read as "the old client cost nothing", which is the
- * opposite of what a missing measurement means.
+ * A **skipped** result is a first-class outcome, not a zero: the old client is
+ * materialised out of git, which not every install can do, and a zero row would
+ * read as "the old client cost nothing" — the opposite of what a missing
+ * measurement means.
  */
 final class BenchResult
 {
@@ -82,11 +82,10 @@ final class BenchResult
     }
 
     /**
-     * Rebuild a result from the JSON a child process printed.
-     *
-     * Every field is read defensively: the child is a separate PHP process and
-     * a malformed answer must come back as a skipped row naming the problem,
-     * never as a plausible-looking zero.
+     * Rebuild a result from the JSON a child process printed. Every field is
+     * read defensively: the child is a separate PHP process, and a malformed
+     * answer must come back as a skipped row naming the problem, never as a
+     * plausible-looking zero.
      *
      * @param  array<string, mixed>  $data
      */

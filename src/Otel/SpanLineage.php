@@ -12,66 +12,40 @@ use OpenTelemetry\API\Trace\Span;
 use Throwable;
 
 /**
- * Where a span sits: which trace it belongs to, which span it hangs off, and
- * how far into the trace it started (US-015).
- *
- * The OpenTelemetry lane exists for exactly one thing the capture engine's
- * records cannot express — **nesting**. Nightwatch's cache, query and outgoing
- * sensors fire on *completion* only, so no decorator over them can ever produce
- * anything but flat siblings sharing a trace id, while an OTel span carries a
- * parent span id by construction. This class holds the two facts that turn that
- * construction into the two columns Prism's `spans` table has always had:
- *
- *   - **{@see current()} — the active span**, read at the moment a signal is
- *     recorded. That is what parents a signal OTel does not emit a span for
- *     (a cache event; see {@see stampSpan()}) into the tree the instrumented
- *     spans built around it.
- *
- *   - **{@see originNanos()} — where a trace began.** Prism's `offset_ms` is
- *     milliseconds from the *front of the trace*, so every bar in a waterfall
- *     is laid out against one origin. OTel spans carry absolute epoch
- *     timestamps instead, so the origin has to be remembered: the processor
- *     calls {@see observe()} from `onStart`, which is the only hook that runs
- *     before a child's own start — a registry built at `onEnd` would learn the
- *     root's start *after* the first child had already needed it.
- *
- * **A span's emitted `span_id` must equal the id its children name in
- * `parent_span_id`**, or the server's tree assembly silently drops those
- * children to roots and the waterfall goes flat with nothing reporting a
- * problem. For an instrumented span that is free — both ids come from the SDK's
- * own span context. For a stamped one it is why {@see newSpanId()} mints the
- * id here rather than at each call site.
- *
- * Every method is total and swallowing: a span lane that throws would cost the
- * host the request it was describing, and a missing lineage costs a flatter
- * waterfall.
+ * Where a span sits — trace, parent span, offset into the trace (US-015). The OTel lane exists
+ * for **nesting**, which the capture engine's records cannot express: Nightwatch's cache, query
+ * and outgoing sensors fire on *completion* only, yielding flat siblings sharing a trace id,
+ * where an OTel span carries a parent span id by construction. {@see current()} is the active
+ * span, read as a signal is recorded, parenting a signal OTel emits no span for (a cache event,
+ * {@see stampSpan()}) into the instrumented tree. {@see originNanos()} is where a trace began:
+ * `offset_ms` counts milliseconds from the *front of the trace*, one origin per waterfall, while
+ * OTel spans carry absolute epoch timestamps — hence {@see observe()} from `onStart`, the only
+ * hook before a child's own start, where a registry built at `onEnd` would learn the root's
+ * start *after* the first child had needed it. **An emitted `span_id` must equal the id its
+ * children name in `parent_span_id`**, or tree assembly silently drops those children to roots
+ * and the waterfall goes flat with nothing reporting a problem — free for an instrumented span
+ * (both ids off the SDK's own span context), and why {@see newSpanId()} mints a stamped one
+ * here, not at each call site. Every method is total and swallowing: a throw would cost the host
+ * the request it was describing, a missing lineage only a flatter waterfall.
  */
 final class SpanLineage
 {
     /**
-     * How many traces' origins to remember at once.
-     *
-     * A queue worker or an Octane process handles one trace after another
-     * forever, so this map has to be bounded or it is a leak. It is only ever
-     * read while the trace is still open, so the cap needs to cover concurrent
-     * traces in one process rather than history — sixteen is generous for a
-     * runtime that handles one execution at a time and cheap regardless (an
-     * int per entry).
+     * How many traces' origins to remember at once. A queue worker or Octane process handles
+     * one trace after another forever, so this map must be bounded or it leaks; only read
+     * while the trace is still open, so the cap covers concurrent traces in one process, not
+     * history — sixteen is generous for a one-execution-at-a-time runtime and cheap
+     * regardless (an int per entry).
      */
     private const MAX_TRACES = 16;
 
-    /**
-     * Trace id → the epoch nanoseconds its earliest span started at.
-     *
-     * @var array<string, int>
-     */
+    /** @var array<string, int> Trace id → the epoch nanoseconds its earliest span started at. */
     private array $origins = [];
 
     /**
-     * Note where a trace begins. Keeps the *earliest* start seen rather than
-     * the first one reported: upstream's HTTP server instrumentation opens the
-     * request span and then back-dates a separate `app bootstrap` span to the
-     * same instant, and a later instrumentation is free to do the same.
+     * Note where a trace begins, keeping the *earliest* start seen, not the first reported:
+     * upstream's HTTP server instrumentation opens the request span then back-dates a
+     * separate `app bootstrap` span to the same instant, as a later one may.
      */
     public function observe(string $traceId, int $startEpochNanos): void
     {
@@ -79,11 +53,10 @@ final class SpanLineage
             return;
         }
 
-        // The trace this process is now in, published where a signal recorded
-        // *after* every span has ended can still read it — and where Laravel
-        // carries it across a queue boundary. See {@see TraceContext::adopt()};
-        // `onStart` is the first moment the id exists at all, which is why it
-        // is done from here rather than at the end of the execution.
+        // The trace this process is now in, published where a signal recorded *after*
+        // every span ended can still read it, and where Laravel carries it across a queue
+        // boundary ({@see TraceContext::adopt()}). From here, not the execution's end:
+        // `onStart` is the first moment the id exists at all.
         TraceContext::adopt($traceId);
 
         $known = $this->origins[$traceId] ?? null;
@@ -98,10 +71,9 @@ final class SpanLineage
 
         $this->origins[$traceId] = $startEpochNanos;
 
-        // Oldest first: a plain FIFO eviction, because the trace least recently
-        // opened is the one least likely to still be laying out bars. By key
-        // rather than `array_shift`, which walks the whole array to reindex
-        // integer keys it will never find here.
+        // Plain FIFO eviction: the trace least recently opened is least likely to still
+        // be laying out bars. By key rather than `array_shift`, which walks the whole
+        // array to reindex integer keys it will never find here.
         while (count($this->origins) > self::MAX_TRACES) {
             unset($this->origins[array_key_first($this->origins)]);
         }
@@ -114,10 +86,9 @@ final class SpanLineage
     }
 
     /**
-     * The currently active span's trace and span ids, or null when nothing is
-     * active — a console command with no instrumentation, a signal raised
-     * outside any request, or an SDK that is switched off (whose current span
-     * is the API's invalid non-recording one).
+     * The active span's trace and span ids, or null when nothing is active — a console
+     * command with no instrumentation, a signal raised outside any request, an SDK switched
+     * off (whose current span is the API's invalid non-recording one).
      *
      * @return array{trace_id: string, span_id: string}|null
      */
@@ -140,20 +111,14 @@ final class SpanLineage
     }
 
     /**
-     * The trace this execution belongs to, or null when OpenTelemetry has
-     * nothing to say about it (US-017).
-     *
-     * This is the answer {@see PrismIngest} rewrites every capture-engine
-     * record's `trace_id` to, and it is deliberately wider than
-     * {@see current()}: the engine writes its `request` record from
-     * `terminate()`, long after upstream's middleware has ended the request
-     * span and detached its scope, so an answer that could only read the active
-     * span would leave the one row every detail screen is keyed on carrying a
-     * different id from all of its children.
-     *
-     * A seam rather than a static call at the ingest so a caller can be built
-     * without one — {@see PrismIngest} takes a nullable lineage, and with none
-     * a record keeps whatever id it arrived with.
+     * The trace this execution belongs to, or null when OpenTelemetry has nothing to say about
+     * it (US-017): what {@see PrismIngest} rewrites every capture-engine record's `trace_id`
+     * to, deliberately wider than {@see current()} because the engine writes its `request`
+     * record from `terminate()`, long after upstream's middleware ended the request span and
+     * detached its scope — an active-span-only answer would leave the one row every detail
+     * screen is keyed on carrying a different id from all of its children. A seam rather than
+     * a static call at the ingest so a caller can be built without one: {@see PrismIngest}
+     * takes a nullable lineage, and with none a record keeps the id it arrived with.
      */
     public function traceId(): ?string
     {
@@ -161,29 +126,18 @@ final class SpanLineage
     }
 
     /**
-     * Give a Prism span event that has no identity of its own one, and hang it
-     * off whatever OTel span is active right now.
-     *
-     * This is the half of the span lane that is *not* an OTel span. The engine
-     * reports a cache operation as a record rather than a span — upstream's own
-     * cache instrumentation only calls `addEvent()`, and a span *event* has no
-     * Prism column to land in — so the `--color-span-cache` lane is fed by
-     * {@see RecordTranslator}'s translation of that record, and this is
-     * where it joins the tree the instrumented spans built.
-     *
-     * Three things happen, and the middle one is easy to miss:
-     *
-     *   - The event gets a fresh `span_id`, always — even with nothing active.
-     *     A span with a blank id is one every other blank-id span in the trace
-     *     is indistinguishable from, which the server reads as a pile of roots.
-     *   - **The event adopts the active span's `trace_id`.** Parenting only
-     *     means anything inside one trace: left under the capture engine's own
-     *     trace id the row would name a parent that is not in its trace, and the
-     *     tree assembly would drop it to a root. (US-017 generalises this to
-     *     every record; here it is the minimum that makes the parent real.)
-     *   - `offset_ms` is measured back from now: the record is written the
-     *     moment the operation completes, so its start is `now - duration`
-     *     relative to the front of the trace.
+     * Give a Prism span event with no identity of its own one and hang it off whatever OTel span
+     * is active — the span lane's non-OTel half. The engine reports a cache operation as a
+     * record, not a span (upstream's own cache instrumentation only calls `addEvent()`, and a
+     * span *event* has no Prism column to land in), so the `--color-span-cache` lane is fed by
+     * {@see RecordTranslator}'s translation of that record and joins the instrumented tree here.
+     * A fresh `span_id` is minted always, even with nothing active: blank-id spans are
+     * indistinguishable and the server reads them as a pile of roots. **The event also adopts
+     * the active span's `trace_id`** — parenting only means anything inside one trace, so under
+     * the engine's own trace id the row names a parent not in its trace and tree assembly drops
+     * it to a root (US-017 generalises this to every record; here the minimum that makes the
+     * parent real). `offset_ms` is measured back from now: the record is written the moment the
+     * operation completes, so its start is `now - duration` from the trace's front.
      *
      * @param  array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}  $event
      * @return array{type: string, timestamp: string, trace_id: string, request_id: string, user_id: string|null, payload: array<string, mixed>}
@@ -192,8 +146,8 @@ final class SpanLineage
     {
         $payload = $event['payload'];
 
-        // A producer that already named itself keeps its identity — nothing
-        // else may re-key a span whose children are already pointing at it.
+        // A producer that already named itself keeps its identity — nothing may re-key
+        // a span whose children are already pointing at it.
         if (($payload['span_id'] ?? null) !== null && $payload['span_id'] !== '') {
             return $event;
         }
@@ -225,8 +179,8 @@ final class SpanLineage
     }
 
     /**
-     * Forget every remembered origin. Only for a process shutting the lane down
-     * or a long-lived runtime resetting between executions.
+     * Forget every remembered origin. Only for a process shutting the lane down, or a
+     * long-lived runtime resetting between executions.
      */
     public function reset(): void
     {
@@ -234,10 +188,9 @@ final class SpanLineage
     }
 
     /**
-     * Milliseconds from the front of a trace to the start of an operation that
-     * is finishing right now, or null when the trace's origin is unknown (so
-     * the caller leaves the column at its default rather than inventing a zero
-     * that would draw the bar at the front of the waterfall).
+     * Milliseconds from the front of a trace to the start of an operation finishing right
+     * now, or null when the trace's origin is unknown — the caller then leaves the column
+     * at its default rather than inventing a zero drawing the bar at the waterfall front.
      */
     private function offsetEndingNow(string $traceId, mixed $durationMs): ?float
     {

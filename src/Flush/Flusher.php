@@ -12,36 +12,26 @@ use Misakstvanu\Prism\Otel\SpanFlush;
 use Misakstvanu\Prism\Transport\Transport;
 
 /**
- * Drains the event buffer and ships it, off the request's critical path
- * (US-038). Invoked from the service provider's `terminating` callback so it
- * runs only after the response has been sent to the client — the host never
- * waits on a flush.
+ * Drains the event buffer and ships it, off the request's critical path (US-038). Invoked from the service
+ * provider's `terminating` callback, so it runs only after the response has been sent — the host never
+ * waits on a flush. The wire envelope is the versioned format the server validates (US-026):
+ * `{ v: 1, app, env, replica, sent_at, events: [ { type, ... } ] }`. The buffer groups events by type; the
+ * flusher flattens them into one list, stamping each with its group's type so the server can route it to
+ * the right table.
  *
- * The wire envelope is the versioned format the server validates (US-026):
- * `{ v: 1, app, env, replica, sent_at, events: [ { type, ... } ] }`. The buffer
- * groups events by type; the flusher flattens them into one list, stamping each
- * with its group's type so the server can route it to the right table.
+ * Sending is inline by default; a batch larger than `prism.batch.queue_threshold` goes to
+ * {@see SendBatchJob} instead, so the gzip-and-POST of a large payload does not hold the process. The
+ * `sync` strategy forces the inline path regardless — for scripts and tests with no queue worker. The
+ * `spool` strategy sends from neither: the envelope goes onto the cache-backed {@see BatchSpool} and one
+ * debounced drain job ({@see SpoolScheduler}) ships everything that accumulated — for a host whose ingest
+ * endpoint is expensive to reach per request, or is served by the very process doing the sending, where an
+ * inline POST deadlocks against itself. It needs a queue worker and a cache store with atomic locks;
+ * without either, {@see shouldSpool()} declines and the batch takes the normal path rather than being lost.
  *
- * Sending is inline by default, but a batch larger than
- * `prism.batch.queue_threshold` is handed to {@see SendBatchJob} instead so the
- * gzip-and-POST of a large payload does not hold the process. The `sync` flush
- * strategy forces the inline path regardless — it exists for scripts and tests
- * with no queue worker.
- *
- * The `spool` strategy sends from neither: the envelope goes onto the
- * cache-backed {@see BatchSpool} and one debounced drain job
- * ({@see SpoolScheduler}) ships everything that accumulated. That is what a host
- * wants when the ingest endpoint is expensive to reach per request — or is served
- * by the very process doing the sending, where an inline POST deadlocks against
- * itself. It needs a queue worker and a cache store with atomic locks; without
- * either, {@see shouldSpool()} declines and the batch takes the normal path
- * rather than being lost.
- *
- * **The OpenTelemetry tracer is force-flushed first** (US-019). Tail sampling
- * holds a trace's spans until its decision, which by default waits longer than
- * a request lives, so anything still held when this runs would miss the batch
- * its own execution shipped in. See {@see SpanFlush}, which is where the
- * ordering is explained and where the "is there a span lane at all" gate lives.
+ * **The OpenTelemetry tracer is force-flushed first** (US-019). Tail sampling holds a trace's spans until
+ * its decision, which by default waits longer than a request lives, so anything still held when this runs
+ * would miss the batch its own execution shipped in. {@see SpanFlush} holds the ordering rationale and the
+ * "is there a span lane at all" gate.
  */
 final class Flusher
 {
@@ -55,20 +45,17 @@ final class Flusher
     ) {}
 
     /**
-     * Ship whatever is buffered. A no-op when the buffer is empty, so a request
-     * that produced no telemetry costs nothing at terminate.
-     *
-     * Every caller is a terminal hook — the app's `terminating` callback, a job's
-     * terminal queue event, a scheduled task's terminal event — so the batch this
-     * builds always describes finished work. That is what lets the spool hand a
-     * batch to another process without any risk of shipping the middle of a
+     * Ship whatever is buffered. A no-op on an empty buffer, so a request that produced no telemetry costs
+     * nothing at terminate. Every caller is a terminal hook — the app's `terminating` callback, a job's
+     * terminal queue event, a scheduled task's terminal event — so the batch always describes finished
+     * work, which lets the spool hand it to another process with no risk of shipping the middle of a
      * request.
      */
     public function flush(): void
     {
-        // BEFORE the empty check, not after it: an execution whose only
-        // telemetry is a span the tail-sampling decision is still holding would
-        // otherwise return on an empty buffer and force nothing out at all.
+        // BEFORE the empty check, not after it: an execution whose only telemetry is a span the
+        // tail-sampling decision still holds would otherwise return on an empty buffer and force nothing
+        // out.
         $this->spans->flush();
 
         if ($this->buffer->isEmpty()) {
@@ -78,9 +65,8 @@ final class Flusher
         $batch = $this->buffer->flush();
         $envelope = $this->envelope($batch);
 
-        // Spool first: only a refusal (no lock support, no worker, a lock the
-        // producer could not take in time) falls through to sending it here, so
-        // declining is always safe.
+        // Spool first: only a refusal (no lock support, no worker, a lock the producer could not take in
+        // time) falls through to sending here, so declining is always safe.
         if ($this->shouldSpool() && $this->spool->push($envelope)) {
             $this->scheduler->arm();
 
@@ -97,14 +83,11 @@ final class Flusher
     }
 
     /**
-     * Whether this flush should be spooled for a drain job rather than sent.
-     *
-     * Three things have to hold. The strategy has to ask for it; the cache store
-     * has to offer atomic locks, which is what keeps concurrent producers and the
-     * drain from losing a batch between them; and the queue connection must not
-     * be `sync`, on which the "deferred" drain would run inline inside the
-     * terminating callback — precisely the blocking send spooling exists to
-     * avoid.
+     * Whether this flush should be spooled for a drain job rather than sent. Three things have to hold:
+     * the strategy asks for it; the cache store offers atomic locks, which keep concurrent producers and
+     * the drain from losing a batch between them; and the queue connection is not `sync`, on which the
+     * "deferred" drain would run inline inside the terminating callback — the blocking send spooling
+     * exists to avoid.
      */
     private function shouldSpool(): bool
     {
@@ -117,8 +100,8 @@ final class Flusher
 
     /**
      * A batch is queued when it exceeds the configured threshold and the flush
-     * strategy is not `sync`. A threshold of zero (or the `sync` strategy)
-     * keeps every flush inline.
+     * strategy is not `sync`. A threshold of zero (or `sync`) keeps every flush
+     * inline.
      */
     private function shouldQueue(FlushedBatch $batch): bool
     {
@@ -141,8 +124,8 @@ final class Flusher
 
     /**
      * Build the versioned wire envelope from a flushed batch. Events are
-     * flattened out of their per-type groups into one list, each stamped with
-     * its type so the server can route it.
+     * flattened out of their per-type groups into one list, each stamped with its
+     * type so the server can route it.
      *
      * @return array<string, mixed>
      */

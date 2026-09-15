@@ -16,26 +16,22 @@ use Throwable;
 /**
  * Ships batches over HTTP to the Prism ingest endpoint (US-038).
  *
- * The payload is JSON-encoded, gzipped and POSTed with the bearer ingest token
- * — or, on a token-less `local` host, with no `Authorization` header at all
- * ({@see headers()}) — under a short timeout (default 2s). Three properties make it safe on a hot
- * path:
+ * The payload is JSON-encoded, gzipped and POSTed with the bearer ingest token — or, on a
+ * token-less `local` host, with no `Authorization` header at all ({@see headers()}). Three
+ * properties make it safe on a hot path:
  *
- *   - Connection reuse. The Guzzle client is built once and held for the life
- *     of the process; the transport is a container singleton, so a long-lived
- *     runtime (Octane, a queue worker) reuses the same keep-alive connection
- *     pool across every flush instead of opening a fresh socket each time.
+ *   - Connection reuse. The Guzzle client is built once and held for the life of the process;
+ *     the transport is a container singleton, so a long-lived runtime (Octane, a queue worker)
+ *     reuses one keep-alive connection pool across every flush rather than a fresh socket each.
  *
- *   - It never throws. A non-2xx status, a timeout or any transport error is
- *     caught, counted and logged to the host's own log at debug level — a
- *     telemetry client that took down the app it monitors would be worse than
- *     useless. Guzzle's own 4xx/5xx exceptions are disabled (`http_errors`
- *     off) so the status is inspected rather than thrown.
+ *   - It never throws. A non-2xx status, a timeout or any transport error is caught, counted and
+ *     logged to the host's own log at debug level — a telemetry client that took down the app it
+ *     monitors would be worse than useless. Guzzle's own 4xx/5xx exceptions are disabled
+ *     (`http_errors` off) so the status is inspected rather than thrown.
  *
- *   - Short timeout. The request and connect timeouts are bounded (config
- *     `prism.batch.timeout`, default 2s) so a slow or unreachable ingest host
- *     can never stall the process for long, even off the response's critical
- *     path.
+ *   - Short timeout. Request and connect timeouts are bounded (config `prism.batch.timeout`,
+ *     default 2s) so a slow or unreachable ingest host can never stall the process for long,
+ *     even off the response's critical path.
  */
 final class HttpTransport implements Transport
 {
@@ -86,13 +82,11 @@ final class HttpTransport implements Transport
     /**
      * The headers a batch travels under.
      *
-     * `Authorization` is present only when a token is configured. A blank one
-     * reaches this method on exactly one path — a `local` host shipping to a
-     * hub that accepts token-less ingest (US-003) — and there a `Bearer `
-     * header with nothing after it is worse than none: the hub's fallback is
-     * reached by a *missing* bearer, so sending an empty one would be refused
-     * by the very install the path exists for. The rule deciding when that path
-     * is allowed lives in the client's `Credentials` helper.
+     * `Authorization` is present only when a token is configured. A blank one reaches this method
+     * on exactly one path — a `local` host shipping to a hub that accepts token-less ingest
+     * (US-003) — and there a `Bearer ` header with nothing after it is worse than none: the hub's
+     * fallback is reached by a *missing* bearer, so an empty one is refused by the very install
+     * the path exists for. The rule allowing that path lives in the client's `Credentials` helper.
      *
      * @return array<string, string>
      */
@@ -103,9 +97,9 @@ final class HttpTransport implements Transport
             'Content-Encoding' => 'gzip',
             'Accept' => 'application/json',
             'Connection' => 'keep-alive',
-            // Marks this POST as Prism's own so the client's HTTP capture
-            // (US-046) skips it rather than recording the ingest send as
-            // an outgoing request and shipping it in turn (US-039 AC1).
+            // Marks this POST as Prism's own so the client's HTTP capture (US-046) skips it
+            // rather than recording the ingest send as an outgoing request and shipping it in
+            // turn (US-039 AC1).
             Recursion::MARKER_HEADER => '1',
         ];
 
@@ -129,8 +123,8 @@ final class HttpTransport implements Transport
     }
 
     /**
-     * The persistent Guzzle client. Built lazily on first send and reused for
-     * the life of the process so connections are pooled across flushes.
+     * The persistent Guzzle client. Built lazily on first send, reused for the life of the
+     * process so connections are pooled across flushes.
      */
     private function client(): ClientInterface
     {
