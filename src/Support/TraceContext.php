@@ -24,8 +24,7 @@ use Throwable;
  * the same lane's Guzzle middleware, and a **dispatched job** carries it in its payload and runs under a
  * CONSUMER span parented to the PRODUCER span that queued it. An upgrade, not a rename: `X-Prism-Trace-Id`
  * was understood only by a Prism client, so a monitored Laravel app calling a Go service produced two
- * traces; `traceparent`, spoken by every APM and language SDK, produces one. The package `UPGRADING.md`
- * records the removal for anyone stamping the old header by hand.
+ * traces; `traceparent`, spoken by every APM and language SDK, produces one.
  *
  * **Since US-017 OpenTelemetry is the source of truth, and this class is where the two engines are made to
  * agree.** The OTel SDK names a trace with a 32-hex W3C id and the capture engine with a UUID of its own,

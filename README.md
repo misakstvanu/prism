@@ -5,31 +5,21 @@ Laravel 12+ application to capture logs, requests, errors, traces, queries, jobs
 and replica metrics and ship them, correlated by trace, to a Prism workspace.
 
 Everything is captured automatically once two variables are set — no code changes, no manual
-instrumentation required. The package deliberately depends on nothing in the Prism server
-application, so it installs cleanly into a stranger's project.
+instrumentation, no daemon and no OS extension. The package depends on nothing in the Prism server
+application, so it installs cleanly into any project.
 
 ## Requirements
 
 - PHP 8.4+
-- Laravel 12 or 13 (`illuminate/support` `^12.0|^13.0`)
+- Laravel 12 or 13
 - A Prism workspace and an **ingest** API token (Console → Settings → API tokens)
 
-Two packages come along as dependencies, and **neither needs an OS or PECL extension** — the whole
-install is `composer require` and two variables:
-
-- `laravel/nightwatch` (`^1.0`) is the capture engine. **Its agent daemon is not used and not
-  required:** Prism installs its own transport over Nightwatch's ingest seam, so records never leave
-  the process except in a Prism batch. There is no phar to run, no socket to open and no Laravel
-  Nightwatch account to hold.
-- `keepsuit/laravel-opentelemetry` (`^2.2`) is the span lane, the half that gives the Traces
-  waterfall its parent/child nesting. It instruments the framework through events and middleware
-  (unlike `open-telemetry/opentelemetry-auto-laravel`, which hard-requires the `ext-opentelemetry`
-  C extension). **Nothing is exported as OTLP:** Prism consumes the spans in process, so there is
-  no collector to run and no exporter connection is ever opened.
+Two packages come along as dependencies and need no configuration of their own:
+`laravel/nightwatch` (the capture engine) and `keepsuit/laravel-opentelemetry` (the span lane, which
+gives the Traces waterfall its nesting). Neither needs a PECL extension, an agent daemon or an OTLP
+collector — Prism consumes both in process and ships everything in its own batch.
 
 ## Quickstart
-
-Three steps and telemetry starts flowing.
 
 **1. Install**
 
@@ -37,16 +27,9 @@ Three steps and telemetry starts flowing.
 composer require misakstvanu/prism
 ```
 
-The service provider (`Misakstvanu\Prism\PrismServiceProvider`) is auto-discovered — there is no
-provider to register and no kernel file to edit.
+The service provider is auto-discovered — nothing to register.
 
-> **Upgrading from 1.x?** 2.0 replaced the hand-written capture listeners with the two engines
-> above, which changes config keys, trace propagation and the request-body default. A `^1.0`
-> constraint will not carry you across it — the move is a deliberate
-> `composer require misakstvanu/prism:^2.0`. Read [`UPGRADING.md`](UPGRADING.md) first; every
-> removed key is listed there with what replaced it.
-
-**2. Set the two required variables**
+**2. Set the variables**
 
 ```dotenv
 PRISM_TOKEN=prism_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -54,16 +37,8 @@ PRISM_APP=your-app-slug
 PRISM_ENDPOINT=https://your-workspace.prism.app/api/ingest
 ```
 
-`PRISM_TOKEN` and `PRISM_APP` are the only required settings. `PRISM_ENDPOINT` defaults to the
-hosted endpoint; set it to your workspace's `/api/ingest` if you self-host. Everything else has a
-working default.
-
-**On a local host you can leave `PRISM_TOKEN` blank.** With `APP_ENV=local` the client captures and
-ships anyway, with no `Authorization` header at all, and a Prism hub running in *its* own `local`
-environment accepts that batch and attributes it to a default workspace — so a development console
-fills up from `composer require` plus `PRISM_APP`, with nothing minted or copied. The two halves
-must agree: a blank token against a hub that is not local is refused with a `401`, and a blank token
-on any other host is the silent no-op below.
+`PRISM_TOKEN` and `PRISM_APP` are the only required settings; `PRISM_ENDPOINT` defaults to the
+hosted endpoint. Everything else has a working default.
 
 **3. Verify**
 
@@ -71,12 +46,7 @@ on any other host is the silent no-op below.
 php artisan prism:check
 ```
 
-This validates the config and POSTs a single test event to confirm the endpoint accepts your token.
-A green run means the next request, job or scheduled task your app runs is already reporting to the
-console.
-
-It also reports the capture engine, so the two questions Nightwatch's own documentation raises are
-answered on the spot:
+This validates the config and POSTs a test event to confirm the endpoint accepts your token.
 
 ```
   Capture engine
@@ -89,37 +59,18 @@ answered on the spot:
     endpoint ....... https://your-workspace.prism.app/api/ingest
 ```
 
-`ingest` is the line to read when a workspace looks empty: it says whether Prism's own pipeline is
-installed over the engine's, which happens only when `PRISM_ENABLED` is true **and** `PRISM_TOKEN`
-is set — or the host is `local`, where the `token` line reads
-`(none — local host, hub must allow untokened ingest)` and the command carries on rather than
-failing. `otel spans` is the second half of the same question — it says whether the span processor
-that gives the Traces waterfall its nesting is registered; `not configured` costs the nesting and
-nothing else. Anything else there means records are being captured and handed to a socket ingest nothing
-is listening on — which looks exactly like a quiet application from the console.
+Read the `ingest` line when a workspace looks empty — it says whether telemetry is actually reaching
+Prism.
 
-`browser` is the [browser endpoint](#browser-telemetry) — the only part of the install a *page* can
-observe, and the one whose failure you meet as a `404` in a browser console rather than as an empty
-screen. It prints the address the router will actually answer, so a renamed `PRISM_BROWSER_PATH`
-shows up here, and who may post to it: `same-origin` for the ordinary install, or the
-`browser.origins` list for a frontend deployed apart from its backend. It reads
-`disabled (PRISM_BROWSER_ENABLED)` when only the browser block is off, and
-`not registered — PRISM_ENABLED is false` when the master switch is — which is the only way a
-configured install stops answering at all, since a missing `PRISM_TOKEN` still answers `204`. That
-last wording is printed even for a disabled install, where the rest of this section is not.
-
-> Nothing else is needed. Requests, exceptions, logs, queries, commands, mail, notifications, jobs
-> and scheduled tasks are the capture engine's, the trace waterfall is the span lane's, and replica
-> metrics are Prism's own — all of it wired by the provider at boot. In particular you do **not**
-> have to add the engine's `nightwatch` channel to `config/logging.php`: Prism attaches its handler
-> to the channels `log.channels` names for you.
+> Nothing else is needed. You do **not** have to add a logging channel to `config/logging.php`;
+> Prism attaches its handler for you.
 
 ## Required variables
 
 | Variable | Purpose |
 | --- | --- |
-| `PRISM_TOKEN` | The ingest token minted in **Console → Settings → API tokens**. With no token the package silently no-ops and logs a single warning at boot — it never throws. Blank is allowed on a `local` host only, where the hub must be local too. |
-| `PRISM_APP` | The application slug this process reports as, inside the workspace the token belongs to. |
+| `PRISM_TOKEN` | The ingest token from **Console → Settings → API tokens**. With no token the package silently no-ops and logs one warning at boot — it never throws. |
+| `PRISM_APP` | The application slug this process reports as. |
 
 ## Configuration
 
@@ -129,74 +80,29 @@ Publish the config to override any default:
 php artisan vendor:publish --tag=prism-config
 ```
 
-The published `config/prism.php` documents every setting inline. Every value can also be driven by
-an environment variable, so most installs never publish the file.
-
-**One config file, three subjects.** Prism owns the capture engine's and the span lane's
-configuration as well as its own: `nightwatch.*` and `opentelemetry.*` are derived from the
-`prism.*` keys below at boot, so there is nothing else to publish and nothing else to keep in step.
-Publish either of those files yourself and Prism steps back from it entirely — see
-[Capture engine](#capture-engine-laravelnightwatch) and
-[Span lane](#span-lane-keepsuitlaravel-opentelemetry) for what that costs.
-
-> The tables in this section are a **hand-maintained mirror** of `config/prism.php`. Nothing
-> generates one from the other, so a change to the config file that does not edit this README in the
-> same commit leaves the two disagreeing — with the README being what an installer reads.
+The published `config/prism.php` documents every setting inline, and every value can be driven by an
+environment variable, so most installs never publish the file. Prism also derives the capture
+engine's and the span lane's configuration from its own — **one config file, not three**.
 
 ### Master switch and credentials
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | `PRISM_ENABLED` | `true` | The kill switch. `false` registers **no** listeners and adds zero overhead — the package is inert, as if uninstalled. |
-| `token` | `PRISM_TOKEN` | `null` | Ingest token. *(required, except on a `local` host feeding a local hub — blank ships with no `Authorization` header)* |
+| `enabled` | `PRISM_ENABLED` | `true` | Kill switch. `false` registers no listeners at all — the package is inert. |
+| `token` | `PRISM_TOKEN` | `null` | Ingest token. *(required, except on a `local` host feeding a local hub)* |
 | `app` | `PRISM_APP` | `null` | Application slug this process reports as. *(required)* |
-| `endpoint` | `PRISM_ENDPOINT` | `https://prism.dev/api/ingest` | Where batches are POSTed. Point at your workspace's `/api/ingest` when self-hosting. |
+| `endpoint` | `PRISM_ENDPOINT` | `https://prism.dev/api/ingest` | Where batches are POSTed. |
 
 ### Identity
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `environment` | `PRISM_ENVIRONMENT` | `APP_ENV` | Deployment tier (`production`, `staging`, …) tagged onto every event. |
-| `replica` | `PRISM_REPLICA` | `gethostname()` | The name this process reports as. One replica row auto-registers per name; override with the pod/container name where the hostname is not meaningful. |
-
-### Capture engine (`laravel/nightwatch`)
-
-Which signals are captured is Nightwatch's vocabulary — this package declares no `capture` toggles
-of its own. Prism derives Nightwatch's config from its own at register time, so **you publish one
-config file, not two**:
-
-| Nightwatch key | Derived from | Why |
-| --- | --- | --- |
-| `nightwatch.enabled` | `prism.enabled` | One master switch. Nightwatch defaults itself to enabled, so without this `PRISM_ENABLED=false` would leave 38 framework hooks registered. |
-| `nightwatch.token` | `prism.token` | The two should name the same credential. |
-| `nightwatch.server` | `prism.replica` | A record's own `server` field and the batch envelope's `replica` field must agree, or one process reports under two names. Re-derived once more after every provider has booted, so a host that names its process from its own `boot()` still gets one name on both. |
-| `nightwatch.sampling.requests` | `prism.sample.requests` | See [Sampling](#sampling). |
-| `nightwatch.sampling.commands` | `prism.sample.commands` | " |
-| `nightwatch.sampling.scheduled_tasks` | `prism.sample.schedules` | " |
-| `nightwatch.sampling.exceptions` | *pinned at `1.0`* | An error is never sampled out. This is the one derived key with **no** environment escape hatch. |
-| `nightwatch.capture_request_payload` | `prism.request.capture_body` | The engine's own 500-only payload follows the switch Prism's request-body capture reads, so the two cannot disagree. See [Request headers and bodies](#request-headers-and-bodies). |
-| `nightwatch.redact_payload_fields` | `prism.scrub` | " (upstream's own defaults survive underneath) |
-| `nightwatch.redact_headers` | `prism.scrub` | " |
-
-`nightwatch.ingest.uri` is left at its default and never used — nothing opens that socket.
-
-**Taking a key back** is deliberately not "set it in the published config and Prism will notice".
-Nightwatch registers before Prism in every real install and merges its own defaults first, so by the
-time Prism looks, *every* key exists and "is it unset" answers nothing. Ownership is decided by
-evidence that survives that ordering, and there are two kinds:
-
-- **Publish `config/nightwatch.php`** (`php artisan vendor:publish --tag=nightwatch-config`) and
-  Prism writes nothing at all — the whole file is yours, including the keys above.
-- **Set the matching `NIGHTWATCH_*` variable** and that one key is yours, the rest stay derived:
-  `NIGHTWATCH_ENABLED`, `NIGHTWATCH_TOKEN`, `NIGHTWATCH_SERVER`, `NIGHTWATCH_REQUEST_SAMPLE_RATE`,
-  `NIGHTWATCH_COMMAND_SAMPLE_RATE`, `NIGHTWATCH_SCHEDULED_TASK_SAMPLE_RATE`,
-  `NIGHTWATCH_CAPTURE_REQUEST_PAYLOAD`, `NIGHTWATCH_REDACT_PAYLOAD_FIELDS`,
-  `NIGHTWATCH_REDACT_HEADERS`. `nightwatch.sampling.exceptions` has no variable on purpose.
+| `environment` | `PRISM_ENVIRONMENT` | `APP_ENV` | Deployment tier tagged onto every event. |
+| `replica` | `PRISM_REPLICA` | `gethostname()` | The name this process reports as. Override with the pod or container name. |
 
 ### Sampling
 
-The share of executions captured, as a fraction of 1. `1.0` keeps everything (the default), `0.0`
-keeps nothing.
+The share of executions captured, as a fraction of 1.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -204,227 +110,86 @@ keeps nothing.
 | `sample.commands` | `PRISM_SAMPLE_COMMANDS` | `1.0` | Fraction of artisan commands captured. |
 | `sample.schedules` | `PRISM_SAMPLE_SCHEDULES` | `1.0` | Fraction of scheduled-task runs captured. |
 
-**The unit is an execution, not a signal — so lowering the request rate lowers span volume with
-it.** A request that is sampled out contributes *nothing at all*: not its own row, and not the
-queries, cache reads, log lines, outgoing calls or spans it made along the way. There is no separate
-span, query or log rate to turn down, and no half-captured trace to reassemble at the far end. Halve
-`PRISM_SAMPLE_REQUESTS` and you halve everything a request produces.
+The unit is an **execution**, not a signal: a request that is sampled out contributes nothing at all
+— not its own row, nor the queries, log lines, outgoing calls or spans it made. Lowering
+`sample.requests` lowers span volume with it, and a job inherits the decision made about whatever
+dispatched it, so a trace stays whole across the queue boundary.
 
-**A job inherits the decision made about whatever dispatched it.** There is no job rate for the same
-reason there is no query rate: a worker's run of a job carries the dispatching execution's verdict in
-Laravel's `Context`, into the payload and out the other side. So a request kept by `sample.requests`
-has the jobs it queued kept with it, and a request that was dropped drops them — the trace stays
-whole across the queue boundary rather than half-recorded.
+**An error is never lost to sampling.** There is no `sample.exceptions`: an execution that was
+sampled out is pulled back in the moment it throws.
 
-**An error is never lost to sampling.** There is deliberately no `sample.exceptions`: an execution
-that was sampled out is pulled back into the sample the moment it throws, so the fault — and the
-context buffered before it — ships anyway. The Prism server pins the exception domain to `1.0` on
-ingest as well, so a team is never blind to breakage because of a rate someone tuned.
+Client-side sampling composes with the per-application rules in **Console → Settings → Sampling**;
+the two multiply. A client at `0.5` under a workspace rule at `50%` keeps a quarter.
 
-Sampling composes with the **server-side** rules configured per application in **Console →
-Settings → Sampling**, which decide what a workspace keeps once a batch arrives. The two multiply
-and neither knows about the other: a client at `0.5` under a workspace rule at `50%` keeps a
-quarter. Client-side sampling is the one that saves bandwidth; server-side is the one that saves
-storage and quota.
-
-A rate this package cannot read at all is treated as `1.0`, never `0.0` — capturing more than
-intended shows up on a bill, while capturing nothing shows up as a console that has quietly been
-empty for a week.
-
-> Note the key is `sample`, not `sampling`. On a host that *is* a Prism workspace, `prism.sampling`
-> is the server's own per-workspace block and the two must not collide: a package/host config merge
-> is shallow, so one key cannot mean two things.
-
-### Span lane (`keepsuit/laravel-opentelemetry`)
+### Span lane
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `otel.enabled` | `PRISM_OTEL_ENABLED` | `true` | The span lane. `false` switches the OpenTelemetry SDK off outright — no instrumentation is registered and no span is produced. |
-| `otel.slow_trace_ms` | `PRISM_SLOW_TRACE_MS` | `2000` | A trace at or beyond this many milliseconds is kept **whole** by tail sampling, however aggressive sampling is. An unreadable value falls back to `2000`, never to zero. |
+| `otel.enabled` | `PRISM_OTEL_ENABLED` | `true` | The span lane. `false` switches OpenTelemetry off outright. |
+| `otel.slow_trace_ms` | `PRISM_SLOW_TRACE_MS` | `2000` | A trace at or beyond this is kept whole, however aggressive sampling is. |
 
-The lane exists for one thing the capture engine cannot express: **nesting**. Nightwatch's cache,
-query and outgoing-request sensors fire on *completion* only, so their records are flat siblings
-sharing a trace id. An OpenTelemetry span carries a parent span id by construction, which is what
-the Traces waterfall is drawn from.
+The lane is what gives the Traces waterfall its parent/child nesting, and it is what carries a trace
+between processes as W3C `traceparent` — an incoming request continues the caller's trace, an
+outgoing HTTP call carries yours onward, and a dispatched job runs under the request that queued it.
+Turning it off costs the nesting and cross-process propagation and nothing else.
 
-It is also **where the trace id comes from**. Two engines mint one: the capture engine a UUID per
-execution, the SDK a 32-hex W3C id per trace — and every Prism screen correlates a request with the
-spans, logs, queries, exceptions and jobs it produced by that single column. OpenTelemetry wins,
-because its id is the one that travels. Every record is re-keyed onto it as it passes through Prism's
-ingest, so nothing you do is needed — and a signal recorded with no OpenTelemetry trace to speak of
-keeps the id it arrived with, so nothing is ever left unkeyed.
-
-**And it is what carries a trace between processes.** `propagators` is left at `tracecontext`, so a
-trace crosses three boundaries as the W3C standard every APM and every language SDK speaks:
-
-- an **incoming `traceparent`** continues the caller's trace, so a request arriving from another
-  service is the same trace rather than an adjacent one;
-- an **outgoing call** through Laravel's HTTP client has `traceparent` injected, so the service you
-  call continues yours — whatever it is written in;
-- a **dispatched job** carries `traceparent` in its payload and runs under a CONSUMER span parented
-  to the PRODUCER span that queued it, so a worker's records land under the request that queued them.
-
-Prism used to do all three itself, over an `X-Prism-Trace-Id` header and a `prism_trace_id` job
-payload key. Both are **removed** — see `UPGRADING.md` if you were propagating either by hand. A
-trace id is a 32-character hex string now rather than a UUID, for the same reason.
-
-**With the lane on, it is also the producer of two signals the capture engine watches as well.**
-Both engines see a query and an outgoing HTTP call, so leaving both alone would store one query as a
-`queries` row *and* a `db` span while storing one outgoing call as two `http` spans. The span wins,
-because it is the one that knows its parent — so the engine's own `query` and `outgoing-request`
-records are dropped as they pass through Prism's ingest, and the `queries` row is built from the db
-span instead (`db.query.text`, `db.system.name`, the span's duration, and Prism's own `slow` marker
-from `query.slow_threshold_ms`). Three consequences worth knowing:
-
-- **A record is dropped only when the span really replaced it.** A console command opens no trace
-  (the console instrumentation is off — the capture engine owns commands), and neither does a query
-  run before the request span opens or a process where you published `config/opentelemetry.php` and
-  did not add Prism's processor. In every one of those the engine's record is kept, because it is the
-  only producer there is.
-- **The SQL is the span's `db.query.text`, which OpenTelemetry truncates at 500 characters**, and
-  `connection` is the driver (`pgsql`, `mysql`) rather than Laravel's connection name — no span
-  attribute names the connection. A statement upstream's query instrumentation skips (it records
-  `SELECT`, `INSERT`, `UPDATE` and `DELETE` only, so not `begin`, `commit` or DDL) has no span and so
-  no row. Set `PRISM_OTEL_ENABLED=false` if you would rather have the engine's fuller records without
-  the nesting.
-- **A Redis command is a `db` span and never a `queries` row.** Both instrumentations name the system
-  the same way, which is why one lane rule covers both — but Prism's query signal has always been
-  Laravel's `QueryExecuted`, which Redis does not raise.
-
-`prism.scrub` applies to the span lane too: the statement and the outgoing URL meet the same list the
-engine's records do, so a scrub entry cannot cover one producer out of two.
-
-**A slow or failing request's trace is kept whole.** The lane runs with OpenTelemetry *tail*
-sampling on, which defers the keep-or-drop decision until the trace has finished and then applies two
-rules: any span whose status is `ERROR` keeps the whole trace, and any trace at or beyond
-`otel.slow_trace_ms` (`PRISM_SLOW_TRACE_MS`, 2000 by default) keeps the whole trace. This is the
-client-side half of a rule the Prism server already enforces on what it receives — belt and braces
-rather than a duplicate: the server's half keeps a slow trace once it has arrived, this one keeps it
-from being dropped before it is sent at all. Answer any of upstream's own
-`OTEL_TRACES_TAIL_SAMPLING_*` variables and your answer is kept, and a tail-sampling rule of your own
-is merged beside Prism's rather than replaced.
-
-Because tail sampling holds a trace's spans until its decision — `decision_wait` is 5000ms by
-default, longer than most requests live — Prism force-flushes the tracer **immediately before**
-draining its own buffer, so whatever is released lands in the batch its own execution ships rather
-than in whichever execution flushes next. Nothing about that needs configuring, and under the `spool`
-flush strategy a span released after its request has ended is carried by the next drain.
-
-Two things follow that are worth knowing. Turning tail sampling on makes OpenTelemetry's *head*
-sampler always-on and applies whatever you configured (`OTEL_TRACES_SAMPLER_TYPE=traceidratio`, say)
-at the tail instead — after the errors and slow-trace rules have had their say, which is the point.
-And **Prism's own span processor sits beside that decision rather than behind it**, so what Prism
-ships is not thinned by the OpenTelemetry sampler at all: the knob for span volume is
-`sample.requests`, because a sampled-out execution discards its whole buffer, spans included.
-
-Turning it off costs the nesting, the shared id and cross-process propagation, and nothing else —
-requests, errors, logs, queries, jobs, commands, mail, notifications and replica metrics all keep
-flowing, correlated within one execution by the capture engine's own trace id, the Traces screen
-falls back to the flat spans its records produce, and the `queries` rows go back to being the
-engine's. What does not survive is a trace that spans services or a queue: there is no `traceparent`
-to carry, so each process traces itself. `PRISM_ENABLED=false` switches it off along
-with everything else.
-
-As with the capture engine, Prism derives the whole OpenTelemetry configuration from its own, so
-**you publish one config file, not three**:
-
-| OpenTelemetry key | Derived from | Why |
-| --- | --- | --- |
-| `opentelemetry.disabled` | `prism.enabled` + `prism.otel.enabled` | One master switch. Also written into `OTEL_SDK_DISABLED`, because that variable — not the config key — is what `Sdk::isDisabled()` reads, and upstream stamped it before Prism could decide. |
-| `opentelemetry.traces.exporter` | *pinned at `null`* | Spans are consumed in process and ship in Prism's own batch. `null` is upstream's Noop exporter, so no PSR-18 client is discovered and no transport is ever built. |
-| `opentelemetry.metrics.exporter` | *pinned at `null`* | " |
-| `opentelemetry.logs.exporter` | *pinned at `null`* | " — logs are the capture engine's signal. |
-| `opentelemetry.service_name` | `prism.app` | A span's resource has to name the same application the batch envelope does. |
-| `opentelemetry.service_instance_id` | `prism.replica` | " (the replica) |
-| `opentelemetry.resource_attributes` | `prism.environment` → `deployment.environment` | " (the tier). Merged, so your own resource attributes survive alongside it. |
-| `opentelemetry.worker_mode.flush_after_each_iteration` | *pinned at `true`* | Upstream defaults it to `false`, which in a queue worker or an Octane process ships one job's spans inside the *next* job's batch — landing them under the wrong execution, silently. |
-| `opentelemetry.traces.sampler.tail_sampling` | *enabled, with `ErrorsRule` + `SlowTraceRule` from `prism.otel.slow_trace_ms`* | A slow or failing execution's trace is kept whole however aggressive sampling is. `decision_wait` stays at upstream's own default, because Prism force-flushes the tracer at the end of every execution. |
-| `opentelemetry.traces.processors` | *Prism's own span processor is appended* | The whole span lane, in one line of config: `Misakstvanu\Prism\Otel\PrismSpanProcessor` turns each finished span into a Prism `span` event. Appended to upstream's own slot rather than replacing the tracer, so keepsuit keeps its resource, sampler and propagators — and your own processors keep working beside it. |
-| `opentelemetry.propagators` | *left at upstream's `tracecontext`* | A trace crosses a service or queue boundary as W3C `traceparent`. Prism writes nothing here; `OTEL_PROPAGATORS` is yours. |
-| `opentelemetry.instrumentation.*` | *see below* | Five on, six off. |
-
-**On:** `HttpServerInstrumentation`, `HttpClientInstrumentation`, `QueryInstrumentation`,
-`QueueInstrumentation`, `RedisInstrumentation` — the lanes the waterfall draws.
-
-**Off:** `CacheInstrumentation` (it only calls `addEvent()` on the active span, and a span *event*
-is not a span — Prism has nowhere to store one, so the cache lane comes from the capture engine's
-own record instead), `ConsoleInstrumentation` (the engine's command sensor already owns commands),
-and `EventInstrumentation` / `ViewInstrumentation` / `LivewireInstrumentation` /
-`ScoutInstrumentation`, which have no Prism counterpart at all.
-
-Most of those keys have the environment variable upstream documents for them
-(`OTEL_TRACES_EXPORTER`, `OTEL_SERVICE_INSTANCE_ID`, `OTEL_INSTRUMENTATION_CACHE`, …) and answering
-one keeps your answer. **`OTEL_SERVICE_NAME` and `OTEL_SDK_DISABLED` are the two exceptions**, and
-not for tidiness: the OpenTelemetry package writes both variables itself, during its own
-`register()`, so by the time Prism looks they are always set and their presence says nothing about
-what you asked for. The SDK switch still respects a `true` you resolved before Prism touched it; the
-service name does not.
-
-The way to take the whole thing over is to publish `config/opentelemetry.php`
-(`php artisan vendor:publish --tag=laravel-opentelemetry-config`) — Prism writes **nothing at all**
-when that file exists, on the assumption that a host with one is running the SDK on its own account.
-Note that this also means Prism's span processor is not registered for you: add
-`Misakstvanu\Prism\Otel\PrismSpanProcessor::class` to `traces.processors` yourself if you want the
-waterfall as well as your own pipeline. `php artisan prism:check` reports that state as
-`otel spans ... not configured — … is installed but not registered`.
+To run the SDK on your own account, publish `config/opentelemetry.php`
+(`php artisan vendor:publish --tag=laravel-opentelemetry-config`) — Prism then writes nothing there.
+Add `Misakstvanu\Prism\Otel\PrismSpanProcessor::class` to `traces.processors` yourself if you still
+want the waterfall.
 
 ### Batching and flush
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `batch.size` | `PRISM_BATCH_SIZE` | `1000` | Max events one request may buffer; the excess is dropped and counted, bounding memory. |
-| `batch.flush` | `PRISM_FLUSH_STRATEGY` | `terminate` | `terminate` ships after the response is returned (off the critical path — the default). `sync` ships inline before the process ends (useful for one-off scripts and tests). `spool` parks the batch in the cache for one debounced drain job (see below). |
-| `batch.timeout` | `PRISM_FLUSH_TIMEOUT` | `2.0` | Ingest POST timeout in seconds, kept short so a slow endpoint never stalls the process. |
-| `batch.queue_threshold` | `PRISM_QUEUE_THRESHOLD` | `100` | A flush larger than this is handed to a queued job instead of sent inline. `0` keeps every flush inline. |
-| `batch.queue` | `PRISM_FLUSH_QUEUE` | `null` | Queue the send/drain job is dispatched onto; `null` = default queue. |
+| `batch.size` | `PRISM_BATCH_SIZE` | `1000` | Max events one execution may buffer; the excess is dropped and counted. |
+| `batch.flush` | `PRISM_FLUSH_STRATEGY` | `terminate` | `terminate` ships after the response is returned. `sync` ships inline. `spool` parks the batch for one debounced drain job. |
+| `batch.timeout` | `PRISM_FLUSH_TIMEOUT` | `2.0` | Ingest POST timeout in seconds. |
+| `batch.queue_threshold` | `PRISM_QUEUE_THRESHOLD` | `100` | A flush larger than this is queued instead of sent inline. `0` keeps every flush inline. |
+| `batch.queue` | `PRISM_FLUSH_QUEUE` | `null` | Queue the send/drain job runs on. |
 
 #### The `spool` strategy
 
-Under `terminate` and `sync` the process that captured the telemetry is also the one that ships it —
-a POST per request. `spool` decouples the two: a finished batch is written to the cache and a single
-debounced job drains everything spooled since the last drain, so a burst of requests costs one ingest
-POST instead of one each. It is the right choice when reaching the ingest host is expensive per
-request, and the necessary one when the host *is* the ingest host — an inline POST into a
-single-worker dev server deadlocks against the request making it.
+`spool` decouples capture from delivery: finished batches are written to the cache and one debounced
+job drains them all, so a burst of requests costs one ingest POST instead of one each. Use it when
+reaching the ingest host is expensive per request — and when the host *is* the ingest host, where an
+inline POST into a single-worker dev server would deadlock.
 
-Only finished work is ever spooled (a flush runs at the end of a request, job or scheduled task), and
-a cache lock guards the hand-off, so a drain can never pick up a half-written batch. A batch that
-fails to send goes back on the spool and a fresh drain is armed, so an outage costs a delay rather
-than the telemetry.
-
-It needs two things: a **cache store with atomic locks** shared by every process that captures (redis,
-memcached, database, file — not `array` outside tests), and a **queue worker** (the drain never runs
-on the `sync` driver). Without either, the flush quietly falls back to `terminate` rather than piling
-up telemetry it cannot ship — `php artisan prism:check` reports which, and how many batches are
-waiting.
+It needs a cache store with atomic locks shared by every capturing process (redis, memcached,
+database, file — not `array`) and a queue worker. Without either it falls back to `terminate`;
+`prism:check` reports which, and how many batches are waiting.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `batch.spool.delay` | `PRISM_SPOOL_DELAY` | `5` | Seconds the drain waits before running — the debounce window everything spooled during it ships in. |
-| `batch.spool.grace` | `PRISM_SPOOL_GRACE` | `60` | Extra seconds the "a drain is pending" marker is held, covering the wait for a free worker. Once it lapses the next flush arms a replacement. |
+| `batch.spool.delay` | `PRISM_SPOOL_DELAY` | `5` | Seconds the drain waits — the debounce window. |
+| `batch.spool.grace` | `PRISM_SPOOL_GRACE` | `60` | Extra seconds the pending-drain marker is held while waiting for a worker. |
 | `batch.spool.ttl` | `PRISM_SPOOL_TTL` | `900` | Seconds a spooled batch survives in the cache. |
 | `batch.spool.max_batches` | `PRISM_SPOOL_MAX_BATCHES` | `500` | Batches held at once; past the cap the oldest are dropped. `0` = unbounded. |
-| `batch.spool.max_attempts` | `PRISM_SPOOL_MAX_ATTEMPTS` | `3` | Send attempts a batch gets before it is discarded, so a wrong endpoint cannot cycle forever. |
-| `batch.spool.store` | `PRISM_SPOOL_STORE` | `null` | Cache store backing the spool; `null` = default store. |
+| `batch.spool.max_attempts` | `PRISM_SPOOL_MAX_ATTEMPTS` | `3` | Send attempts before a batch is discarded. |
+| `batch.spool.store` | `PRISM_SPOOL_STORE` | `null` | Cache store backing the spool. |
 | `batch.spool.lock_seconds` | `PRISM_SPOOL_LOCK_SECONDS` | `5` | How long the spool index lock is held. |
-| `batch.spool.lock_wait` | `PRISM_SPOOL_LOCK_WAIT` | `3` | How long a flush waits for that lock before giving up and sending inline. |
+| `batch.spool.lock_wait` | `PRISM_SPOOL_LOCK_WAIT` | `3` | How long a flush waits for that lock before sending inline. |
 
 ### Per-domain limits
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `request.capture_headers` | `PRISM_CAPTURE_REQUEST_HEADERS` | `true` | Record the headers the request was addressed with, scrubbed by key. See [Request headers and bodies](#request-headers-and-bodies). |
-| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | Record the body the client sent. See [Request headers and bodies](#request-headers-and-bodies). |
+| `request.capture_headers` | `PRISM_CAPTURE_REQUEST_HEADERS` | `true` | Record the headers the request was addressed with, scrubbed by key. |
+| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | Record the body the client sent. |
 | `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | Record the body the application sent back. |
-| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body, and per header bag. A cut value says so; `0` disables the cap. |
-| `request.body_content_types` | — | six types | Media types whose bodies are recorded. `text/html` is deliberately absent. This list replaces the default wholesale. |
-| `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record what a queued job was asked to do, scrubbed by key. See [Job payloads](#job-payloads). |
-| `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per job payload. A cut value says so; `0` disables the cap. |
-| `mail.capture_recipients` | `PRISM_CAPTURE_MAIL_RECIPIENTS` | `true` | Record the To, Cc and Bcc addresses of every message. See [Mail and notification recipients](#mail-and-notification-recipients). |
+| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body and per header bag. A cut value says so; `0` disables the cap. |
+| `request.body_content_types` | — | six types | Media types whose bodies are recorded: JSON (including `+json`), form-urlencoded, multipart, XML and `text/plain`. `text/html` is deliberately absent. The list replaces the default wholesale. |
+| `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record what a queued job was asked to do, scrubbed by key. |
+| `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per job payload. `0` disables the cap. |
+| `mail.capture_recipients` | `PRISM_CAPTURE_MAIL_RECIPIENTS` | `true` | Record the To, Cc and Bcc addresses of every message (up to 50 per list). |
 | `notification.capture_recipients` | `PRISM_CAPTURE_NOTIFICATION_RECIPIENTS` | `true` | Record what a notification was addressed to and where its channel routed. |
-| `log.channels` | — | `[]` | Logging channels Prism attaches the engine's handler to. Empty = the app's default channel/stack. You do not have to add `nightwatch` to `config/logging.php` yourself. |
+| `log.channels` | — | `[]` | Logging channels Prism attaches its handler to. Empty = the app's default channel or stack. |
 | `log.level` | `PRISM_LOG_LEVEL` | `debug` | Minimum PSR-3 level captured. |
-| `query.slow_threshold_ms` | `PRISM_SLOW_QUERY_MS` | `100` | A query at/above this is marked slow, and is then kept (with its whole trace) whatever the **server's** per-workspace rules say. It does not survive the client-side rates above — those drop the execution before anything is sent. `0` disables the marker. |
+| `query.slow_threshold_ms` | `PRISM_SLOW_QUERY_MS` | `100` | A query at or above this is marked slow and kept with its whole trace. `0` disables the marker. |
+
+Uploaded file contents are never recorded at any setting — a multipart request is stored as its
+ordinary fields plus a `_prism_files` entry naming, sizing and typing each upload. Bodies and
+payloads longer than their cap end in `… [truncated]`.
 
 ### Runtime metrics
 
@@ -434,399 +199,79 @@ waiting.
 | `metrics.queue_interval` | `PRISM_QUEUE_POLL_INTERVAL` | `30` | Seconds between queue-depth/worker samples. Runs only on a process that works the queue. |
 | `metrics.replica_type` | `PRISM_REPLICA_TYPE` | `null` | `web` or `worker`. `null` infers it from the process. |
 
-Both samples are taken when an execution ends — a request, a command or a job — and the interval is
-what keeps that from meaning a sample every time. **A due sample ships in a batch of its own**, and
-deliberately so: the capture engine discards an execution's whole batch when [the sampling
-rates](#sampling) reject it, and a replica's health has nothing to do with whether one request was
-interesting. Turning `sample.requests` down therefore does not thin out the Replicas screen or the
-`replica_cpu` alert with it.
-
-Runtime metrics are also the one signal the capture engine has no sensor for, so Prism keeps
-collecting them itself; everything else on this page is the engine's.
+A due sample ships in a batch of its own, so turning `sample.requests` down does not thin out the
+Replicas screen or the `replica_cpu` alert with it.
 
 ### Browser telemetry
 
-The endpoint the browser SDK ([`@misakstvanu/prism-browser`](https://www.npmjs.com/package/@misakstvanu/prism-browser))
-posts to. It is registered for you the moment this package is installed and enabled, so the frontend
-half needs no backend code of yours — there is no route to add and no controller to write.
+The endpoint the browser SDK
+([`@misakstvanu/prism-browser`](https://www.npmjs.com/package/@misakstvanu/prism-browser)) posts to.
+It is registered for you the moment this package is installed and enabled — there is no route to add
+and no controller to write. The page reports to your own application, which enriches the report with
+the signed-in user, the client IP and the environment, scrubs it with the same `scrub` list below,
+and forwards it through the pipeline every other signal travels.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `browser.enabled` | `PRISM_BROWSER_ENABLED` | `true` | Whether the endpoint is registered at all. Off, it does not exist and the SDK's posts 404. |
+| `browser.enabled` | `PRISM_BROWSER_ENABLED` | `true` | Whether the endpoint is registered at all. |
 | `browser.path` | `PRISM_BROWSER_PATH` | `_prism/browser` | Where it is registered. Excluded from capture automatically, whatever you rename it to. |
-| `browser.max_events` | — | `50` | Events one post may carry; the excess is dropped. |
-| `browser.max_bytes` | — | `262144` | Bytes one post may carry, measured before it is decoded. |
-| `browser.rate_limit` | — | `120` | Posts per client IP per minute. `0` disables throttling entirely. |
+| `browser.max_events` | — | `50` | Events one post may carry. |
+| `browser.max_bytes` | — | `262144` | Bytes one post may carry. |
+| `browser.rate_limit` | — | `120` | Posts per client IP per minute. `0` disables throttling. |
 | `browser.origins` | — | `[]` | Origins allowed to post cross-origin. Empty is same-origin only. Matched with `Str::is`, so `https://*.example.com` works. |
-| `browser.guard` | — | `null` | The auth guard the signed-in user is read from; `null` uses the app's default guard. |
+| `browser.guard` | — | `null` | The auth guard the signed-in user is read from. |
 | `browser.trust_client_user` | — | `false` | Whether a user id the **page** claims is believed when the request carries no authenticated session. |
 
-**Why the report goes to your application rather than to the workspace.** A browser cannot be given
-an ingest token — anything the page can read, a reader can read — and a workspace endpoint open to
-the page would be an unauthenticated write from an origin nobody controls. Posting here instead
-means the report is enriched with what only the server knows (the signed-in user, the client IP, the
-environment), scrubbed with the same [`scrub`](#scrubbed-keys) list every other signal meets, and
-shipped through the same pipeline.
+A frontend on another origin needs one line: set `browser.origins` to the origins your pages are
+served from and the route answers preflights and allows credentials for those origins alone. There
+is no CORS middleware to add.
 
-Four things about the route are deliberate:
-
-- **No answer carries a body — the status is the whole of what is said back.** The SDK uses
-  `navigator.sendBeacon` where it can — the only transport that survives a page being unloaded,
-  which is when the last report of a session is sent — and a beacon cannot read a response at all,
-  so a sentence explaining a refusal would be a sentence written for nobody. An accepted report is
-  `204`; the refusals are `413` (over `max_bytes` or `max_events`), `400` (undecodable), `422`
-  (decodable, but not a report this package speaks) and `429` (throttled). A bad *event* inside a
-  good report is none of those — it is dropped and counted, because one malformed entry must not
-  cost the nineteen good ones beside it.
-- **It exists even without `PRISM_TOKEN`.** An install that is switched on but not yet credentialled
-  still accepts the post and discards it, because from the page's side a `404` is indistinguishable
-  from a routing mistake and the SDK would hold the report and retry it.
-- **A failure while forwarding is a `500`, not a quiet `204`.** Everywhere else in this package a
-  failed ship is swallowed so it cannot cost your application a request; here the forwarding is the
-  only thing the request was for, so the exception is allowed out and reaches your own error
-  reporting — including Prism's, which keeps the failure even though the report's own execution is
-  one Prism has asked not to capture. A telemetry client that stops working quietly is worse than
-  one that says so.
-- **It runs inside your `web` group with CSRF verification excluded and no auth middleware.** `web`
-  because the session is where "who is signed in" lives; without CSRF because a beacon cannot set a
-  header and a write-only sink has nothing forgery would win; without auth because an anonymous
-  visitor hitting a JavaScript error is the report most worth having.
-
-**What arrives at the workspace is not only what the page said.** Four fields are the backend's
-answer, because a report is an unauthenticated write and each of these is something the page either
-cannot know or could set to anything:
-
-- **`user_id`** is the identity of the request that carried the report —
-  `Auth::guard(config('prism.browser.guard'))->id()`. A `user` in the body is ignored: it is a value
-  anyone can set to anyone. `browser.trust_client_user` is the one escape hatch, for a
-  token-authenticated SPA whose posts carry no session; even switched on it only fills a blank, so
-  it can never replace a real identity with a claimed one.
-- **`context.ip`** is the client address your application saw. A page cannot know its own public
-  address without asking a third party.
-- **`context.user_agent`** — and a page view's own `user_agent` column — is the request header,
-  written over the SDK's copy of `navigator.userAgent`. The two ordinarily agree; when they do not,
-  the one that travelled with the request is the one the page could not edit.
-- **Every event's `timestamp`** is corrected against the report's own `sent_at`. Device clocks are
-  wrong in the field far more often than they are wrong by a little, and telemetry tables are
-  partitioned by day with a per-row TTL — so a row from a clock a year out lands in a partition
-  retention drops on sight, or one no screen's window reaches. `sent_at` and the events in a report
-  are read off the *same* clock, so the distance between them survives however wrong it is: past a
-  five-second tolerance the whole report shifts by the offset between `sent_at` and the server's
-  clock, which keeps the gaps that make a report legible, and a timestamp still in the future
-  afterwards becomes now.
-
-The application, the environment and the replica need no such handling — they ride the ordinary
-batch envelope, exactly as they do for every server-side signal.
-
-**The page's trace id is honoured as it arrives.** The SDK mints a trace id per page view and sends
-it as a W3C `traceparent` header on the page's same-origin `fetch` / XHR calls, and the backend
-request continues that trace rather than starting one of its own — the same rule that makes one
-trace of a call from another service, through the `tracecontext` propagator Prism leaves at
-upstream's default. That is what puts a JavaScript error beside the API call it made, with that
-call's queries and log lines, on one Traces screen. **No allow-list is applied to a browser-supplied
-trace id.** It is untrusted, and it is harmless: a trace id is a `String` column that every read
-scopes to your workspace first, and nothing joins on it across workspaces — the only check it meets
-is the W3C grammar itself, so a malformed header simply starts a fresh trace.
-
-**And nothing on your [`scrub`](#scrubbed-keys) list leaves.** One list governs every signal, so a
-browser report meets the same two rules a query, a command line and a request body meet — there is
-no second list and no browser-specific implementation:
-
-- **By key, everywhere in the payload, to any depth.** An error's page context, a breadcrumb's
-  `data`, a failed call's log context, and the columns beside them: a `password` in any of those is
-  `[REDACTED]`, and so is one nested three objects down inside a `setContext()` value.
-- **Query strings are rewritten pair by pair, not blanked.** A page view's `url` and `referrer`, the
-  address an error happened at, the target of a failed `fetch`, the `from` and `to` of a navigation
-  breadcrumb — `?token=abc&step=2` becomes `?token=%5BREDACTED%5D&step=2`, so the screen still says
-  which page it was.
-- **`name = value` pairs written into free text are redacted too** — an error's message, a log
-  line's, a breadcrumb's — because `console.error`-ing the request you were about to send is the
-  ordinary way a credential ends up in prose.
-
-The redaction runs **after** the enrichment above, so it governs what leaves rather than what the
-page said: the user agent your server read meets the list exactly as the page's own copy would have.
-An exception's stack frames are left alone — a bundle path is an address, not a credential, and it is
-what the workspace groups a browser error by.
-
-**A frontend on another origin needs one line of config and nothing else.** Set
-`browser.origins` to the origins your pages are served from — `['https://app.example.com']`, or
-`['https://*.example.com']` for a fleet of preview deployments — and the route answers `OPTIONS`
-preflights and allows credentials for those origins alone. An unlisted origin gets a `204` with no
-CORS header at all, which is a browser's way of being told no; a listed one is echoed back rather
-than answered with `*`, because a browser refuses a wildcard origin alongside the credentials this
-endpoint needs. Leave it empty for the ordinary install and no CORS header is ever written on
-either verb. There is no CORS middleware to add and no origin to open up anywhere else in your
-application.
-
-`php artisan prism:check` prints the endpoint's address and who may post to it, so "the SDK gets a
-404" and "the SDK's origin is not on the list" are one command apart rather than a guess.
-
-`browser.rate_limit` bounds abuse rather than volume — a page in a bad state reports in bursts, and
-per-report sampling is the SDK's job — and it is keyed on the client IP precisely because most
-reporters have no session to key on.
-
-**Why `_prism/*` is on `ignore.paths`, and why it stays there whatever you rename the route to.** A
-browser report is a request the page made *because* Prism is installed. Captured like any other, it
-would become a request row of its own plus the session read, the queue dispatch and the outgoing
-call that forwarding it performs — a page's one error turning into four events, and on an
-application that also hosts the workspace it reports to, a loop that never settles. So the
-endpoint's execution is never captured, by two mechanisms: `_prism/*` is on the package's default
-[`ignore.paths`](#ignore-lists), which covers the shipped path, and `browser.path` itself is rejected
-as a request path whatever it is set to, which covers a renamed one. The events *inside* the report
-are unaffected — they are shipped as a batch of their own, in the pipeline every other signal
-travels, rather than through the ignored request's buffer (which is emptied). A failure while
-forwarding is likewise kept: it flips the execution back into the sample so that the fault ships,
-even though the request that raised it is one Prism has asked not to capture.
-
-**`sampleRate` and the quota.** Browser events count against the workspace's monthly event quota
-exactly as server-side ones do — a `page_view` per visit and a `log` per `console.warn` add up on a
-busy site in a way errors never do, which is why the SDK ships with page views and HTTP-failure log
-lines off and console capture starting at `warn`. The SDK's `sampleRate` is the first knob: it
-keeps that share of page views and log lines, rolled per event in the page, and **never touches an
-exception**. The workspace's per-application rules (Console → Settings → Sampling) are the second,
-applied once the batch arrives, and the two multiply — the same relationship
-[`sample.*`](#sampling) has with those rules for server-side signals. Exceptions are pinned to
-100% on both sides, and a workspace over quota still keeps them; a page is never told about the
-quota at all (its post is answered `204` regardless), the forwarding batch simply meets the `429`
-every other batch would. A flood of *logs* is what `sampleRate` and the SDK's `capture.console`
-list exist for; a flood of *posts* is what `browser.rate_limit`, `max_events` and `max_bytes` are
-for.
-
-**Source maps are not consumed, and frames render minified.** A browser error's frames arrive as
-the browser reported them — the bundled file, its line and column, and whatever label the minifier
-left — and that is how the console shows them, marking a frame whose label is two characters or
-shorter as *minified* once, above the trace. What the server engineers instead is grouping that is
-**stable across deploys** without a source map: a browser fingerprint hashes the class, the top
-application frame's file with its content hash stripped (`app-Bx3kq9.js` today and `app-Q7mLp2.js`
-tomorrow are one file), the function label only when it is three characters or longer, and the
-message with URLs, ids and numbers replaced by placeholders. Server-side unminification is a
-follow-up; nothing in this package uploads, reads or expects a `.map` file.
+`php artisan prism:check` prints the endpoint's address and who may post to it.
 
 ### Ignore lists
 
 Activity the client never captures. Every list but `ignore.exceptions` matches with `Str::is`
-wildcards, so one pattern covers a family (`api/internal/*`, `App\Jobs\Internal\*`, `prism:*`); a
-pattern without a `*` matches exactly.
+wildcards, so one pattern covers a family (`api/internal/*`, `App\Jobs\Internal\*`, `prism:*`).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ignore.paths` | Prism's own routes (including `_prism/*`, the [browser endpoint](#browser-telemetry)), `telescope*`, `horizon*`, `_debugbar*`, `nova*`, `up`, `health*` | Request URI patterns never captured. |
-| `ignore.jobs` | `[]` | Queued job class names, as resolved for display — for a queued broadcast that is the event class, not the framework's wrapper. Covers both the dispatch and the worker's run of it. |
-| `ignore.commands` | `[]` | Artisan command names — `prism:*`, `reports:build`. A scheduled task runs as one of these, so a schedule silenced here is silenced wherever it is started from. |
-| `ignore.http` | `[]` | Outgoing HTTP destinations, matched against the host, the host and path, and the full URL without its query string — `redis.internal`, `*.googleapis.com` and `http://ch:8123/*` all work. |
-| `ignore.cache` | `[]` | Cache keys, matched on the full key before it is truncated for display. |
-| `ignore.exceptions` | `NotFoundHttpException`, `ValidationException` | Exception classes never reported. Matched with `instanceof`, so subclasses are covered too. (Laravel's own "don't report" list already covers the two defaults; the entries earn their keep for anything you add.) |
+| `ignore.paths` | Prism's own routes, `telescope*`, `horizon*`, `_debugbar*`, `nova*`, `up`, `health*` | Request URI patterns never captured. |
+| `ignore.jobs` | `[]` | Queued job class names. Covers both the dispatch and the worker's run of it. |
+| `ignore.commands` | `[]` | Artisan command names. A scheduled task runs as one of these. |
+| `ignore.http` | `[]` | Outgoing HTTP destinations, matched against the host, the host and path, and the full URL without its query string. |
+| `ignore.cache` | `[]` | Cache keys, matched on the full key. |
+| `ignore.exceptions` | `NotFoundHttpException`, `ValidationException` | Exception classes never reported. Matched with `instanceof`. |
 
-`paths`, `jobs` and `commands` silence a whole **execution**: a request, a job's run or a command
-that matches contributes nothing at all — not its own row and not the queries, cache reads, log
-lines, spans or outgoing calls it made. `http`, `cache` and `exceptions` silence one **signal**
-wherever it occurs, so an ignored cache key is invisible on an otherwise fully captured request.
+`paths`, `jobs` and `commands` silence a whole **execution**; `http`, `cache` and `exceptions`
+silence one **signal** wherever it occurs.
 
-The one signal that still leaves an ignored execution is the replica heartbeat
-(`replica_metric`, see [Runtime metrics](#runtime-metrics)). It is a fixed-cadence sample of the
-process rather than a record of anything the execution did — the figure the Replicas screen and the
-`replica_cpu` alert read — and it ships on its own so that a replica's health does not depend on
-whether the request that happened to be running was one you wanted to see.
-
-There are two reasons to add something here. The mild one is noise: a health check polled every
-second, or a cache key touched on every request, costs an event each time and tells you nothing.
-
-The serious one is **feedback**. Capturing work that exists *because* of telemetry means the capture
-produces more work to capture. Prism excludes its own outbound batch automatically — it carries an
-internal marker header and runs under a suppression scope — and an *inbound* request carrying that
-same marker is treated the same way: capture is suppressed for its whole lifetime, so neither the
-request nor the queries, cache reads and log lines it triggers are recorded. An application that
-hosts the Prism workspace it reports to therefore never captures another client's ingest POST, on
-any endpoint, with no configuration. What it cannot know is the work **your** application does on Prism's
-behalf: the job that stores a batch, the counters it increments, the datastore it writes to. Those
-are what the lists above are for. Two cases worth checking in any install:
-
-- **A datastore reached over HTTP** rather than as a database connection (ClickHouse, OpenSearch, a
-  cloud API) travels through Laravel's HTTP client, so every read and write becomes a span — and
-  storing that span is another write. Add its host to `ignore.http`.
-- **Cache is the chattiest signal.** One operation touching half a dozen counters emits a span per
-  counter, so a prefix used for internal bookkeeping is worth an `ignore.cache` entry.
+Two entries are worth adding in almost any install: a **datastore reached over HTTP** (ClickHouse,
+OpenSearch, a cloud API) belongs on `ignore.http`, because every read and write becomes a span; and
+a **cache prefix used for internal bookkeeping** belongs on `ignore.cache`, cache being the
+chattiest signal there is.
 
 ### Scrubbed keys
 
-Keys whose values are redacted **at the source** before an event leaves the process — matched
-case-insensitively. The list is additive; extend it with any field specific to your app. Defaults:
+Keys whose values are redacted **at the source**, before an event leaves the process — matched
+case-insensitively, at any depth. The list is additive; extend it with any field specific to your
+app. Defaults:
 
 `password`, `password_confirmation`, `secret`, `token`, `authorization`, `cookie`, `api_key`,
 `access_token`, `refresh_token`, `credit_card`, `card_number`, `cvv`, `ssn`.
 
-One list governs every signal. A key here is redacted wherever it appears:
-
-| Where | What happens |
-| --- | --- |
-| Request body, headers, query string | The value is replaced; the field, header and parameter stay, so the shape is still legible. A JSON or form body is matched **by key** rather than as text. |
-| Response body | Same, and by key for a JSON document — so an endpoint that answers with a credential does not put one in the console. |
-| Outgoing call query string | Same, so a credential passed to a third-party API never reaches the console. |
-| SQL statement | The value half of `password = 'x'` is replaced. A `?` or `:name` placeholder is left alone. |
-| Artisan command line | `--password=x` keeps the option and loses the value. |
-| Cache key | `token:abc` becomes `token:[REDACTED]`; a key that is only a name (`api_key`) is untouched — the name of an entry is not a secret. |
-| Mail subject, exception message | The value half of any `name = value` pair in the text. |
-| Queued job payload | Matched **by key** over the job's own JSON. See [Job payloads](#job-payloads) for the one thing this cannot reach. |
-| Mail and notification recipients | An address is replaced when the list's own name (`to`, `cc`, `bcc`, `recipients`) or `email` is on the list. The list keeps its length, so it still agrees with the counts stored beside it. |
-
-### Request headers and bodies
-
-Prism records **what an HTTP exchange carried** — the headers it was addressed with, the body the
-client sent, the body your application sent back, and the query string — on every request, not only
-on one that faulted.
-
-None of it comes usably from the capture engine. Its request record serialises a payload only for a
-**500** response, into a field Prism has no column for; it has no notion of a response body at all
-(it carries `responseSize`, an integer); and it redacts its header bag in a wording of its own
-rather than through your scrub list. So Prism captures all three itself, from a middleware that
-holds the request and the response at the same time.
-
-| Key | Env | Default | |
-| --- | --- | --- | --- |
-| `request.capture_headers` | `PRISM_CAPTURE_REQUEST_HEADERS` | `true` | The headers the request was addressed with. |
-| `request.capture_body` | `PRISM_CAPTURE_REQUEST_BODY` | `true` | The body the client sent. |
-| `request.capture_response` | `PRISM_CAPTURE_RESPONSE_BODY` | `true` | The body your application sent back. |
-| `request.max_body` | `PRISM_MAX_BODY` | `65536` | Bytes kept per body, and per header bag. `0` disables the cap. |
-| `request.body_content_types` | — | see below | Media types whose **bodies** are recorded. |
-
-All three default to **on**: a request body is the most useful thing to have when a bug reproduces
-once, a response body is what says whether the fault was in what came back or in what went in, and
-the headers are what say how the request was addressed. Turn any of them off where the exposure
-outweighs the debugging.
-
-Six rules decide what is stored, and each of them is a way of not lying to you:
-
-- **The header bag is scrubbed BY KEY, like a structured body.** `authorization` and `cookie` are on
-  [the scrub list](#scrubbed-keys) by default and read `[REDACTED]`; add any header name of your own
-  to that same list. The media-type allow list below does **not** apply to headers — every request
-  has them, and they are what says how one was addressed.
-
-- **A structured body is scrubbed BY KEY, not by pattern.** A JSON or form body is decoded, run
-  through [the scrub list](#scrubbed-keys) — the same list that redacts a header or an outgoing
-  query string — and re-encoded. A `password` field is redacted because it is a field called
-  `password`, not because its value happened to look like a secret.
-- **Anything else meets the free-text rule**, the same `name = value` matcher a SQL statement and an
-  artisan command line meet. A `text/plain` or XML body has no keys to walk.
-- **Only readable media types are recorded.** `application/json` (including any `+json` vendor
-  type), `application/x-www-form-urlencoded`, `multipart/form-data`, `application/xml`, `text/xml`
-  and `text/plain`. **`text/html` is deliberately absent** — an HTML response is the rendered page,
-  the largest and least diagnostic thing an application produces. Add it to
-  `request.body_content_types` if you want it; that list replaces the default wholesale, because the
-  config merge is shallow. A streamed or file response is never recorded: its body does not exist
-  yet when the middleware sees it.
-- **A body is capped in bytes and says when it was cut.** The cut never lands inside a multi-byte
-  character, and a truncated body ends in `… [truncated]`, so what you read is never a document that
-  merely looks malformed.
-- **Uploaded file contents are never recorded, at any setting.** A multipart request is stored as
-  its ordinary fields plus a `_prism_files` entry naming, sizing and typing each upload.
-
-The **query string** is recorded beside the path rather than inside it, in a column of its own.
-`path` is the dimension you filter and scan the Stream tab by, so a query mixed into it would make
-one endpoint a different value on every request. It needs no switch of its own — it is part of the
-request's address, not its payload — and whatever `prism.scrub` covers is redacted pair by pair
-before it is stored, so `?token=…` reaches the console as `?token=%5BREDACTED%5D`.
-
-Prism's own traffic is exempt: a batch arriving from another install carries the internal marker
-header, and recording its body would put a whole telemetry batch inside one request row.
-
-In the console all three appear on the **Request detail** screen — the two body panels and the
-Query parameters panel. A body that was not captured —
-capture switched off, a media type off the list, a request that carried none, or a row written
-before this version — reads as "no body captured" rather than as an empty one.
-
-### Job payloads
-
-Prism records **what a queued job was asked to do** — the job's own JSON payload as Laravel wrote
-it, which is its display name, the queued command's class and the serialised command itself.
-
-The capture engine does not supply it. Its `queued-job` and `job-attempt` records carry the job's
-name, id, queue, connection and outcome and nothing about its arguments, so `backup:tenant 41` and
-`backup:tenant 7` arrive as one row shape with no way to tell which tenant failed — which is the
-question a failed job raises. Prism captures the payload itself, from the framework's queue events.
-
-| Key | Env | Default | |
-| --- | --- | --- | --- |
-| `job.capture_payload` | `PRISM_CAPTURE_JOB_PAYLOAD` | `true` | Record the payload. |
-| `job.max_payload` | `PRISM_MAX_JOB_PAYLOAD` | `65536` | Bytes kept per payload. `0` disables the cap. |
-
-Three things are worth knowing:
-
-- **Both halves of a job's life carry it.** A dispatch and a worker's attempt are two rows, usually
-  written by two processes, and each holds the payload from the queue event it saw — so the failed
-  job's detail screen has it whichever row it found.
-- **It is scrubbed BY KEY**, over the decoded JSON, exactly as a JSON request body is. Every key on
-  [the scrub list](#scrubbed-keys) is answered wherever it appears in the document.
-- **The serialised command is not rewritten, and cannot be.** `data.command` is a PHP
-  `serialize()` string whose byte lengths are part of its syntax, so redacting a value inside it
-  would produce a document that no longer parses. A constructor argument you need redacted has to
-  be a **property name on the scrub list** — that is matched by key like everything else. A value
-  buried in a blob that no rule working on keys can see stays as it was; dispatch a reference
-  rather than the secret if that matters to you.
-
-A payload longer than the cap ends in `… [truncated]`, with the cut never landing inside a
-multi-byte character. In the console it appears on the **Failed job detail** screen, pretty-printed;
-a job whose payload was not captured reads as "no payload captured" rather than as an empty one.
-
-### Mail and notification recipients
-
-Prism records **who an outbound message went to** — the To, Cc and Bcc addresses of every mail, and
-for a notification the notifiable it was addressed to plus the addresses its channel routed to.
-
-The capture engine does not supply any of it. Its `mail` record carries the mailer, the mailable
-class, the subject and three recipient *counts*; its `notification` record carries the channel and
-the class. So the most either row can say is that something went to three people, and "did the
-customer get the receipt" — the question a mail screen is opened for — is unanswerable. Prism
-captures the names itself, from the framework's `MessageSending` and `NotificationSending` events.
-
-| Key | Env | Default | |
-| --- | --- | --- | --- |
-| `mail.capture_recipients` | `PRISM_CAPTURE_MAIL_RECIPIENTS` | `true` | Record the three address lists. |
-| `notification.capture_recipients` | `PRISM_CAPTURE_NOTIFICATION_RECIPIENTS` | `true` | Record the notifiable and the channel's routed addresses. |
-
-Four things are worth knowing:
-
-- **A notification is recorded per channel.** One sent over mail and Slack is two rows with two
-  answers, because the Slack delivery routed to a webhook rather than to the email beside it. A
-  channel that routes to something with no address in it — `database` routes to a relation — stores
-  an empty list rather than a guess.
-- **The notifiable is an identity, not an address.** It is stored as `Class#id`; an on-demand
-  notifiable (`Notification::route(…)`) has no key and reads as its class alone.
-- **Addresses are scrubbed, and a redacted list keeps its length.** Put the list's own name (`to`,
-  `cc`, `bcc`, `recipients`) or `email` on [the scrub list](#scrubbed-keys) and every address is
-  stored as `[REDACTED]` — one per address, so the list still agrees with the counts stored beside
-  it.
-- **At most 50 addresses per list are kept.** A send wider than that is a mailing rather than a
-  message, and the counts beside the names still report the true width.
-
-A message whose recipients were not captured — capture switched off, or a row written before this
-version — reads as an empty list rather than as a message that went to nobody.
-
-### Command lines
-
-A command row carries **the whole invocation** — `backup:run 41 --only-db --disk=s3`, not just
-`backup:run` — so two runs of one command are distinguishable. The capture engine reports it: it
-builds the line from the input the console kernel handed it, which for `php artisan …` is the raw
-argument list as it was typed.
-
-Two rules apply on the way out, and neither is configurable:
-
-- **It is redacted against [the scrub list](#scrubbed-keys)**, so `--password=hunter2` ships as
-  `--password=[REDACTED]`. The option's own name survives, so the run stays readable.
-- **It is capped at 4 KB**, ending in `… [truncated]` when it was cut. Nothing upstream bounds this
-  field and the column behind it has no cap of its own, so one command invoked with a document as an
-  argument would otherwise be stored whole, on every run.
-
-There is no Commands screen yet; the line is in the `commands` table and on the wire.
+One list governs every signal. A key here is redacted in request and response bodies, headers and
+query strings, outgoing call URLs, SQL statements, artisan command lines, cache keys, mail subjects,
+exception messages, queued job payloads and recipient lists — the field, header or parameter stays,
+so the shape is still legible. The one thing no key-based rule can reach is a value inside a job's
+serialised command blob: name the **property** on the scrub list, or dispatch a reference rather
+than the secret.
 
 ## Manual instrumentation
 
-Automatic capture covers the common signals. Two static helpers on `Misakstvanu\Prism\Prism` let
-you record things no instrumentation can see. Both are **safe no-ops when the client is inert**
-(disabled or unconfigured), so you can call them unconditionally.
+Automatic capture covers the common signals. Two static helpers record what no instrumentation can
+see. Both are safe no-ops when the client is inert, so call them unconditionally.
 
-**Report a handled exception** — one your code caught but still wants in Prism (a swallowed
-integration error, a best-effort background failure). It is recorded as `handled`, scrubbed and
-buffered like any other:
+**Report a handled exception:**
 
 ```php
 use Misakstvanu\Prism\Prism;
@@ -839,12 +284,9 @@ try {
 }
 ```
 
-**Instrument a block of code as a trace span** — arbitrary work no instrumentation sees, such as an
-expensive computation or a third-party SDK call. The closure is timed and placed on the trace
-waterfall as a real OpenTelemetry span, so anything opened inside it (a query, an outgoing call, a
-nested `Prism::span()`) nests beneath it by construction and the trace it joins is the one that
-crosses service and queue boundaries. The closure's return value is passed through, and with the
-span lane off (`PRISM_OTEL_ENABLED=false`) the closure still runs — it is simply not recorded:
+**Instrument a block of code as a trace span.** The closure is timed and placed on the waterfall as
+a real OpenTelemetry span, so anything opened inside it nests beneath it. The return value is passed
+through, and with the span lane off the closure still runs — it is simply not recorded:
 
 ```php
 $report = Prism::span('generate monthly report', function () use ($account) {
@@ -855,127 +297,16 @@ $report = Prism::span('generate monthly report', function () use ($account) {
 $rows = Prism::span('warehouse rollup', fn () => $warehouse->rollup(), type: 'db');
 ```
 
-## Octane
+## Octane and Horizon
 
-The package is Octane-aware. Per-request state (the event buffer, the trace context and the recursion
-guard) is reset on each `RequestReceived`, so one request's telemetry never
-leaks into the next inside a long-lived worker. The `terminate` flush strategy fires under Octane's
-per-request kernel terminate, and the HTTP transport reuses a keep-alive connection pool across
-requests. No extra configuration is required.
+Both work with no extra configuration. Under Octane, per-request state is reset on each
+`RequestReceived` so one request's telemetry never leaks into the next, and the HTTP transport
+reuses a keep-alive connection pool. Queue-depth and worker-count metrics are read through Horizon
+automatically when it is installed, and job capture works the same whether you run `queue:work`,
+`queue:listen` or Horizon.
 
-## Horizon
-
-Queue-depth and worker-count metrics are read through Horizon automatically when it is installed —
-the package detects `Laravel\Horizon\Contracts\SupervisorRepository` at runtime, with no
-compile-time dependency, so nothing breaks when Horizon is absent. Job capture works the same way
-whether you run `queue:work`, `queue:listen` or Horizon.
-
-For queue metrics to be reported, run `prism:check` (or any job) on a **worker** process — queue
-polling is skipped entirely on web replicas, and an idle worker with no jobs never reaches the end
-of an execution, which is where the interval is consulted.
-
-## Capture cost
-
-Two instrumentation engines listen where the client used to listen for itself, so what capture costs
-a request is measured rather than assumed:
-
-```bash
-php artisan prism:bench:capture
-```
-
-It times the same synthetic request under four configurations — nothing capturing, the pre-2.0
-client, the capture engine alone, and the capture engine plus the span lane — and reports what each
-one *adds* to the request. Each configuration runs in a process of its own, because which engines
-listen is decided during `register()`: four configurations in one process would be four names for
-one configuration. The whole sweep repeats (`--rounds`, default 3) round-robin and each row reports
-its median round, because ambient load moves the same measurement further than the difference being
-looked for.
-
-**A configuration that costs more wall-clock per request than the old client fails the command**
-(non-zero exit). So does any sign that a span left the process as OTLP.
-
-The old client comes out of git — it was deleted when the engines replaced it — so export it once
-from a shell that has `git` before the first run:
-
-```bash
-mkdir -p storage/app/prism-bench/legacy
-git archive <the commit that deleted src/Capture>^ \
-    packages/prism/src/Capture packages/prism/src/Support/SpanStack.php \
-  | tar -x -C storage/app/prism-bench/legacy --strip-components=3
-```
-
-The command does this itself when `git` is on the PATH; when it is not, it prints the line above and
-refuses to report a verdict rather than quoting three numbers with nothing to compare them against.
-
-What comes back is the old **request** path — the middleware that timed the lifecycle and emitted its
-spans, the query and cache capturers, the span recorder they shared and the Monolog handler. The job,
-schedule and outgoing-HTTP listeners are left out because a request never fires them, and the runtime
-metrics collectors because they sample on an interval rather than per request (they cost the two
-engine configurations ~40 µs a request against the array store, which is inside the noise of
-everything below).
-
-### The recorded run
-
-PHP 8.4.23 with OPcache, Laravel 13.21, 11th-gen i7-1165G7 (8 threads), inside the project's
-`prism-be` container while the rest of the stack was running — an ordinary development box under
-ordinary load, not a quiet benchmarking rig. 250 requests × 5 rounds, each request running 8
-queries, 8 cache read/writes and 1 log line:
-
-| configuration | per request | added | added peak mem | events/req |
-| --- | --- | --- | --- | --- |
-| capture off | 1.56 ms | — | — | 0.0 |
-| old client (pre-2.0) | 2.65 ms | +1.09 ms | +473 kB | 29.3 |
-| Nightwatch only | 3.59 ms | +2.03 ms | +862 kB | 26.0 |
-| Nightwatch + OTel spans | 6.90 ms | +5.34 ms | +2909 kB | 35.0 |
-
-Repeat sweeps on the same box put the three added figures at roughly +0.8–1.4 ms, +2.0–2.4 ms and
-+4.4–5.6 ms — quote the shape, not the second digit. What does not move is the ordering.
-
-**The default install is more expensive per request than the old client was, and the command fails
-on it** (exit 1). Varying the workload one signal at a time (200 requests × 3 rounds) says where the
-cost is, and it is not a fixed per-request overhead:
-
-| workload | old client | Nightwatch | Nightwatch + OTel |
-| --- | --- | --- | --- |
-| nothing (the request alone) | +0.29 ms | +0.58 ms | +0.81 ms |
-| 8 queries | +0.58 ms | +0.99 ms | +2.60 ms |
-| 8 cache read/writes (16 events) | +1.45 ms | +1.84 ms | +2.41 ms |
-
-Subtracting the empty request, a query costs the old client ~36 µs, the capture engine ~51 µs and
-the span lane a further ~200 µs. The span lane is the bulk of the difference, and what it is buying
-is visible in the event counts: a query under the span lane produces **two** rows — the `db` bar in
-the waterfall and the `queries` row derived from it — where the old client produced one flat query
-event and a single aggregate `db` span for the whole request. Nesting is not free.
-
-The **per-signal** figures are the transferable ones. The headline workload is deliberately
-signal-dense — 8 queries and 16 cache events inside a request whose own work is 1.5 ms — so it
-answers "what does one captured operation cost", not "what fraction of a request will this be".
-Multiply the per-signal numbers by what your own requests actually do. Peak memory moves the same
-way and for the same reason: the span lane holds a span per operation until the trace ends, which is
-~2.9 MB against the old client's ~0.5 MB on this workload.
-
-Three findings worth keeping:
-
-- **Rejecting the superseded records upstream does not recover it.** The engine takes its
-  `debug_backtrace(limit: 21)` *before* any `reject*` callback runs, so `Nightwatch::rejectQueries()`
-  cannot avoid the expensive part. `nightwatch.filtering.ignore_queries` can — it is checked first —
-  and measured at ~90 µs per query in a span-lane install, against a per-request query counter that
-  would then read zero. It is a partial recovery of an inherent cost, not a fix.
-- **The replica-metrics interval throttle costs a cache round trip per request** in any process that
-  did not win the interval. It is not capture and predates both engines, but it measured 1.19 ms per
-  request against a Redis store — larger than everything above — which is why the benchmark runs its
-  children on the array store and says so.
-- **Peak memory is bounded by the buffer, not by the request.** `PRISM_BATCH_SIZE` is what stops a
-  request that issues a hundred queries holding a hundred spans: at capacity the buffer either ships
-  early or drops and counts, and the benchmark reports both numbers.
-
-The lever that is already built for this is `PRISM_SAMPLE_REQUESTS`. Sampling is per **execution**
-now: a request the sampler rejects is discarded whole, spans included, so it never pays the
-per-signal costs above. Halving the rate halves the average cost of a request; there is no
-per-signal rate to tune and no half-captured trace to reassemble. Turning individual OpenTelemetry
-instrumentations off (`OTEL_INSTRUMENTATION_QUERY`, `OTEL_INSTRUMENTATION_HTTP_CLIENT`, …) is the
-other dial, and it costs that lane its nesting rather than its volume — see
-[Span lane](#span-lane-keepsuitlaravel-opentelemetry).
+Queue metrics are only reported from a **worker** process — polling is skipped on web replicas, and
+an idle worker never reaches the end of an execution, which is where the interval is consulted.
 
 ## Troubleshooting
 
@@ -988,21 +319,18 @@ php artisan prism:check
 | Symptom | Likely cause |
 | --- | --- |
 | `prism:check` reports a missing token or app | `PRISM_TOKEN` / `PRISM_APP` not set, or config cached before they were — run `php artisan config:clear`. |
-| A `401` from the endpoint | The token is wrong, revoked, or not an **ingest**-scope token. Mint a fresh ingest token. |
-| A `429` from the endpoint | The workspace is over its monthly event quota. Connectivity and the token are fine — this is a billing state. Errors are still accepted. |
-| Nothing appears in the console | Confirm `PRISM_ENABLED` is not `false`, the path/job is not on an ignore list, and — for a worker — that a job has actually run (the batch flushes at the end of each job). |
-| `prism:check` reports `records are NOT reaching Prism` | The capture engine is running but Prism's ingest was never installed over it — which happens when `PRISM_ENABLED` is false, or `PRISM_TOKEN` is blank at boot on a host that is not `local`. Fix those and the `ingest` line reads `in-process`. |
-| A token-less local install gets `401`s | The hub is not running in *its* `local` environment, or it has no workspace to attribute the batch to. Token-less ingest is a local-to-local arrangement; anywhere else, set `PRISM_TOKEN`. |
-| The browser SDK's posts come back `404` | The endpoint is not registered. `prism:check`'s `browser` line says why: `PRISM_ENABLED=false` (the only switch that removes it — a blank `PRISM_TOKEN` still answers `204`), `PRISM_BROWSER_ENABLED=false`, or a blank `PRISM_BROWSER_PATH`. It also prints the address the router will answer, which is the other half of a `404`: the SDK may simply be posting somewhere else. |
-| The browser SDK's posts are refused by the browser itself | The page is on a different origin from the backend and that origin is not on `browser.origins` — `prism:check`'s `browser` line reads back the list it is matched against. See [Browser telemetry](#browser-telemetry). |
-| You went looking for an OTLP collector to point at | There isn't one. Spans never leave the process as OTLP — all three OpenTelemetry exporters are pinned to `null` and Prism ships the spans in its own batch. |
-| You went looking for a `nightwatch:agent` daemon | There isn't one. `prism:check` says `agent: not required` for exactly this reason — Prism replaces the engine's transport, so nothing is transmitted over a socket and no daemon is installed, started or monitored. |
-| Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, batches are landing but nothing drains them: check a worker is consuming the queue named by `PRISM_FLUSH_QUEUE` (default queue), and that the endpoint is reachable **from the worker**, which is where the send now happens. |
-| Events flow but a body or the header bag is blank | Sensitive keys are scrubbed at the source, so a redacted field is expected. A missing header bag means `request.capture_headers` is off. A whole body missing means one of: `request.capture_body` / `request.capture_response` off, a media type not on `request.body_content_types` (`text/html` is not, by default), a streamed or file response, or a request that carried no body. See [Request headers and bodies](#request-headers-and-bodies). |
-| A body ends in `… [truncated]` | It was longer than `request.max_body` (64 KB by default). Raise it, or set it to `0` for no cap. |
-| A failed job shows no payload | `job.capture_payload` is off, or the row was written before this version. A payload ending in `… [truncated]` was longer than `job.max_payload`. See [Job payloads](#job-payloads). |
-| A queued job's payload is blank | It is never captured at all — the engine's job records carry the name, id, queue, connection and outcome and nothing else. |
-| No telemetry after a deploy | Config cache is stale — `php artisan config:clear` (or re-run `config:cache`). |
+| A `401` from the endpoint | The token is wrong, revoked, or not an **ingest**-scope token. |
+| A `429` from the endpoint | The workspace is over its monthly event quota. Errors are still accepted. |
+| Nothing appears in the console | Confirm `PRISM_ENABLED` is not `false`, the path or job is not on an ignore list, and — for a worker — that a job has actually run. |
+| `prism:check` reports `records are NOT reaching Prism` | `PRISM_ENABLED` is false, or `PRISM_TOKEN` is blank at boot on a host that is not `local`. |
+| A token-less local install gets `401`s | The hub is not running in *its* `local` environment. Token-less ingest is a local-to-local arrangement. |
+| The browser SDK's posts come back `404` | The endpoint is not registered, or the SDK is posting elsewhere. `prism:check`'s `browser` line says which. |
+| The browser SDK's posts are refused by the browser itself | The page's origin is not on `browser.origins`. |
+| You went looking for an OTLP collector or a `nightwatch:agent` daemon | There isn't one of either. Spans and records never leave the process except in a Prism batch. |
+| Nothing appears, and `prism:check` shows batches "waiting" | Under `spool`, check a worker is consuming `PRISM_FLUSH_QUEUE` and that the endpoint is reachable **from the worker**. |
+| Events flow but a body or the header bag is blank | Scrubbed keys are expected. Otherwise: capture switched off, a media type not on `request.body_content_types`, a streamed or file response, or a request that carried none. |
+| A body or payload ends in `… [truncated]` | It was longer than `request.max_body` / `job.max_payload`. Raise it, or set it to `0`. |
+| No telemetry after a deploy | Config cache is stale — `php artisan config:clear`. |
 
 `PRISM_ENABLED=false` and an over-quota `429` are both **success** exits for `prism:check` — a
 deliberate opt-out and an operational quota state are not wiring faults.
@@ -1010,8 +338,7 @@ deliberate opt-out and an operational quota state are not wiring faults.
 ## Tests
 
 The package carries its own [Pest](https://pestphp.com) suite, run through
-[Testbench](https://packages.tools/testbench) with no host application present — which is what
-proves it depends on nothing outside itself:
+[Testbench](https://packages.tools/testbench) with no host application present:
 
 ```bash
 cd packages/prism
