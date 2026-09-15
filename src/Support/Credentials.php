@@ -10,13 +10,13 @@ use Illuminate\Contracts\Config\Repository;
  * Whether this process holds enough credentials to capture, and how it should
  * authenticate when it ships (US-003).
  *
- * `PRISM_TOKEN` is what binds a batch to a workspace, so out of the box a blank
- * one means the client has nowhere to send anything and no-ops. There is one
- * exception, and it is symmetrical with the hub's own: a Prism hub running in
- * the `local` environment accepts a token-less batch and attributes it to a
- * default workspace (US-002), so a client on a `local` host is allowed to ship
- * without a credential — which is what lets `composer require` plus `PRISM_APP`
- * fill a development console with nothing minted, copied or pasted.
+ * `PRISM_TOKEN` binds a batch to a workspace, so out of the box a blank one
+ * means the client has nowhere to send anything and no-ops. One exception,
+ * symmetrical with the hub's own: a Prism hub running in the `local`
+ * environment accepts a token-less batch and attributes it to a default
+ * workspace (US-002), so a client on a `local` host may ship without a
+ * credential — which is what lets `composer require` plus `PRISM_APP` fill a
+ * development console with nothing minted, copied or pasted.
  *
  * The rule lives here rather than at its four call sites — the boot gate, the
  * span-processor gate, `prism:check`'s validation and the transport's own

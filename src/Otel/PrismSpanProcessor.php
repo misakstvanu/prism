@@ -25,62 +25,33 @@ use OpenTelemetry\SDK\Trace\SpanProcessorInterface;
 use Throwable;
 
 /**
- * Turns every finished OpenTelemetry span into one Prism `span` event (US-015).
+ * Turns every finished OpenTelemetry span into one Prism `span` event (US-015). **The whole OpenTelemetry
+ * decision exists for this**: the capture engine reports a cache read, a query and an outgoing call on
+ * *completion* only — no start hook — so a decorator over those records can only produce flat siblings
+ * sharing a trace id, where an OTel span carries a parent span id by construction. Load-bearing plumbing:
  *
- * **This is the story the whole OpenTelemetry decision exists for.** The capture
- * engine reports a cache read, a query and an outgoing call on *completion*
- * only — there is no start hook and nothing that says what was open at the
- * time — so any decorator over those records can produce flat siblings sharing
- * a trace id and nothing else. An OTel span carries a parent span id by
- * construction, which is the one thing a waterfall needs and the one thing the
- * engine cannot give. Everything else about the span lane is plumbing.
- *
- * Four things about that plumbing are load-bearing:
- *
- *   - **It is registered through upstream's own `traces.processors` slot**, so
- *     the `TracerProvider` this reads from is the one `keepsuit/…` built —
- *     with its resource, its sampler and its propagators. Replacing the
- *     provider would mean owning all of that, and a host that later publishes
- *     `config/opentelemetry.php` to export to its own collector would find
- *     Prism had quietly taken the tracer away from it. The processor sits
- *     *beside* the batch processor upstream always installs; because US-014
- *     pins every exporter to `null`, that one is a Noop and nothing leaves the
- *     process.
- *
- *   - **A span's emitted `span_id` is the SDK's own**, and so is the
- *     `parent_span_id` its children name. That equality is the whole contract:
- *     the server groups children by parent and walks the tree depth-first, so
- *     a parent id naming a span that is not in the trace silently drops that
- *     row to a root and the waterfall goes flat with nothing reporting a
- *     problem. Nothing here re-keys a span.
- *
- *   - **Nothing downstream changes.** The event goes into the same
- *     {@see EventBuffer} every other signal writes into, so it rides the same
- *     envelope, the same transport and the same `prism.batch.flush` strategy —
- *     and, because {@see PrismIngest::flush()} discards that buffer for an
- *     execution the sampler rejected, a dropped execution drops its spans with
- *     it rather than shipping a waterfall for a request nothing else recorded.
- *     There is no depth column on the `spans` table and never was: depth and
- *     `hasChildren` are derived at read time by the server, which is the house
- *     rule that the service produces every display figure.
- *
- *   - **`offset_ms` is milliseconds from the front of the trace**, not from the
- *     epoch. OTel timestamps are absolute, so the trace's origin is remembered
- *     by {@see SpanLineage} from `onStart` — the only hook that runs before a
- *     child's own start.
- *
- * **A db span stands for two signals, not one** (US-018). It is a bar in the
- * `db` lane *and* a row in the `queries` table the Queries screen reads — both
- * emitted here, from one span, because both engines watch `QueryExecuted` and
- * only one of them may be the producer or the same query is stored twice. The
- * capture engine's own `query` record is the one that gives way; see
- * {@see recordQuery()} and {@see SpanLane}.
- *
- * The type mapping answers Prism's existing six-lane vocabulary
- * (`mw|ctrl|db|http|cache|resp`) from the span's kind and attributes; see
- * {@see type()}. It never drops a span it cannot classify — an unmapped span is
- * `ctrl`, because a bar in the wrong lane is a colour and a missing bar is a
- * hole in the trace.
+ *   - **Registered through upstream's own `traces.processors` slot**, so the `TracerProvider` stays
+ *     `keepsuit/…`'s with its resource, sampler and propagators: replacing it would mean owning all of
+ *     that, and a host later publishing `config/opentelemetry.php` to export to its own collector would
+ *     find Prism had taken the tracer away. Sits *beside* the batch processor upstream always installs,
+ *     whose exporter US-014 pins to `null`, so that one is a Noop and nothing leaves the process.
+ *   - **An emitted `span_id` is the SDK's own**, as is the `parent_span_id` its children name, and
+ *     nothing here re-keys a span: the server groups children by parent and walks depth-first, so a
+ *     parent id naming a span not in the trace silently drops that row to a root and the waterfall goes
+ *     flat with nothing reporting a problem.
+ *   - **Nothing downstream changes**: the same {@see EventBuffer}, envelope, transport and
+ *     `prism.batch.flush` strategy as every other signal, so a sampler-rejected execution drops its
+ *     spans with its buffer ({@see PrismIngest::flush()}) rather than shipping a waterfall for a request
+ *     nothing else recorded. There is no depth column on `spans` and never was: the server derives depth
+ *     and `hasChildren` at read time, the house rule that the service produces every display figure.
+ *   - **`offset_ms` is milliseconds from the front of the trace**, not the epoch; OTel timestamps being
+ *     absolute, {@see SpanLineage} remembers the origin from `onStart`, the only hook before a child's.
+ *   - **A db span stands for two signals** (US-018): a `db` lane bar *and* a row in the `queries` table
+ *     the Queries screen reads, one producer for a signal both engines watch — see {@see recordQuery()}
+ *     and {@see SpanLane}.
+ *   - **{@see type()}** maps the span's kind and attributes onto Prism's existing six-lane vocabulary
+ *     (`mw|ctrl|db|http|cache|resp`), never dropping a span it cannot classify: an unmapped span is
+ *     `ctrl`, a bar in the wrong lane being a colour where a missing bar is a hole in the trace.
  */
 final class PrismSpanProcessor implements SpanProcessorInterface
 {
@@ -88,45 +59,38 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     private const EVENT_TYPE = 'span';
 
     /**
-     * The attribute a caller-declared waterfall lane rides on (US-021).
-     *
-     * {@see Prism::span()} takes a `$type` argument and the
-     * manual span it opens has none of the attributes {@see type()} reads a lane
-     * off, so without this every hand-instrumented span would come out `ctrl`
-     * whatever the caller asked for. Namespaced because the attribute bag is the
-     * host's and the SDK's as much as ours; it lands in the event payload and is
-     * dropped server-side, there being no `spans` column named for it.
+     * The attribute a caller-declared waterfall lane rides on (US-021). The manual span
+     * {@see Prism::span()} opens carries none of the attributes {@see type()} reads a lane off, so
+     * without this its `$type` argument would be silently ignored and every hand-instrumented span come
+     * out `ctrl`. Namespaced because the attribute bag is the host's and the SDK's as much as ours; it
+     * lands in the event payload and is dropped server-side, there being no `spans` column for it.
      */
     public const TYPE_ATTRIBUTE = 'prism.span.type';
 
     /**
-     * The second signal a db span carries: the server routes this one to the
-     * `queries` table, which is what the Queries screen reads. See
-     * {@see recordQuery()}.
+     * The second signal a db span carries, routed server-side to the `queries` table the Queries screen
+     * reads. See {@see recordQuery()}.
      */
     private const QUERY_EVENT_TYPE = 'query';
 
     /**
-     * The datastore whose spans are NOT queries. Upstream's Redis
-     * instrumentation sets the same `db.system.name` attribute the SQL one
-     * does, so the `db` lane covers both — but a Redis command is not a row in
-     * the `queries` table and never was: Prism's query signal has always been
-     * Laravel's `QueryExecuted`, which Redis does not raise.
+     * The datastore whose spans are NOT queries. Upstream's Redis instrumentation sets the same
+     * `db.system.name` as the SQL one, so the `db` lane covers both — but a Redis command is not a row in
+     * `queries` and never was: Prism's query signal has always been Laravel's `QueryExecuted`, which Redis
+     * does not raise.
      */
     private const NOT_A_QUERY = 'redis';
 
     /**
-     * The span upstream back-dates over the framework's bootstrap, which is
-     * the one span OTel produces that belongs in Prism's `mw` lane. Matched by
-     * name because it carries no attribute to match on; a rename upstream
+     * The span upstream back-dates over the framework's bootstrap — the one OTel span belonging in
+     * Prism's `mw` lane. Matched by name because it carries no attribute to match on; a rename upstream
      * costs the bar its colour, not its existence.
      */
     private const BOOTSTRAP_SPAN = 'app bootstrap';
 
     /**
-     * The waterfall lanes the console draws, and therefore the only values
-     * {@see TYPE_ATTRIBUTE} is honoured for — an unrecognised one falls through
-     * to the ordinary rules rather than reaching the `spans` table's `type`
+     * The waterfall lanes the console draws, hence the only values {@see TYPE_ATTRIBUTE} is honoured for
+     * — an unrecognised one falls through to the ordinary rules rather than reaching the `spans` `type`
      * column, where it would render as no lane at all.
      *
      * @var list<string>
@@ -134,16 +98,15 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     private const LANES = ['mw', 'ctrl', 'db', 'http', 'cache', 'resp'];
 
     /**
-     * Whether {@see shutdown()} has been called. The specification says
-     * `onStart`, `onEnd` and `forceFlush` are invalid afterwards, and a second
-     * shutdown answers false.
+     * Whether {@see shutdown()} has been called: the specification says `onStart`, `onEnd` and
+     * `forceFlush` are invalid afterwards, and a second shutdown answers false.
      */
     private bool $closed = false;
 
     /**
-     * @param  Container  $container  Resolved from lazily rather than injected: this processor is
-     *                                constructed while `keepsuit/…` boots, which is *before* Prism's
-     *                                own `registerCapture()` has bound the buffer it writes into.
+     * @param  Container  $container  Resolved from lazily, not injected: this processor is
+     *                                constructed while `keepsuit/…` boots, *before* Prism's own
+     *                                `registerCapture()` bound the buffer it writes into.
      */
     public function __construct(
         private readonly Container $container,
@@ -151,12 +114,9 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     ) {}
 
     /**
-     * Remember where this span's trace began.
-     *
-     * `onStart` is the only hook that runs before a child span's own start, so
-     * it is the only place the trace origin can be learned in time to lay the
-     * first child out against it. A registry filled at `onEnd` would learn the
-     * root's start after every one of its children had already needed it.
+     * Remember where this span's trace began. `onStart` is the only hook running before a child span's own
+     * start, so the only place the trace origin can be learned in time to lay the first child out against
+     * it: a registry filled at `onEnd` would learn the root's start after every child had needed it.
      */
     public function onStart(ReadWriteSpanInterface $span, ContextInterface $parentContext): void
     {
@@ -167,8 +127,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
         try {
             $this->lineage->observe($span->getContext()->getTraceId(), $this->startNanos($span));
         } catch (Throwable) {
-            // A lane that cannot say where a trace began draws its bars from
-            // each span's own start; it must never cost the host a request.
+            // A lane that cannot say where a trace began draws its bars from each span's own start;
+            // it must never cost the host a request.
         }
     }
 
@@ -187,11 +147,9 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Nothing is held back, so there is nothing to force out: `onEnd` writes
-     * straight into the shared buffer, which the host's own flush strategy
-     * ships. Answers true so a caller draining every processor — upstream's
-     * worker mode does this after each queue job, and US-019's tail sampling
-     * will — reads a successful flush rather than a failed one.
+     * Nothing is held back, so nothing to force out: `onEnd` writes straight into the shared buffer, which
+     * the host's own flush strategy ships. Answers true so a caller draining every processor — upstream's
+     * worker mode after each queue job, US-019's tail sampling — reads a successful flush, not a failed one.
      */
     public function forceFlush(?CancellationInterface $cancellation = null): bool
     {
@@ -199,8 +157,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Close the lane and forget the trace origins. Answers false when already
-     * shut down, as the specification requires.
+     * Close the lane and forget the trace origins. Answers false when already shut down, as the
+     * specification requires.
      */
     public function shutdown(?CancellationInterface $cancellation = null): bool
     {
@@ -215,14 +173,10 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Build and buffer the event.
-     *
-     * Two refusals come first, and both are about not capturing Prism's own
-     * work: {@see Recursion::suppressed()} is true while a batch is being built
-     * and shipped, and `prism.ignore.http` is what a dogfooded install writes
-     * its own ClickHouse and ingest hosts onto. Without them, sending telemetry
-     * is telemetry — the exact loop {@see RejectRules} closes for every signal
-     * the capture engine raises.
+     * Build and buffer the event. Two refusals come first, both about not capturing Prism's own work:
+     * {@see Recursion::suppressed()} is true while a batch is built and shipped, and `prism.ignore.http`
+     * covers a dogfooded install's own ClickHouse and ingest hosts ({@see rejected()}). Without them,
+     * sending telemetry is telemetry — the loop {@see RejectRules} closes for every capture-engine signal.
      */
     private function record(ReadableSpanInterface $span): void
     {
@@ -260,10 +214,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
             'request_id' => '',
             'user_id' => $this->userId($attributes),
             'payload' => [
-                // The span's own attributes travel first so Prism's column
-                // vocabulary wins any collision, the same rule the record
-                // translator follows. Anything with no `spans` column is
-                // dropped server-side rather than lost work.
+                // Attributes travel first so Prism's column vocabulary wins any collision, the record
+                // translator's rule; anything with no `spans` column is dropped server-side, not lost work.
                 ...$attributes,
                 'span_id' => $data->getSpanId(),
                 'parent_span_id' => $data->getParentContext()->isValid() ? $data->getParentSpanId() : '',
@@ -280,40 +232,22 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Buffer the `queries` row a db span also stands for (US-018).
-     *
-     * The Queries screen and the `queries` table long predate the span lane and
-     * are not going anywhere: what changed is the producer. Both engines watch
-     * `QueryExecuted`, and once the span carries the parent lineage a waterfall
-     * needs, the capture engine's flat `query` record is the same work reported
-     * a second time — so {@see PrismIngest} drops that record and this fills the
-     * gap. One query therefore lands as exactly one row in `queries` and exactly
-     * one `db` span, from one producer, which is the only arrangement in which
-     * the two cannot disagree.
-     *
-     * Three deliberate limits, all of them upstream's and all visible on the
-     * screen rather than hidden:
-     *
-     *   - **A Redis command is a `db` span and is NOT a query.** Upstream's
-     *     Redis instrumentation sets the same `db.system.name` attribute, which
-     *     is exactly why the `db` lane covers both — but Prism's query signal
-     *     has always been `QueryExecuted`, which Redis never raises. See
-     *     {@see NOT_A_QUERY}.
-     *   - **`connection` is the driver, not Laravel's connection name.** The
-     *     span carries `db.system.name` (`pgsql`, `mysql`, `sqlite`) and no
-     *     attribute names the connection the query ran on; for the default
-     *     connections the two read identically, and the driver is the answer a
-     *     reader of that column is looking for either way.
-     *   - **The SQL is upstream's `db.query.text`**, which it truncates at 500
-     *     characters. `bindings` stays absent rather than being filled with an
-     *     empty list that would read as "this query had none" — the same
-     *     stance the record translator takes.
-     *
-     * The `slow` marker is Prism's own and rides the payload exactly as it
-     * always has: the *server's* sampler keeps a slow query and the trace
-     * around it whatever the workspace's rules say, and
-     * `prism.query.slow_threshold_ms` is still the threshold. See
-     * {@see SpanLane::isSlowQuery()}.
+     * Buffer the `queries` row a db span also stands for (US-018). The Queries screen and the `queries`
+     * table predate the span lane; only the producer changed. Both engines watch `QueryExecuted`, and
+     * once the span carries the parent lineage a waterfall needs, the capture engine's flat `query`
+     * record is the same work reported twice — so {@see PrismIngest} drops it and this fills the gap:
+     * one query is one `queries` row and one `db` span, from one producer, the only arrangement in which
+     * the two cannot disagree. Three deliberate limits follow, all upstream's, all visible on the
+     * screen. A Redis command is a `db` span and is NOT a query: its instrumentation sets the same
+     * `db.system.name`, which is why the `db` lane covers both, but Prism's query signal has always been
+     * `QueryExecuted`, which Redis never raises ({@see NOT_A_QUERY}). `connection` is that
+     * `db.system.name` — the driver (`pgsql`, `mysql`, `sqlite`) — not Laravel's connection name, which
+     * no attribute carries; for the default connections the two read identically, and the driver is what
+     * that column's reader wants either way. The SQL is upstream's `db.query.text`, truncated at 500
+     * characters, and `bindings` stays absent rather than filled with an empty list reading as "this
+     * query had none", the record translator's stance. The `slow` marker is Prism's own: the *server's*
+     * sampler keeps a slow query and the trace around it whatever the workspace's rules say, still at
+     * `prism.query.slow_threshold_ms` ({@see SpanLane::isSlowQuery()}).
      *
      * @param  array<string, mixed>  $attributes
      */
@@ -352,13 +286,10 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * The first of the named attributes that carries a string, or null.
-     *
-     * Two spellings per attribute because the semantic conventions renamed
-     * every one of these (`db.system` → `db.system.name`, `db.statement` →
-     * `db.query.text`) and a host is free to run an instrumentation that
-     * predates the rename. Reading both costs an array lookup and saves a
-     * column that silently empties on a dependency bump.
+     * The first of the named attributes that carries a string, or null. Two spellings each because the
+     * semantic conventions renamed every one of these (`db.system` → `db.system.name`, `db.statement` →
+     * `db.query.text`) and a host may run an instrumentation predating the rename: reading both costs an
+     * array lookup and saves a column that silently empties on a dependency bump.
      *
      * @param  array<string, mixed>  $attributes
      */
@@ -377,20 +308,14 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Run `prism.scrub` over the two attributes that can carry a value a host
-     * asked never to leave the process (US-011, applied to the lane by US-018).
-     *
-     * This is not belt and braces: once the span lane owns the query and
-     * outgoing-request signals, an attribute is where that text lives. The
-     * engine's own records meet the list through {@see RedactRules}'s
-     * `redact*` callbacks, and a span meets nothing at all unless it meets it
-     * here — so a `prism.scrub` entry would go on reading correctly in config
-     * while quietly covering one producer out of two.
-     *
-     * Two shapes, the same two the record side has: a statement is free text
-     * holding `name = value` pairs, and a URL is a query string rewritten pair
-     * by pair. Upstream redacts the URL against a sensitive-parameter list of
-     * its own first; this one runs over the result, so both lists apply.
+     * Run `prism.scrub` over the two attributes that can carry a value a host asked never to leave the
+     * process (US-011, applied to the lane by US-018). Not belt and braces: once the span lane owns the
+     * query and outgoing-request signals, an attribute is where that text lives, and a span meets the list
+     * nowhere unless it meets it here — the engine's own records meet it through {@see RedactRules}'s
+     * `redact*` callbacks, so a `prism.scrub` entry would go on reading correctly in config while covering
+     * one producer out of two. Two shapes, as on the record side: a statement is free text holding
+     * `name = value` pairs, a URL a query string rewritten pair by pair. Upstream redacts the URL against
+     * a sensitive-parameter list of its own first; this runs over the result, so both lists apply.
      *
      * @param  array<string, mixed>  $attributes
      * @return array<string, mixed>
@@ -415,9 +340,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
             if (is_string($attributes[$key] ?? null)) {
                 /** @var string $url */
                 $url = $attributes[$key];
-                // `url.query` is a bare query string; giving it the leading `?`
-                // the pair-splitter looks for and taking it off again is what
-                // lets one implementation answer both.
+                // `url.query` is a bare query string; adding the leading `?` the pair-splitter looks
+                // for and taking it off again lets one implementation answer both.
                 $attributes[$key] = $key === 'url.full'
                     ? $rules->redactUrl($url)
                     : substr($rules->redactUrl('?'.$url), 1);
@@ -428,18 +352,12 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * What the bar is labelled on the waterfall.
-     *
-     * The SDK's own name is used for every lane but one. An outgoing call's
-     * span is named `"{METHOD} {route}"` upstream — and `route` is null unless
-     * the host installed a resolver, so in practice the label is the bare word
-     * `GET`, which says nothing about who was called. Prism has always named
-     * that bar `GET api.example.com/v1/things`, on the record side too
-     * ({@see RecordTranslator}), so the lane keeps that vocabulary: a
-     * supersession must not cost the screen the label it had.
-     *
-     * Built from the attributes rather than from `url.full`, so a credential in
-     * a query string cannot reach the `name` column by the back door.
+     * What the bar is labelled on the waterfall: the SDK's own name for every lane but one. Upstream names
+     * an outgoing call's span `"{METHOD} {route}"`, and `route` is null unless the host installed a
+     * resolver, so in practice the label is the bare word `GET`, saying nothing about who was called. The
+     * lane keeps Prism's vocabulary, `GET api.example.com/v1/things`, as the record side has it
+     * ({@see RecordTranslator}) — a supersession must not cost the screen the label it had — built from
+     * the attributes, not `url.full`, so a credential in a query string cannot reach the `name` column.
      *
      * @param  array<string, mixed>  $attributes
      */
@@ -459,39 +377,27 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Which of Prism's six waterfall lanes this span belongs in.
-     *
-     * The lanes are the ones the console has always drawn and the ones
-     * `--color-span-*` names, so this maps into an existing vocabulary rather
-     * than introducing OTel's. Read in order:
-     *
-     *   - **db** — anything speaking a datastore's protocol. Upstream's query
-     *     and Redis instrumentations both set `db.system.name`, so one rule
-     *     covers SQL and Redis without naming either.
-     *   - **http** — an outgoing call: a CLIENT span carrying an HTTP method or
-     *     a URL. Kind-gated deliberately, because the *incoming* request span
-     *     carries the same attributes and is not an outgoing call.
-     *   - **resp** — rendering the response. Upstream's view instrumentation
-     *     (off by default, US-014) is the producer, and `template.name` is the
-     *     attribute only it sets.
-     *   - **mw** — the framework's bootstrap; see {@see BOOTSTRAP_SPAN}.
-     *   - **ctrl** — the request or job itself, and the fallback for anything
-     *     unrecognised. A span in the wrong lane is a colour; a dropped span is
-     *     a hole in the trace, so nothing here returns null.
-     *
-     * There is no **cache** arm, and that is not an omission: OTel emits no
-     * cache span at all (upstream's cache instrumentation only calls
-     * `addEvent()`, and a span *event* has no Prism column to land in), so the
-     * cache lane is fed by the capture engine's own record and joined to this
-     * tree by {@see SpanLineage::stampSpan()}.
+     * Which of Prism's six waterfall lanes this span belongs in — the lanes the console draws and
+     * `--color-span-*` names, an existing vocabulary rather than OTel's. Read in order: **db**, anything
+     * speaking a datastore's protocol (upstream's query and Redis instrumentations both set
+     * `db.system.name`, so one rule covers SQL and Redis without naming either); **http**, an outgoing
+     * call — a CLIENT span carrying an HTTP method or a URL, kind-gated deliberately because the
+     * *incoming* request span carries the same attributes and is not an outgoing call; **resp**,
+     * rendering the response, produced by upstream's view instrumentation (off by default, US-014) and
+     * marked by the `template.name` only it sets; **mw**, the framework's bootstrap
+     * ({@see BOOTSTRAP_SPAN}); and **ctrl**, the request or job itself and the fallback for anything
+     * unrecognised — a span in the wrong lane is a colour where a dropped span is a hole in the trace,
+     * so nothing here returns null. There is no **cache** arm, and that is not an omission: OTel emits
+     * no cache span at all (upstream's cache instrumentation only calls `addEvent()`, and a span *event*
+     * has no Prism column to land in), so that lane is fed by the capture engine's own record and joined
+     * to this tree by {@see SpanLineage::stampSpan()}.
      *
      * @param  array<string, mixed>  $attributes
      */
     private function type(SpanDataInterface $data, array $attributes): string
     {
-        // A lane the caller named outright wins: a manual span carries no
-        // attribute any of the rules below could read, and the argument would
-        // otherwise be silently ignored.
+        // A lane the caller named outright wins: a manual span carries no attribute the rules below
+        // could read, so the argument would otherwise be silently ignored.
         if (in_array($attributes[self::TYPE_ATTRIBUTE] ?? null, self::LANES, true)) {
             /** @var string */
             return $attributes[self::TYPE_ATTRIBUTE];
@@ -518,10 +424,9 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * The authenticated user upstream recorded on the span, if the host left
-     * `opentelemetry.user_context` on. Only the request's own span carries it,
-     * which is enough: every other signal in the trace is correlated by
-     * `trace_id`, not by repeating the attribution.
+     * The authenticated user upstream recorded on the span, if the host left `opentelemetry.user_context`
+     * on. Only the request's own span carries it, and that is enough: every other signal in the trace
+     * correlates by `trace_id`, not by repeating the attribution.
      *
      * @param  array<string, mixed>  $attributes
      */
@@ -534,14 +439,11 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Whether this span describes work a host has asked Prism not to watch.
-     *
-     * Only the outgoing-call dimension is answerable here — `prism.ignore.http`
-     * is what a workspace monitoring itself writes its own ClickHouse and
-     * ingest hosts onto, and those calls are exactly the ones that would feed
-     * the pipeline its own traffic. Every other dimension of the ignore list is
-     * refused earlier, by the capture engine's own reject callbacks
-     * ({@see RejectRules}), and never produces a span in the first place.
+     * Whether this span describes work a host has asked Prism not to watch. Only the outgoing-call
+     * dimension is answerable here: `prism.ignore.http` is what a workspace monitoring itself writes its
+     * own ClickHouse and ingest hosts onto, exactly the calls that would feed the pipeline its own traffic.
+     * Every other dimension of the ignore list is refused earlier by the capture engine's own reject
+     * callbacks ({@see RejectRules}) and never produces a span at all.
      *
      * @param  array<string, mixed>  $attributes
      */
@@ -560,14 +462,10 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * The shared buffer, or null when the client is not live.
-     *
-     * Resolved per span rather than injected: this processor is built while
-     * `keepsuit/…` boots, and Prism binds the buffer in its own `boot()` — one
-     * provider later. The {@see PrismServiceProvider::ACTIVE} marker is the
-     * package's standing "is the client live" test, and is what stops an
-     * enabled-but-token-less install quietly filling a buffer nothing will
-     * ever ship.
+     * The shared buffer, or null when the client is not live. Resolved per span, not injected: this
+     * processor is built while `keepsuit/…` boots and Prism binds the buffer in its own `boot()`, one
+     * provider later. The {@see PrismServiceProvider::ACTIVE} marker is the package's standing "is the
+     * client live" test, stopping an enabled-but-token-less install quietly filling a buffer nothing ships.
      */
     private function buffer(): ?EventBuffer
     {
@@ -585,9 +483,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * Which signals this lane owns, or null when the client is not live enough
-     * to have bound the rule. Resolved per span for {@see buffer()}'s reason:
-     * this processor is built one provider before Prism's own boot.
+     * Which signals this lane owns, or null when the client is not live enough to have bound the rule.
+     * Resolved per span for {@see buffer()}'s reason: built one provider before Prism's own boot.
      */
     private function lane(): ?SpanLane
     {
@@ -601,8 +498,8 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * The `prism.scrub` rules, or null when the client is not live enough to
-     * have bound them. Resolved per span for {@see buffer()}'s reason.
+     * The `prism.scrub` rules, or null when the client is not live enough to have bound them. Resolved
+     * per span for {@see buffer()}'s reason.
      */
     private function redactions(): ?RedactRules
     {
@@ -636,11 +533,9 @@ final class PrismSpanProcessor implements SpanProcessorInterface
     }
 
     /**
-     * A starting span's epoch nanoseconds.
-     *
-     * The SDK's own span exposes them directly; the interface only promises
-     * `toSpanData()`, which allocates an immutable snapshot. `onStart` runs for
-     * every span in the process, so the direct read is worth the `instanceof`.
+     * A starting span's epoch nanoseconds. The SDK's own span exposes them directly; the interface only
+     * promises `toSpanData()`, which allocates an immutable snapshot, and `onStart` runs for every span
+     * in the process, so the direct read earns its `instanceof`.
      */
     private function startNanos(ReadWriteSpanInterface $span): int
     {

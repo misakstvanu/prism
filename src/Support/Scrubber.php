@@ -10,28 +10,28 @@ use stdClass;
 /**
  * Redacts sensitive values before an event leaves the process (US-040).
  *
- * A secret must never make the trip to the console: the scrub happens at the
- * source, so a redacted value is never serialized, transmitted or stored. Every
+ * A secret must never make the trip to the console, so the scrub happens at the
+ * source: a redacted value is never serialized, transmitted or stored. Every
  * capture listener (US-042+) runs the structures it collects — request bodies,
- * query strings, headers, query bindings and job payloads — through {@see
- * scrub()} before buffering them.
+ * query strings, headers, query bindings, job payloads — through {@see scrub()}
+ * before buffering them.
  *
- * Matching is by key, **exact and case-insensitive**. That is why the default
+ * Matching is by key, **exact and case-insensitive**, which is why the default
  * list enumerates `password` and `password_confirmation` separately rather than
  * relying on one substring: exact matching is predictable and never
- * over-redacts a benign field that merely contains a sensitive word (a
+ * over-redacts a benign field merely containing a sensitive word (a
  * `password_strength` score, a `tokenized` flag). The list is additive through
  * config `prism.scrub`, so a host adds any app-specific field with no code.
  *
- * Redaction is recursive: it walks nested arrays and objects to any depth,
- * replacing a matched key's value — whatever its type — with {@see REDACTED}
- * while preserving the key, so the shape of the payload stays legible in the
- * console. Non-matching keys are copied through untouched.
+ * Recursive: it walks nested arrays and objects to any depth, replacing a
+ * matched key's value — whatever its type — with {@see REDACTED} while
+ * preserving the key, so the payload's shape stays legible in the console.
+ * Non-matching keys are copied through untouched.
  *
  * Registered as a container singleton by
- * {@see PrismServiceProvider::registerCapture()} with the
- * key set read once from config, so a listener resolves it once and reuses it on
- * every event rather than re-reading config on a hot path.
+ * {@see PrismServiceProvider::registerCapture()} with the key set read once from
+ * config, so a listener resolves it once and reuses it on every event rather
+ * than re-reading config on a hot path.
  */
 final class Scrubber
 {
@@ -66,9 +66,9 @@ final class Scrubber
 
     /**
      * Redact a structure, returning a scrubbed copy. Recurses through nested
-     * arrays and objects; a key matching the scrub list has its value replaced
-     * with {@see REDACTED} regardless of that value's type, so a whole nested
-     * secret (an array of tokens, a credentials object) is redacted wholesale.
+     * arrays and objects; a matched key's value is replaced with {@see REDACTED}
+     * whatever its type, so a whole nested secret (an array of tokens, a
+     * credentials object) goes wholesale.
      *
      * @param  array<array-key, mixed>  $data
      * @return array<array-key, mixed>

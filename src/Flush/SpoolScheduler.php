@@ -17,35 +17,32 @@ use Throwable;
  * Keeps exactly one {@see DrainSpoolJob} pending, and guarantees that whatever
  * reaches the {@see BatchSpool} is covered by one.
  *
- * Every terminal flush spools a batch and then calls {@see arm()}. Dispatching a
- * drain per flush would put the queue back where the inline send was — one round
- * trip per request — so the first caller to win a cache lock dispatches a single
- * delayed job and everyone else rides along with it. The lock *is* the "a job is
- * already queued" marker: it is held from dispatch until the job starts, and its
- * expiry (delay plus a grace period) is what re-arms a spool whose drain was lost
- * with its worker.
+ * Every terminal flush spools a batch and then calls {@see arm()}. A drain per
+ * flush would put the queue back where the inline send was — one round trip per
+ * request — so the first caller to win a cache lock dispatches a single delayed
+ * job and everyone else rides along. The lock *is* the "a job is already queued"
+ * marker: held from dispatch until the job starts, and its expiry (delay plus a
+ * grace period) re-arms a spool whose drain was lost with its worker.
  *
  * ## Why nothing is left behind
  *
- * The one rule that makes this safe is the order the drain job works in: it
- * {@see disarm()}s **before** it claims. Take any push P, and the first
- * {@see arm()} call A that follows it:
+ * The drain job {@see disarm()}s **before** it claims, and that is the whole
+ * guarantee. Take any push P and the first {@see arm()} call A after it:
  *
- *   - A wins the lock. It dispatches a drain, which necessarily claims after A,
+ *   - A wins the lock: it dispatches a drain, which necessarily claims after A,
  *     and therefore after P. P ships.
- *   - A loses the lock. Some drain D held it at the moment of A. D releases the
- *     lock only at the start of its own run, so D's release — and therefore D's
- *     claim, which comes after it — happens after A, and therefore after P. P
- *     ships.
+ *   - A loses the lock: some drain D held it at the moment of A, and D releases
+ *     only at the start of its own run, so D's release — and D's claim, which
+ *     follows it — happen after A, and therefore after P. P ships.
  *
- * Either way a batch that is on the spool has a claim still ahead of it. The
- * reverse order (claim, then release) opens the gap this closes: a push landing
- * between the claim and the release would find the marker still set, skip
- * arming, and sit there until unrelated traffic happened to arm the next drain.
+ * Either way a batch on the spool has a claim still ahead of it. The reverse
+ * order (claim, then release) opens the gap this closes: a push landing between
+ * the claim and the release would find the marker still set, skip arming, and sit
+ * there until unrelated traffic armed the next drain.
  *
- * The cost of that ordering is the opposite, harmless case: a push during a
- * drain's send window arms a second drain that may find the spool already empty.
- * A no-op drain is cheap; a stranded batch is not.
+ * The cost is the opposite, harmless case: a push during a drain's send window
+ * arms a second drain that may find the spool already empty. A no-op drain is
+ * cheap; a stranded batch is not.
  */
 final class SpoolScheduler
 {
@@ -58,12 +55,11 @@ final class SpoolScheduler
     ) {}
 
     /**
-     * Ensure a drain job is pending, dispatching one only if none is. Returns
-     * true when this call is the one that dispatched it.
-     *
-     * Called after the batch is on the spool, never before: a job armed ahead of
-     * the push could drain and finish before the push landed, leaving the batch
-     * with nothing scheduled to collect it.
+     * Ensure a drain job is pending, dispatching one only if none is. True when
+     * this call is the one that dispatched it. Called after the batch is on the
+     * spool, never before: a job armed ahead of the push could drain and finish
+     * before the push landed, leaving the batch with nothing scheduled to
+     * collect it.
      */
     public function arm(): bool
     {
@@ -96,8 +92,8 @@ final class SpoolScheduler
      * for why that order is the whole guarantee.
      *
      * The owner token is checked on release, so a job whose lock already expired
-     * (a worker that sat idle past the grace period, letting another producer arm
-     * a replacement) releases nothing and leaves the replacement pending.
+     * (a worker idle past the grace period, letting another producer arm a
+     * replacement) releases nothing and leaves the replacement pending.
      */
     public function disarm(?string $owner): void
     {
@@ -134,8 +130,8 @@ final class SpoolScheduler
 
     /**
      * Seconds a batch waits on the spool before the drain runs. The window is
-     * what coalesces many requests into one ingest POST; zero drains as soon as
-     * a worker picks the job up.
+     * what coalesces many requests into one ingest POST; zero drains as soon as a
+     * worker picks the job up.
      */
     private function delay(): int
     {
@@ -144,9 +140,9 @@ final class SpoolScheduler
 
     /**
      * How long the pending marker is held: the debounce window plus a grace
-     * period covering the time a job waits for a free worker. Once it lapses the
-     * next push arms a replacement, so a drain lost to a restarted or overloaded
-     * worker cannot strand the spool.
+     * period covering the wait for a free worker. Once it lapses the next push
+     * arms a replacement, so a drain lost to a restarted or overloaded worker
+     * cannot strand the spool.
      */
     private function holdSeconds(): int
     {

@@ -16,39 +16,23 @@ use Misakstvanu\Prism\Jobs\DrainSpoolJob;
 use Throwable;
 
 /**
- * A shared, cache-backed holding area for finished batches, so the process that
- * produced telemetry never has to ship it (US-038, `spool` flush strategy).
+ * A shared, cache-backed holding area for finished batches, so the process that produced telemetry never
+ * ships it (US-038, `spool` flush strategy). The inline strategies send from whichever process filled the
+ * buffer: a round trip to the ingest host per request, and an outright deadlock when that host is served by
+ * the very process doing the sending — a single-worker dev server answering its own POST. Here a terminal
+ * flush writes its envelope and returns at once, and one debounced {@see DrainSpoolJob} ships the
+ * accumulation ({@see SpoolScheduler} guarantees exactly one is pending).
  *
- * The inline flush strategies send from whichever process filled the buffer. That
- * costs every request a round trip to the ingest host, and it deadlocks outright
- * when the ingest host is served by the very process doing the sending — a
- * single-worker dev server answering its own POST. Spooling breaks that: a
- * terminal flush writes its envelope here and returns immediately, and one
- * debounced {@see DrainSpoolJob} ships everything that accumulated
- * ({@see SpoolScheduler} guarantees exactly one is pending).
- *
- * Two invariants make a concurrent reader safe, and both matter:
- *
- *   - **Only whole units are spooled.** {@see push()} is reached only from a
- *     terminal flush (the app's `terminating` callback, a job's terminal queue
- *     event, a scheduled task's terminal event), so an envelope that lands here
- *     describes a request, job or task that has already finished. Nothing
- *     half-produced is ever visible.
- *
- *   - **Only whole envelopes are visible.** The payload is written under its own
- *     key *before* that key is appended to the index, and the index is the only
- *     way a reader learns the key exists. A drain can therefore never read a
- *     segment that is still being written, no matter how the two interleave.
- *
- * The index — a short list of segment keys — is guarded by a cache lock, which
- * every append and every claim takes. Payloads stay outside that critical
- * section: the lock is held for a read-append-write of a handful of strings, not
- * for megabytes of events, so producers barely contend even under load.
- *
- * Everything degrades rather than throws. A store without atomic locks (the one
- * thing this cannot work without), a lock that cannot be acquired inside its
- * wait, an unencodable envelope — each returns false so {@see Flusher} falls back
- * to sending the batch itself, and the batch is never dropped on the floor.
+ * Two invariants make a concurrent reader safe. **Only whole units are spooled**: {@see push()} is reached
+ * only from a terminal flush (the app's `terminating` callback, a job's or a scheduled task's terminal
+ * event), so nothing half-produced is ever visible. **Only whole envelopes are visible**: the payload is
+ * written under its own key *before* that key joins the index, a reader's only route to it, so a drain can
+ * never read a segment still being written, however the two interleave. The index — a short list of segment
+ * keys — is guarded by a cache lock every append and claim takes; payloads stay outside it, so the lock
+ * covers a read-append-write of a few strings, not megabytes of events, and producers barely contend even
+ * under load. Everything degrades rather than throws: no atomic locks (the one hard requirement), a lock
+ * not taken inside its wait, an unencodable envelope — each returns false, so {@see Flusher} sends the
+ * batch itself and it is never dropped on the floor.
  */
 final class BatchSpool
 {
@@ -67,11 +51,9 @@ final class BatchSpool
     ) {}
 
     /**
-     * Whether the configured cache store can back a spool at all. Atomic locks
-     * are the one hard requirement — without them two producers could interleave
-     * a read-modify-write of the index and lose a batch — so a store that has
-     * none (or a store name that does not resolve) reports unusable and the
-     * caller keeps its existing send path.
+     * Whether the configured cache store can back a spool at all. Atomic locks are the one hard requirement
+     * — without them two producers could interleave a read-modify-write of the index and lose a batch — so a
+     * store with none, or an unresolvable name, reports unusable and the caller keeps its existing send path.
      */
     public function usable(): bool
     {
@@ -79,11 +61,10 @@ final class BatchSpool
     }
 
     /**
-     * Whether a drain job could actually run later. A spool is only ever emptied
-     * by a queued job, so on the `sync` driver the "deferred" drain would run
-     * inline inside the terminating callback that spooled it — the blocking send
-     * spooling exists to avoid. Reported by {@see CheckCommand} and honoured by
-     * {@see Flusher}, which sends normally instead.
+     * Whether a drain job can run later. A spool is only emptied by a queued job, so on the `sync` driver
+     * the "deferred" drain runs inline in the terminating callback that spooled it — the blocking send
+     * spooling exists to avoid. Reported by {@see CheckCommand}, honoured by {@see Flusher}, which sends
+     * normally instead.
      */
     public function drainable(): bool
     {
@@ -97,9 +78,8 @@ final class BatchSpool
     }
 
     /**
-     * Spool one finished batch. Returns false when it could not be stored, which
-     * is the caller's cue to send it inline instead — a false here must never
-     * mean a discarded batch.
+     * Spool one finished batch. False when it could not be stored — the caller's cue to send it inline
+     * instead; a false here must never mean a discarded batch.
      *
      * @param  array<string, mixed>  $envelope  A complete wire envelope.
      * @param  int  $attempts  Failed sends this envelope has already survived.
@@ -115,9 +95,8 @@ final class BatchSpool
 
         $key = self::SEGMENT_PREFIX.Str::uuid()->toString();
 
-        // Written before it is indexed: the index is the only path a reader has
-        // to this key, so publishing the key last makes a partially-written
-        // payload unreachable by construction.
+        // Written before it is indexed: the index is a reader's only path to this key, so
+        // publishing the key last makes a partially-written payload unreachable by construction.
         $repository->put($key, $encoded, $this->ttl());
 
         $max = $this->maxBatches();
@@ -128,9 +107,8 @@ final class BatchSpool
         $indexed = $this->withIndex(static function (array $index) use ($key, $max, &$evicted): array {
             $index[] = $key;
 
-            // Past the cap the oldest batches go rather than the newest: when the
-            // spool is backing up the ingest host is unreachable, and fresh
-            // telemetry is worth more than a stale batch nobody could deliver.
+            // Past the cap the oldest go, not the newest: a backing-up spool means an unreachable
+            // ingest host, and fresh telemetry beats a stale batch nobody could deliver.
             if ($max > 0 && count($index) > $max) {
                 $overflow = count($index) - $max;
                 $evicted = array_slice($index, 0, $overflow);
@@ -141,15 +119,13 @@ final class BatchSpool
         });
 
         if (! $indexed) {
-            // The payload is unreachable without an index entry, so drop it now
-            // rather than leaving it to expire on its own.
+            // Unreachable without an index entry, so drop it now rather than leave it to expire.
             $repository->forget($key);
 
             return false;
         }
 
-        // Deleted outside the lock — they are already unreachable, so nothing
-        // waits on this.
+        // Deleted outside the lock — they are already unreachable, so nothing waits on this.
         foreach ($evicted as $stale) {
             $repository->forget($stale);
         }
@@ -162,13 +138,9 @@ final class BatchSpool
     }
 
     /**
-     * Take everything spooled so far, atomically. The index is read and cleared
-     * inside the same lock every {@see push()} takes, so a claim either sees a
-     * batch or does not — it can never see half of one, and two drains running at
-     * once cannot both take the same batch.
-     *
-     * Payloads are read after the lock is released: once the index is cleared the
-     * keys are private to this claim, so nothing else can reach them.
+     * Take everything spooled so far, atomically. The index is read and cleared inside the same lock every
+     * {@see push()} takes, so a claim sees a batch or none of it, and two drains cannot both take the same
+     * batch. Payloads are read after the lock is released: a cleared index makes those keys private here.
      *
      * @return list<SpooledBatch>
      */
@@ -210,10 +182,9 @@ final class BatchSpool
     }
 
     /**
-     * Put batches the drain could not deliver back on the spool, one attempt
-     * older. A batch that has exhausted `max_attempts` is dropped and logged
-     * instead — a permanently unreachable endpoint must not leave the queue
-     * cycling the same payload forever.
+     * Put batches the drain could not deliver back on the spool, one attempt older. One that has exhausted
+     * `max_attempts` is dropped and logged instead — a permanently unreachable endpoint must not leave the
+     * queue cycling one payload forever.
      *
      * @param  list<SpooledBatch>  $batches
      * @return int Number of batches actually re-spooled.
@@ -250,9 +221,8 @@ final class BatchSpool
     }
 
     /**
-     * How many batches are waiting. A lock-free read used for reporting
-     * ({@see CheckCommand}), so a count taken while a push is in flight may be
-     * one behind — never a reason to hold the lock.
+     * How many batches are waiting. A lock-free read, for reporting ({@see CheckCommand}): a count
+     * taken while a push is in flight may be one behind — never a reason to hold the lock.
      */
     public function pending(): int
     {
@@ -260,8 +230,8 @@ final class BatchSpool
     }
 
     /**
-     * Discard everything spooled. Not part of the flush path — it exists for
-     * tests and for an operator who wants to abandon an undeliverable backlog.
+     * Discard everything spooled. Not part of the flush path — for tests, and for an operator
+     * abandoning an undeliverable backlog.
      */
     public function purge(): void
     {
@@ -285,13 +255,10 @@ final class BatchSpool
     }
 
     /**
-     * Run $mutator against the current index under the index lock and store what
-     * it returns. The lock is what makes a concurrent append and claim safe; the
-     * body is deliberately tiny (a list of key strings) so the wait stays short.
-     *
-     * Returns false when the lock could not be taken inside its wait, or when the
-     * store cannot lock at all — the caller then falls back rather than risking a
-     * lost or duplicated batch.
+     * Run $mutator against the current index under the index lock and store what it returns. The lock is
+     * what makes a concurrent append and claim safe; the body is deliberately tiny (a list of key strings)
+     * so the wait stays short. False when the lock could not be taken inside its wait, or the store cannot
+     * lock at all — the caller falls back rather than risk a lost or duplicated batch.
      *
      * @param  callable(list<string>): list<string>  $mutator
      */
@@ -319,8 +286,7 @@ final class BatchSpool
                 return true;
             });
         } catch (Throwable $e) {
-            // A lock timeout, or any store fault. Both mean "not spooled", which
-            // the caller turns into an inline send.
+            // A lock timeout, or any store fault: both mean "not spooled", so the caller sends inline.
             Log::debug('Prism spool index unavailable: '.$e->getMessage());
 
             return false;
@@ -328,9 +294,8 @@ final class BatchSpool
     }
 
     /**
-     * The current index, normalised. Config and cache are untyped, so a value
-     * that is not a list of strings is treated as an empty spool rather than
-     * being coerced into keys nobody wrote.
+     * The current index, normalised. Config and cache are untyped, so a value that is not a list of
+     * strings reads as an empty spool rather than being coerced into keys nobody wrote.
      *
      * @return list<string>
      */
@@ -353,10 +318,9 @@ final class BatchSpool
     }
 
     /**
-     * Encode one batch for storage. JSON rather than PHP serialization so a
-     * segment written by one process is readable by another running a different
-     * build of the host, and so an unencodable payload fails here — before it is
-     * indexed — instead of at drain time.
+     * Encode one batch for storage. JSON, not PHP serialization, so one process's segment is readable by
+     * another on a different build of the host; an unencodable payload fails before indexing, not at drain
+     * time.
      *
      * @param  array<string, mixed>  $envelope
      */

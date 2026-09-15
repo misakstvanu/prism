@@ -13,67 +13,52 @@ use Misakstvanu\Prism\Support\Text;
 use Throwable;
 
 /**
- * What a job was asked to do, held until the record describing it is written.
+ * What a job was asked to do, held until the record describing it is written — the gap
+ * {@see BodyRecorder} fills for an HTTP exchange, one signal along. The capture engine has no answer
+ * here: its `queued-job` and `job-attempt` records carry a job's name, id, queue, connection and
+ * outcome and nothing about its *arguments*, so without this the `payload` column the failed-job
+ * screen draws a panel from would be empty for every row a real install writes. A **holder, not a
+ * listener**, for {@see BodyRecorder}'s reason — the payload is in hand at the framework's queue
+ * events, the record it belongs to written later (`queued-job` at `JobQueued`, `job-attempt` when the
+ * worker has finished) — and {@see PrismIngest::stampJobPayload()} closes the gap. Four rules decide
+ * what is held, each a way of not lying:
  *
- * **The capture engine has no answer here, which is why this class exists** —
- * the same gap {@see BodyRecorder} fills for an HTTP
- * exchange, one signal along. Nightwatch's `queued-job` and `job-attempt`
- * records carry the job's name, id, queue, connection and outcome and nothing
- * about its *arguments*; Prism's `jobs` table has a `payload` column and the
- * failed-job screen draws a panel from it, so without this the panel is empty
- * for every row a real install ever writes.
- *
- * It is a **holder, not a listener**, for {@see BodyRecorder}'s
- * reason: the payload is in hand while the framework raises its queue events,
- * and the record it belongs to is written later — a `queued-job` record at
- * `JobQueued`, a `job-attempt` record when the worker has finished running it.
- * {@see PrismIngest::stampJobPayload()} is what closes the gap.
- *
- * Four rules decide what is held, and each of them is a way of not lying:
- *
- *   - **Keyed by the job id the sensor itself uses.** Both of upstream's job
- *     sensors identify a job as `payload['nightwatch']['job_id'] ?? payload['uuid']`,
- *     and {@see keyFor()} is that expression restated — so the key this holds a
- *     payload under and the `uuid` the translated event carries cannot name two
- *     different jobs. A payload with neither is not held at all: an entry
- *     nothing can ask for is a leak, not a capture.
- *   - **Scrubbed by key, never as text.** The payload is a JSON document with
- *     keys, so it meets the {@see Scrubber} exactly as a JSON request body
- *     does. It is deliberately *not* run through
- *     {@see RedactRules::redactText()} afterwards: `data.command` is a
- *     serialised PHP object whose string lengths are part of its syntax, so
- *     rewriting a value inside it would produce a document that no longer
- *     parses — a corruption where the honest answer is that a key nobody named
- *     was not redacted. A host that wants a job's constructor argument scrubbed
- *     names the property in `prism.scrub`; the serialised blob is beyond any
- *     rule that works on keys.
- *   - **Capped in bytes, and it says when it cut.** {@see Text::truncate()}, so
- *     the cut never lands inside a multi-byte character and the value stays
- *     insertable; the marker is appended after the cut, so the cap reads as the
- *     number the host configured.
- *   - **Read once.** {@see take()} releases the entry it answers, because a
- *     payload belongs to exactly one record and a worker process runs jobs
- *     until it is told to stop. {@see LIMIT} is the second half of that: a job
- *     that was queued and whose record never arrived — a dispatch that threw
- *     between the two events, an execution the sampler discarded — would
- *     otherwise sit here forever.
+ *   - **Keyed by the job id the sensor itself uses**: both of upstream's job sensors identify a job
+ *     as `payload['nightwatch']['job_id'] ?? payload['uuid']`, restated in {@see keyFor()}, so the
+ *     key a payload is held under and the `uuid` the translated event carries cannot name two
+ *     different jobs. A payload with neither is not held at all: an entry nothing can ask for is a
+ *     leak, not a capture.
+ *   - **Scrubbed by key, never as text**: a JSON document with keys, so it meets the {@see Scrubber}
+ *     exactly as a JSON request body does, and deliberately *not* {@see RedactRules::redactText()}
+ *     after — `data.command` is a serialised PHP object whose string lengths are part of its syntax,
+ *     so rewriting a value inside it produces a document that no longer parses, a corruption where
+ *     the honest answer is that a key nobody named was not redacted. A host that wants a job's
+ *     constructor argument scrubbed names the property in `prism.scrub`; the serialised blob is
+ *     beyond any rule that works on keys.
+ *   - **Capped in bytes, and it says when it cut**: {@see Text::truncate()}, so the cut never lands
+ *     inside a multi-byte character and the value stays insertable; the marker is appended after the
+ *     cut, so the cap reads as the number the host configured.
+ *   - **Read once**: {@see take()} releases the entry it answers, because a payload belongs to
+ *     exactly one record and a worker process runs jobs until it is told to stop. {@see LIMIT} is the
+ *     second half — a job queued whose record never arrived (a dispatch that threw between the two
+ *     events, an execution the sampler discarded) would otherwise sit here forever.
  */
 final class JobPayloadRecorder
 {
     /**
      * How many unread payloads may be held at once.
      *
-     * Entries are released as they are read, so in a healthy process at most
-     * one or two are ever pending. The bound is for the unhealthy one: a
-     * long-lived worker that dispatches jobs whose records never arrive must
-     * not grow a map for the life of the process. The oldest is dropped, which
-     * is the entry least likely to still be claimed.
+     * Entries are released as they are read, so a healthy process has at most
+     * one or two pending; the bound is for the unhealthy one, a long-lived
+     * worker dispatching jobs whose records never arrive, which must not grow a
+     * map for the life of the process. The oldest is dropped, being the entry
+     * least likely to still be claimed.
      */
     private const LIMIT = 64;
 
     /**
-     * Payloads by job id, insertion-ordered (PHP arrays are), which is what
-     * makes "drop the oldest" a single `array_key_first`.
+     * Payloads by job id, insertion-ordered (PHP arrays are), which makes "drop
+     * the oldest" a single `array_key_first`.
      *
      * @var array<string, string>
      */
@@ -88,9 +73,9 @@ final class JobPayloadRecorder
      * Hold one job's payload, as the framework serialised it.
      *
      * Guarded end to end: encoding a client-supplied structure is not worth a
-     * host's request or a worker's job, and a failure leaves nothing held,
-     * which reads on the screen exactly as "no payload was captured" — the
-     * honest answer.
+     * host's request or a worker's job, and a failure leaves nothing held, which
+     * reads on the screen exactly as "no payload was captured" — the honest
+     * answer.
      *
      * @param  array<array-key, mixed>  $payload
      */
@@ -133,8 +118,8 @@ final class JobPayloadRecorder
      * The payload held for one job, released as it is answered.
      *
      * Null rather than an empty string when there is none, so the ingest can
-     * leave the key off the event entirely and the column keeps its own
-     * `DEFAULT ''` rather than being told an empty payload was observed.
+     * leave the key off the event and the column keeps its own `DEFAULT ''`
+     * rather than being told an empty payload was observed.
      */
     public function take(string $key): ?string
     {
@@ -198,8 +183,8 @@ final class JobPayloadRecorder
     /**
      * Make a payload safe to insert and bound its cost.
      *
-     * {@see Text::clean()} first, because the cap is in bytes and the cut has
-     * to happen on a string whose bytes are already valid UTF-8.
+     * {@see Text::clean()} first: the cap is in bytes and the cut has to happen
+     * on a string whose bytes are already valid UTF-8.
      */
     private function cap(string $value): string
     {

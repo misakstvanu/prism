@@ -14,9 +14,9 @@ namespace Misakstvanu\Prism\Support;
  * dispatches jobs but never processes them pays nothing for polling; the same
  * signal seeds the replica-type inference (US-051).
  *
- * The check reads `$_SERVER['argv']`, which is populated for a CLI process and
- * absent under php-fpm/web — so a web request answers false without any
- * argv-parsing, and a worker answers true from the command it was launched with.
+ * The check reads `$_SERVER['argv']`, populated for a CLI process and absent
+ * under php-fpm/web: a web request answers false with no argv-parsing, a worker
+ * answers true from the command it was launched with.
  */
 final class Runtime
 {

@@ -16,53 +16,31 @@ use Symfony\Component\Mime\Address;
 use Throwable;
 
 /**
- * Who an outbound message was addressed to, held until the record describing it
- * is written.
+ * Who an outbound message was addressed to, held until the record describing it is written — the gap {@see
+ * BodyRecorder} fills for an HTTP exchange and {@see JobPayloadRecorder} for a job's arguments. The capture
+ * engine has none: Nightwatch's `mail` record carries the mailer, mailable class, subject and three
+ * *counts*, its `notification` record the channel and class, and neither names a recipient, which no count
+ * answers for. A **holder, not a listener**, for {@see BodyRecorder}'s reason — addresses are in hand at
+ * `MessageSending` / `NotificationSending` and the record follows later, from upstream's own listener on
+ * the matching `…Sent` event, so {@see PrismIngest::stampRecipients()} closes the gap.
  *
- * **The capture engine has no answer here, which is why this class exists** —
- * the same gap {@see BodyRecorder} fills for an HTTP exchange and
- * {@see JobPayloadRecorder} for a job's arguments. Nightwatch's `mail` record
- * carries the mailer, the mailable class, the subject and three *counts*, and
- * its `notification` record carries the channel and the class; neither says who
- * anything went to. "Did the receipt reach the customer" is the question a mail
- * screen is opened for, and a count of three cannot answer it.
- *
- * It is a **holder, not a listener**, for {@see BodyRecorder}'s reason: the
- * addresses are in hand while the framework raises `MessageSending` /
- * `NotificationSending`, and the record they belong to is written later, from
- * upstream's own listener on the matching `…Sent` event.
- * {@see PrismIngest::stampRecipients()} is what closes the gap.
- *
- * **The match rule is the whole trap.** A record carries no id of any kind —
- * unlike a job, which has one both sides agree on — so the only thing the
- * holder and the record share is the mailable / notification **class**. Within
- * one execution the framework sends synchronously and in order (`Sending` then
- * `Sent`, one pair at a time), so a per-class FIFO consumed in order pairs each
- * record with its own addresses: two invoices of one class in one request get
- * one recipient list each, in the order they were sent.
- *
- * Four rules decide what is held, and each of them is a way of not lying:
- *
- *   - **A notification's own mail is not held as mail.** Upstream's mail sensor
- *     returns null for a message carrying `__laravel_notification`, so no `mail`
- *     record follows one — an entry pushed for it would never be claimed and
- *     would mis-pair the next real send of that class. The same test, restated,
- *     is what keeps the two signals apart.
- *   - **Keyed the way the record's own `class` field is written**, so the two
- *     sides cannot drift: upstream restricts it to 255 bytes and strips the
- *     `@anonymous\0…` suffix PHP gives an anonymous class, and
- *     {@see keyFor()} / {@see notificationClass()} restate both.
- *   - **Addresses are scrubbed, and the list keeps its length.** An address is
- *     replaced by {@see Scrubber::REDACTED} rather than dropped, so the list
- *     still agrees with the `to` / `cc` / `bcc` counts stored beside it. The
- *     keys that redact one are the list's own name and {@see ADDRESS_KEY} — the
- *     two names a host reaches for when it puts recipients on `prism.scrub`.
- *   - **Read once.** {@see take()} releases the entry it answers, because a
- *     list belongs to exactly one record and a worker process sends mail until
- *     it is told to stop. {@see LIMIT} is the second half of that: a send whose
- *     record never arrived — a listener that returned false from
- *     `MessageSending`, an execution the sampler discarded — would otherwise
- *     sit here for the life of the process.
+ * **The match rule is the whole trap.** A record carries no id of any kind (a job has one both sides agree
+ * on), so holder and record share only the mailable / notification **class**. Within one execution the
+ * framework sends synchronously and in order (`Sending` then `Sent`, one pair at a time), so a per-class FIFO
+ * consumed in order gives two sends of one class in one request a list each. Four rules decide what is held:
+ *   - **A notification's own mail is not held as mail**, restating upstream's own test: its mail sensor
+ *     returns null for a message carrying `__laravel_notification`, so no `mail` record follows one, and
+ *     an entry pushed for it would never be claimed and would mis-pair that class's next real send.
+ *   - **Keyed the way the record's `class` field is written**, so the two cannot drift: upstream cuts it to
+ *     255 bytes and strips PHP's `@anonymous\0…` suffix, both restated by {@see keyFor()} / {@see
+ *     notificationClass()}.
+ *   - **Scrubbed, and the list keeps its length**: an address becomes {@see Scrubber::REDACTED}, never
+ *     dropped, so it still agrees with the `to` / `cc` / `bcc` counts stored beside it; the list's own
+ *     name or {@see ADDRESS_KEY} redacts one — the two names a host puts recipients under on `prism.scrub`.
+ *   - **Read once**: {@see take()} releases the entry it answers, a list belonging to exactly one record
+ *     and a worker process sending mail until told to stop. {@see LIMIT} is the second half — a send whose
+ *     record never arrived (a listener returning false from `MessageSending`, an execution the sampler
+ *     discarded) would otherwise sit here for the life of the process.
  */
 final class RecipientRecorder
 {
@@ -73,12 +51,9 @@ final class RecipientRecorder
     public const NOTIFICATION = 'notification';
 
     /**
-     * The scrub key that redacts an address wherever one is stored.
-     *
-     * A recipient is an email address in the channel a host is most likely to
-     * care about, and `email` is the name they would put on the list. The
-     * list's own name (`to`, `cc`, `bcc`, `recipients`) answers as well, so
-     * either way of asking works.
+     * The scrub key that redacts an address wherever one is stored: a recipient is an email address in the
+     * channel a host is most likely to care about, so `email` is the name they would put on the list, and
+     * the list's own name (`to`, `cc`, `bcc`, `recipients`) answers as well.
      */
     private const ADDRESS_KEY = 'email';
 
@@ -86,18 +61,14 @@ final class RecipientRecorder
     private const MAX_ADDRESSES = 50;
 
     /**
-     * How many unclaimed entries may be held per class.
-     *
-     * Entries are released as they are read, so in a healthy process at most
-     * one is ever pending. The bound is for the unhealthy one — a send that
-     * raised `Sending` and never `Sent` because a listener refused it — where
-     * the oldest is dropped, being the entry least likely to still be claimed.
+     * How many unclaimed entries may be held per class. Entries are released as read, so at most one is
+     * pending in a healthy process; the bound is for the unhealthy one — a send that raised `Sending` and
+     * never `Sent` because a listener refused it — dropping the oldest, least likely to still be claimed.
      */
     private const LIMIT = 64;
 
     /**
      * Columns to stamp, by `"{signal}|{class}"`, each a FIFO in send order.
-     *
      * @var array<string, list<array<string, string>>>
      */
     private array $pending = [];
@@ -108,11 +79,8 @@ final class RecipientRecorder
     ) {}
 
     /**
-     * Hold the three address lists of one outbound message.
-     *
-     * Guarded end to end: reading a mime message is not worth a host's request,
-     * and a failure leaves nothing held, which reads on the screen exactly as
-     * "no recipients were captured" — the honest answer.
+     * Hold the three address lists of one outbound message. Guarded end to end: reading a mime message is
+     * not worth a host's request, and a failure leaves nothing held, which reads as no recipients captured.
      */
     public function recordMail(MessageSending $event): void
     {
@@ -120,9 +88,8 @@ final class RecipientRecorder
             return;
         }
 
-        // A notification that went out over the mail channel produces no `mail`
-        // record at all — upstream's sensor refuses it on this very test — so
-        // an entry pushed here could only ever be claimed by the wrong message.
+        // A notification over the mail channel produces no `mail` record — upstream's sensor refuses it on
+        // this very test — so an entry pushed here could only be claimed by the wrong message.
         if (isset($event->data['__laravel_notification'])) {
             return;
         }
@@ -145,11 +112,8 @@ final class RecipientRecorder
     }
 
     /**
-     * Hold what one notification was addressed to, for one channel.
-     *
-     * Per channel, because a notification sent over mail and Slack is two
-     * records with two answers — the routed address of a Slack delivery is a
-     * webhook, not the email beside it.
+     * Hold what one notification was addressed to, per channel: one sent over mail and Slack is two
+     * records with two answers, a Slack delivery routing to a webhook, not the email beside it.
      */
     public function recordNotification(NotificationSending $event): void
     {
@@ -170,13 +134,9 @@ final class RecipientRecorder
     }
 
     /**
-     * The columns held for the next record of this signal and class, released
-     * as they are answered.
-     *
-     * Null rather than an empty array when there is none, so the ingest can
-     * leave every key off the event and the columns keep their own
-     * `DEFAULT ''` rather than being told an empty list was observed.
-     *
+     * The columns held for the next record of this signal and class, released as they are answered. Null
+     * rather than an empty array when there is none, so the ingest leaves every key off the event and the
+     * columns keep their own `DEFAULT ''` rather than being told an empty list was observed.
      * @return array<string, string>|null
      */
     public function take(string $signal, string $class): ?array
@@ -203,11 +163,9 @@ final class RecipientRecorder
     }
 
     /**
-     * The key one signal's entries are held under.
-     *
-     * The class is restricted to 255 bytes because upstream writes it through
-     * `Nightwatch\Types\Str::tinyText()`, and a key that did not match the
-     * record's own field would hold an entry nothing could ever claim.
+     * The key one signal's entries are held under, the class cut to 255 bytes because upstream writes it
+     * through `Nightwatch\Types\Str::tinyText()`; a key not matching the record's own field would hold an
+     * entry nothing could ever claim.
      */
     public static function keyFor(string $signal, string $class): string
     {
@@ -215,12 +173,9 @@ final class RecipientRecorder
     }
 
     /**
-     * The class name upstream's notification sensor records.
-     *
-     * An anonymous class is `Some\Base@anonymous\0/path/to/file.php:12$0` in
-     * PHP; upstream keeps the part before the NUL byte, and so does this, or
-     * the key and the record's `class` would name the same notification
-     * differently on every request.
+     * The class name upstream's notification sensor records. PHP names an anonymous class
+     * `Some\Base@anonymous\0/path/to/file.php:12$0`; upstream keeps the part before the NUL byte, and so does
+     * this, or the key and the record's `class` would name one notification differently on every request.
      */
     public static function notificationClass(mixed $notification): string
     {
@@ -240,9 +195,8 @@ final class RecipientRecorder
     }
 
     /**
-     * The mailable class upstream's mail sensor records — the key Laravel puts
-     * on the message data, and an empty string for a raw `Mail::raw()` send,
-     * which is exactly what the record carries for one.
+     * The mailable class upstream's mail sensor records — the key Laravel puts on the message data, and an
+     * empty string for a raw `Mail::raw()` send, which is what the record carries for one.
      */
     private function mailableClass(MessageSending $event): string
     {
@@ -253,14 +207,10 @@ final class RecipientRecorder
     }
 
     /**
-     * Where this notification's channel routed, as a list of addresses.
-     *
-     * `routeNotificationFor()` is the framework's own answer and is whatever the
-     * notifiable makes it: a string, a list, an `email => name` map, or an
-     * object no address can be read from (the `database` channel routes to a
-     * relation). Anything unreadable contributes nothing rather than a made-up
-     * value, and a notifiable that throws leaves the list empty.
-     *
+     * Where this notification's channel routed, as a list of addresses. `routeNotificationFor()` is the
+     * framework's own answer, whatever the notifiable makes it: a string, a list, an `email => name` map, or
+     * an object no address can be read from (the `database` channel routes to a relation). Anything
+     * unreadable contributes nothing rather than a made-up value; a notifiable that throws leaves it empty.
      * @return list<string>
      */
     private function routed(NotificationSending $event): array
@@ -283,12 +233,8 @@ final class RecipientRecorder
     }
 
     /**
-     * One routing answer as a flat list of candidate addresses.
-     *
-     * A string key IS the address — `['a@b.test' => 'Ada']` is the shape
-     * `MailChannel` reads, where the value is the display name — so the key
-     * wins wherever there is one.
-     *
+     * One routing answer as a flat list of candidate addresses. A string key IS the address, so it wins
+     * wherever there is one (`['a@b.test' => 'Ada']`, the shape `MailChannel` reads, value = display name).
      * @return list<mixed>
      */
     private function flatten(mixed $route): array
@@ -307,12 +253,9 @@ final class RecipientRecorder
     }
 
     /**
-     * One address list, scrubbed, capped and made insertable.
-     *
-     * A redacted list keeps its length: the `mail` table stores the counts
-     * beside these names, and a list shorter than its own count would read as
-     * a message that went to fewer people than it did.
-     *
+     * One address list, scrubbed, capped and made insertable. A redacted list keeps its length: the `mail`
+     * table stores the counts beside these names, and a shorter list would read as a message that went to
+     * fewer people than it did.
      * @param  iterable<mixed>  $values
      * @return list<string>
      */
@@ -350,9 +293,8 @@ final class RecipientRecorder
             return $value;
         }
 
-        // `Illuminate\Mail\Mailables\Address` and anything else shaped like it:
-        // named rather than type-hinted, so the package needs no dependency on
-        // a class a host may route through and may not.
+        // `Illuminate\Mail\Mailables\Address` and anything shaped like it, named rather than type-hinted
+        // so the package needs no dependency on a class a host may or may not route through.
         if (is_object($value)) {
             foreach (['address', 'email'] as $property) {
                 /** @var mixed $candidate */
@@ -368,12 +310,10 @@ final class RecipientRecorder
     }
 
     /**
-     * The model a notification was addressed to, as `Class#id`.
-     *
-     * An on-demand notifiable (`Notification::route(…)`) has no key and reads as
-     * its class alone — a `#` with nothing after it would claim an identity that
-     * does not exist. Deliberately not an address: an address is what the
-     * `recipients` column beside it holds, and the scrub list governs that one.
+     * The model a notification was addressed to, as `Class#id`. An on-demand notifiable
+     * (`Notification::route(…)`) has no key and reads as its class alone — a bare `#` would claim an
+     * identity that does not exist. Deliberately not an address: that is the `recipients` column beside
+     * it, which the scrub list governs.
      */
     private function notifiable(mixed $notifiable): string
     {
@@ -401,7 +341,6 @@ final class RecipientRecorder
 
     /**
      * Hold one entry, oldest first, bounded per class.
-     *
      * @param  array<string, string>  $columns
      */
     private function push(string $signal, string $class, array $columns): void
@@ -416,12 +355,8 @@ final class RecipientRecorder
     }
 
     /**
-     * A structure as its column stores it.
-     *
-     * The same flags every other JSON column is written with, so a value that
-     * cannot be encoded whole is stored as much of itself as encodes rather
-     * than costing the message its whole entry.
-     *
+     * A structure as its column stores it, on the same flags every other JSON column uses, so a value that
+     * cannot be encoded whole stores as much of itself as encodes rather than costing the message its entry.
      * @param  array<array-key, mixed>  $value
      */
     private function encode(array $value): string

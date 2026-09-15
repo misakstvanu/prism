@@ -18,90 +18,53 @@ use Misakstvanu\Prism\Support\Scrubber;
 use Symfony\Component\HttpFoundation\HeaderBag;
 
 /**
- * `prism.scrub` said in the capture engine's vocabulary (US-011).
+ * `prism.scrub` said in the capture engine's vocabulary (US-011). The list and {@see Scrubber}'s verdict on a
+ * name are unchanged, only the *where* moved: the old client's listeners are gone, so the list is translated
+ * onto `laravel/nightwatch`'s typed record + `redact*` callback per signal. Unlike the reject callbacks
+ * ({@see RejectRules}) these **always run** and **mutate rather than short-circuit**: nothing dropped, no
+ * per-execution figure moved. Two halves, like every `nightwatch.*` derivation here:
+ *   - **The config keys** `redact_payload_fields` / `redact_headers` from `prism.scrub`
+ *     ({@see payloadFields()}, {@see headerNames()}), snapshotted into a `SensorManager` by upstream's request
+ *     sensor during Nightwatch's `register()` — so in a real install, where `laravel/nightwatch` sorts first,
+ *     the write alone is read by nobody and {@see PrismServiceProvider} pushes them onto the built sensor.
+ *   - **The callbacks** below: everything that is not a request field, plus the request again from a seam
+ *     no provider ordering can miss.
  *
- * A host still writes one list of sensitive field names under `prism.scrub`,
- * and {@see Scrubber} is still what decides whether a name is one of them. What
- * changed is where the redaction happens: the old client scrubbed the
- * structures its own listeners had collected, and there are no such listeners
- * left. `laravel/nightwatch` builds a typed record per signal and offers a
- * `redact*` callback per record type, so this class is the one place that
- * translation happens — one list, every signal, one file to read when a value
- * turns up in the console that should never have left the process.
- *
- * Unlike the reject callbacks ({@see RejectRules}) these **always run** and
- * they **mutate rather than short-circuit**: the record is still recorded, and
- * only the field carrying the secret is replaced. That is why redaction has
- * none of rejection's counter problem — nothing is dropped, so no per-execution
- * figure moves.
- *
- * Two halves, for the same reason every other `nightwatch.*` derivation in this
- * package has two:
- *
- *   - **The config keys** `redact_payload_fields` and `redact_headers` are
- *     derived from `prism.scrub` ({@see payloadFields()}, {@see headerNames()}),
- *     which is what upstream's own request sensor reads. Those are snapshotted
- *     into a `SensorManager` during Nightwatch's `register()`, so in a real
- *     install — where `laravel/nightwatch` sorts first — the write alone is read
- *     by nobody, and {@see PrismServiceProvider} pushes them
- *     onto the built sensor as well.
- *   - **The callbacks** below cover everything that is not a request field, and
- *     cover the request again from a seam no provider ordering can miss.
- *
- * Three shapes do all the work, and every signal is one of them:
- *
- *   - **A structure with keys** — a request's payload bag and its headers. The
- *     {@see Scrubber} handles these directly and case-insensitively, which is
- *     stricter than upstream's exact `in_array` comparison on the payload.
- *   - **A URL** — a request's own and an outgoing call's. Only the query string
- *     can carry a secret, and it is rewritten pair by pair so an untouched
- *     parameter survives byte for byte.
- *   - **Free text holding `name = value` pairs** — a SQL statement, an artisan
- *     command line, a mail subject, an exception message and a cache key are all
- *     this. {@see redactPairs()} is the one implementation, so `--password=x`,
- *     `password = 'x'` and `token:x` are answered by the same rule and a host
- *     that adds a key to `prism.scrub` gets all five for it.
- *
- * Nightwatch's job records — `queued-job` and `job-attempt` — carry no payload
- * at all (their fields are the job's name, id, queue, connection and outcome),
- * so a secret dispatched inside a job never reaches a record to be redacted
- * from. That is covered by absence rather than by a callback, and asserted as
- * such: there is no `redactQueuedJobs()` upstream because there is nothing
- * there to redact.
+ * Three shapes cover every signal: a **keyed structure** ({@see redactRequest()}, through the {@see Scrubber});
+ * **a URL** ({@see redactUrl()} — a request's own and an outgoing call's, where only the query string can carry
+ * a secret); and **free text holding `name = value` pairs** ({@see redactPairs()} — SQL, an artisan command
+ * line, a mail subject, an exception message, a cache key, one implementation so all five share one rule and a
+ * host adding a key to `prism.scrub` gets them all). Nightwatch's `queued-job` / `job-attempt` records carry no
+ * payload (name, id, queue, connection, outcome), so a secret dispatched in a job reaches no record to redact
+ * from — covered by absence, not a callback, and asserted as such: no `redactQueuedJobs()` upstream.
  */
 final class RedactRules
 {
     /**
-     * Upstream's own `redact_payload_fields` default, kept underneath Prism's
-     * list rather than replaced by it — a host relying on `_token` being
-     * redacted did not ask to stop by installing Prism.
+     * Upstream's `redact_payload_fields` default, kept underneath Prism's list rather than replaced: a host
+     * relying on `_token` being redacted did not ask to stop by installing Prism.
      *
      * @var list<string>
      */
     public const PAYLOAD_FIELDS = ['_token', 'password', 'password_confirmation'];
 
     /**
-     * Upstream's own `redact_headers` default, kept for the same reason. These
-     * four get value-shape-aware treatment upstream (an `Authorization` keeps
-     * its scheme, a `Cookie` keeps its names), which is worth preserving.
+     * Upstream's `redact_headers` default, kept for the same reason plus the value-shape-aware treatment
+     * upstream gives these four (an `Authorization` keeps its scheme, a `Cookie` its names).
      *
      * @var list<string>
      */
     public const HEADERS = ['Authorization', 'Cookie', 'Proxy-Authorization', 'X-XSRF-TOKEN'];
 
     /**
-     * Values that look like a `name = value` pair but are not one: a SQL
-     * placeholder. `where password = ?` carries no secret, and replacing the
-     * `?` would take the statement's shape away from the query screen for
-     * nothing.
+     * Looks like a `name = value` pair but is not one: a SQL placeholder. `where password = ?` carries no
+     * secret, and replacing the `?` takes the statement's shape off the query screen for nothing.
      */
     private const PLACEHOLDER = '/^[?:$@][\w]*$/';
 
     /**
-     * The compiled `name = value` matcher, or null when the scrub list is empty.
-     *
-     * Built once, at boot, because it is consulted on the hot path — every
-     * query, every cache key — and the alternation is the whole scrub list.
+     * The compiled `name = value` matcher, or null when the scrub list is empty. Built once, at boot: it is
+     * consulted on the hot path — every query, every cache key — and the alternation is the whole scrub list.
      */
     private readonly ?string $pairPattern;
 
@@ -118,11 +81,9 @@ final class RedactRules
     }
 
     /**
-     * Resolve the list once, at boot, so nothing re-reads config while a request
-     * is being served — the same stance as {@see RejectRules::fromConfig()}.
-     *
-     * It builds its own {@see Scrubber} rather than taking the container's,
-     * because this runs during `register()`, before the singleton exists.
+     * Resolve the list once, at boot, so nothing re-reads config while a request is served —
+     * {@see RejectRules::fromConfig()}'s stance. Builds its own {@see Scrubber} rather than taking the
+     * container's: this runs during `register()`, before the singleton exists.
      */
     public static function fromConfig(Repository $config): self
     {
@@ -140,8 +101,7 @@ final class RedactRules
     }
 
     /**
-     * `nightwatch.redact_payload_fields` — the request body fields upstream's
-     * own sensor blanks while it serialises them.
+     * `nightwatch.redact_payload_fields` — request body fields blanked by upstream's sensor as it serialises.
      *
      * @return list<string>
      */
@@ -151,8 +111,7 @@ final class RedactRules
     }
 
     /**
-     * `nightwatch.redact_headers` — the header names upstream's own sensor
-     * blanks while it serialises them.
+     * `nightwatch.redact_headers` — header names blanked by upstream's sensor as it serialises them.
      *
      * @return list<string>
      */
@@ -162,13 +121,9 @@ final class RedactRules
     }
 
     /**
-     * A request record: its headers, its body and its URL.
-     *
-     * The headers and the body are keyed structures, so the {@see Scrubber}
-     * answers them exactly as it answered the old client's — including the
-     * case-insensitivity upstream's `in_array($key, $fields, true)` does not
-     * have. The URL is rewritten because a token in a query string is a secret
-     * in the one field every screen prints.
+     * A request record: headers and body are keyed structures the {@see Scrubber} answers as it did the old
+     * client's, including the case-insensitivity upstream's `in_array($key, $fields, true)` lacks; the URL
+     * is rewritten because a token in a query string is a secret in the one field every screen prints.
      */
     public function redactRequest(Request $record): void
     {
@@ -183,12 +138,9 @@ final class RedactRules
     }
 
     /**
-     * A query record: its SQL.
-     *
-     * Nightwatch captures no bindings — the old client did, and scrubbed them —
-     * so what is left to redact is a value written into the statement itself,
-     * which is what a raw `DB::statement()` produces. A `?` or `:name`
-     * placeholder is deliberately left alone.
+     * A query record's SQL. Nightwatch captures no bindings (the old client did, and scrubbed them), so
+     * what is left is a value written into the statement itself — what a raw `DB::statement()` produces.
+     * A `?` or `:name` placeholder is deliberately left alone.
      */
     public function redactQuery(Query $record): void
     {
@@ -202,13 +154,9 @@ final class RedactRules
     }
 
     /**
-     * A cache event: its key.
-     *
-     * A cache key is a `name:value` pair often enough that the free-text rule is
-     * the right one — `password-reset:<token>` loses the token and keeps the
-     * name, so the key stays legible on the screen while the secret does not
-     * leave. A key that is *only* a name (`api_key`) has no value part and is
-     * left exactly as it was: the name of a cache entry is not a secret.
+     * A cache event's key, a `name:value` pair often enough for the free-text rule: `password-reset:<token>`
+     * loses the token, keeps the name, stays legible while the secret does not leave. A key that is *only* a
+     * name (`api_key`) has no value part and is left alone — a cache entry's name is not a secret.
      */
     public function redactCacheEvent(CacheEvent $record): void
     {
@@ -221,23 +169,16 @@ final class RedactRules
         $record->subject = $this->redactPairs($record->subject);
     }
 
-    /**
-     * A command record: its full command line, where a secret arrives as an
-     * option — `user:create --password=hunter2`.
-     */
+    /** A command record's full command line, where a secret arrives as an option (`--password=hunter2`). */
     public function redactCommand(Command $record): void
     {
         $record->command = $this->redactPairs($record->command);
     }
 
     /**
-     * An exception record: its message.
-     *
-     * Safe to rewrite because nothing groups on it. Upstream hashes its
-     * `_group` from class, code, file and line, and Prism's own fingerprint is
-     * the class plus the topmost application frame (US-029) with the message
-     * explicitly not an input — so redacting here cannot move an error group,
-     * orphan an issue or undo a triage decision.
+     * An exception record's message. Safe to rewrite: nothing groups on it — upstream hashes `_group` from
+     * class, code, file and line, Prism's fingerprint is the class plus the topmost application frame (US-029),
+     * never the message — so redacting cannot move an error group, orphan an issue or undo a triage decision.
      */
     public function redactException(Exception $record): void
     {
@@ -245,12 +186,9 @@ final class RedactRules
     }
 
     /**
-     * Replace the value of every sensitive header, in place.
-     *
-     * A `HeaderBag` lower-cases its own keys, so this is case-insensitive on
-     * both sides. Upstream then applies its own value-shape-aware redaction to
-     * whatever names reached `redact_headers`; running after this one it merely
-     * re-blanks an already-blank value.
+     * Replace the value of every sensitive header, in place. A `HeaderBag` lower-cases its own keys, so
+     * this is case-insensitive on both sides. Upstream's own value-shape-aware redaction of the names
+     * that reached `redact_headers` runs after this one and re-blanks a blank value.
      */
     private function redactHeaderBag(HeaderBag $headers): void
     {
@@ -262,14 +200,10 @@ final class RedactRules
     }
 
     /**
-     * The free-text rule, for a caller that holds a string rather than one of
-     * the engine's record objects.
-     *
-     * {@see PrismSpanProcessor} is that caller (US-018): once the span lane
-     * owns the query signal, the SQL Prism ships is an OpenTelemetry span
-     * attribute rather than the `Query` record {@see redactQuery()} rewrites,
-     * and a `prism.scrub` list that stopped applying the day the lane landed
-     * would be the quietest possible way to start shipping credentials.
+     * The free-text rule, for a caller holding a string rather than a record: {@see PrismSpanProcessor}
+     * (US-018). With the span lane owning the query signal, the SQL Prism ships is an OpenTelemetry span
+     * attribute, not the `Query` record {@see redactQuery()} rewrites — a `prism.scrub` list that stopped
+     * applying the day the lane landed would be the quietest way to start shipping credentials.
      */
     public function redactText(string $text): string
     {
@@ -277,17 +211,11 @@ final class RedactRules
     }
 
     /**
-     * Rewrite a URL's query string, pair by pair.
-     *
-     * Public for {@see redactText()}'s reason: the span lane reports an
-     * outgoing call as a span carrying `url.full`, and that URL has to meet the
-     * same list the `OutgoingRequest` record's does.
-     *
-     * Deliberately not `parse_str()` + `http_build_query()`: that round trip
-     * re-encodes every value, collapses a repeated key into an array and drops
-     * a valueless flag, so a URL with nothing sensitive in it would still come
-     * back changed. Splitting on the separators leaves every untouched pair
-     * byte for byte as it arrived.
+     * Rewrite a URL's query string, pair by pair. Public for {@see redactText()}'s reason: the span lane's
+     * outgoing-call span carries `url.full`, which must meet the same list the `OutgoingRequest` record's URL
+     * does. Deliberately not `parse_str()` + `http_build_query()`, whose round trip re-encodes every value,
+     * collapses a repeated key into an array and drops a valueless flag, so a URL with nothing sensitive in
+     * it still comes back changed; splitting on the separators leaves every untouched pair byte for byte.
      */
     public function redactUrl(string $url): string
     {
@@ -333,15 +261,10 @@ final class RedactRules
     }
 
     /**
-     * Replace the value half of every `name = value` pair whose name is on the
-     * scrub list, wherever it appears in free text.
-     *
-     * One implementation for five signals, because they are the same problem
-     * written five ways: `--password=hunter2` on a command line, `password =
-     * 'hunter2'` in a statement, `"password":"hunter2"` in a serialised body,
-     * `token:abc` in a cache key. The separator may be `=`, `:` or `=>`; the
-     * value may be quoted, and its quotes are preserved so the text stays
-     * well-formed after the value inside them is gone.
+     * Replace the value half of every `name = value` pair whose name is on the scrub list, wherever it appears
+     * in free text — one implementation for five signals: `--password=hunter2` on a command line,
+     * `password = 'hunter2'` in a statement, `token:abc` in a cache key. Separator `=`, `:` or `=>`; a quoted
+     * value keeps its quotes so the text stays well-formed once the value inside is gone.
      */
     private function redactPairs(string $text): string
     {
@@ -354,8 +277,7 @@ final class RedactRules
             static function (array $matches): string {
                 $value = $matches[3];
 
-                // A SQL placeholder is not a value; leaving it alone keeps the
-                // statement's shape readable and costs nothing.
+                // A SQL placeholder is not a value; leaving it alone keeps the statement's shape readable.
                 if (preg_match(self::PLACEHOLDER, $value) === 1) {
                     return $matches[0];
                 }
@@ -371,13 +293,9 @@ final class RedactRules
     }
 
     /**
-     * Compile the scrub list into the pair matcher, or null when there is
-     * nothing to match.
-     *
-     * The name may wear a `--` (an artisan option) or a quote (a serialised
-     * body); the lookarounds keep `password` from matching inside
-     * `password_strength`, which is the same over-redaction the {@see Scrubber}
-     * avoids by comparing whole keys.
+     * Compile the scrub list into the pair matcher, null when nothing to match. The name may wear a `--`
+     * (artisan option) or a quote (serialised body); the lookarounds keep `password` from matching inside
+     * `password_strength` — the over-redaction the {@see Scrubber} avoids by comparing whole keys.
      *
      * @param  list<string>  $keys
      */
@@ -397,8 +315,8 @@ final class RedactRules
     }
 
     /**
-     * Upstream's own defaults with `prism.scrub` on top, de-duplicated
-     * case-insensitively so a host repeating `password` does not send it twice.
+     * Upstream's own defaults with `prism.scrub` on top, de-duplicated case-insensitively so a host
+     * repeating `password` does not send it twice.
      *
      * @param  list<string>  $defaults
      * @return list<string>

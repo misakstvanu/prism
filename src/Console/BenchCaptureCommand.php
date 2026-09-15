@@ -32,43 +32,24 @@ use Throwable;
 /**
  * Times the host's request lifecycle under four capture configurations, so the
  * cost of replacing the capture engine is measured rather than assumed
- * (US-023).
- *
- * The four configurations are the four answers worth having:
- *
- *   - **off** — nothing captures. Every other figure is quoted as the cost
- *     *added* on top of this one, so it is the only row that is not itself
- *     interesting.
- *   - **legacy** — the client as it was before the epic, materialised out of
- *     git ({@see LegacyCapturePath}). This is the number the change has to beat.
- *   - **nightwatch** — the capture engine alone, feeding Prism's buffer.
- *   - **otel** — the engine plus the OpenTelemetry span lane, i.e. what a
- *     default install actually runs.
- *
- * **Each configuration is a separate process, and that is not an optimisation.**
- * Which engines listen is decided during `register()` — hooks cannot be
- * un-registered, and the ingest swap, the reject callbacks and the span
- * processor are all installed before any command runs. Four configurations in
- * one process would therefore be four names for one configuration. So the
- * command spawns itself once per configuration with the environment that
- * produces it (`--profile=`), parses the one JSON line each child prints, and
- * does the comparing here.
- *
- * **What a child times.** One synthetic route through the *real* HTTP kernel,
- * doing a fixed amount of the work capture is expensive for — queries (the
- * engine's query sensor takes a `debug_backtrace()` per query, the single most
- * expensive thing in the path), cache reads and writes, log lines — with the
- * response never sent and delivery replaced by {@see BenchTransport}. Between
- * iterations the per-execution state is reset exactly as a long-lived runtime
- * resets it (scoped instances forgotten, `prepareForRequest()`), because
- * without that the capture engine's own global middleware would sample the
- * first request and wave every later one through, and the benchmark would
- * measure capture happening once.
- *
- * **The verdict is a gate, not a note.** A configuration that adds more
- * wall-clock per request than the old client exits non-zero and says so: the
- * point of the exercise was that the new path is not more expensive, and a
- * regression recorded in a table nobody blocks on is a regression that ships.
+ * (US-023): **off** (nothing captures — the baseline every other figure is
+ * quoted as an addition to), **legacy** (the pre-epic client out of git,
+ * {@see LegacyCapturePath} — the number the change has to beat), **nightwatch**
+ * (the engine alone, feeding Prism's buffer) and **otel** (the engine plus the
+ * OpenTelemetry span lane, what a default install runs). Each is its own
+ * process, not an optimisation: which engines listen is decided in `register()`,
+ * hooks cannot be un-registered, and the ingest swap, reject callbacks and span
+ * processor are installed before any command runs, so four in one would be four
+ * names for one. It spawns itself per configuration (`--profile=`), parses the
+ * one JSON line each child prints and compares here; a child times one synthetic
+ * route through the *real* HTTP kernel doing fixed work capture is expensive for
+ * — queries (the query sensor's `debug_backtrace()` per query, the single most
+ * expensive thing in the path), cache reads and writes, log lines — response
+ * never sent, delivery replaced by {@see BenchTransport}, per-execution state
+ * reset each iteration (scoped instances forgotten, `prepareForRequest()`). The
+ * verdict is a gate, not a note: a configuration adding more wall-clock per
+ * request than the old client exits non-zero, because a regression recorded in
+ * a table nobody blocks on ships.
  */
 class BenchCaptureCommand extends Command
 {
@@ -92,15 +73,13 @@ class BenchCaptureCommand extends Command
 
     /**
      * The configurations, and the environment each is produced by.
-     *
-     * `NIGHTWATCH_ENABLED=false` is what makes "off" a true zero rather than
-     * "the engine registered its hooks and was then paused": upstream registers
-     * before Prism in every real install and reads its own config while doing
-     * so, so the only way to have none of its hooks is to answer its own
-     * variable. `NIGHTWATCH_FORCE_REQUEST` is the other side of the same coin —
-     * the engine decides once, at register time, whether this process serves
-     * requests, and under an artisan command the honest answer is no, which
-     * would wire the console sensors and leave the request path untouched.
+     * `NIGHTWATCH_ENABLED=false` makes "off" a true zero rather than "hooks
+     * registered, then paused": the engine registers before Prism in every real
+     * install, reading its own config as it does, so answering its own variable
+     * is the only way to have none of its hooks. `NIGHTWATCH_FORCE_REQUEST` is
+     * the other side — the engine decides once, at register time, whether this
+     * process serves requests, and under an artisan command the answer is no,
+     * which would wire the console sensors and leave the request path untouched.
      *
      * @var array<string, array{label: string, env: array<string, string>, legacy: bool}>
      */
@@ -129,22 +108,19 @@ class BenchCaptureCommand extends Command
 
     /**
      * Environment every child gets whatever its configuration, so the four are
-     * compared on one delivery strategy and one sampling rate. A sampled-out
+     * compared on one delivery strategy and one sampling rate: a sampled-out
      * execution is discarded whole, so leaving the rate to the host's `.env`
-     * would let one configuration measure capture and another measure the
-     * sampler refusing it.
-     *
-     * **`CACHE_STORE=array` is load-bearing, and it was found by this command's
-     * own first run.** {@see SystemMetrics} throttles
-     * its interval across the processes on a replica with an atomic cache
-     * `add()`, and only the process that *wins* that add records the sample in
-     * memory — every other one re-asks the cache on every single flush. Against
-     * the host's Redis that is a network round trip per request: it measured
-     * 1.19 ms, dwarfed every figure the benchmark exists to compare, and landed
-     * wherever the interval lock happened to be held, so two identical runs
-     * disagreed by 3x. It belongs to neither engine (it predates the epic and is
-     * unchanged by it) and it is the cache backend's latency rather than
-     * capture's, so the benchmark takes the backend out and says so.
+     * would have one configuration measure capture and another measure the
+     * sampler refusing it. **`CACHE_STORE=array` is load-bearing**, as this
+     * command's own first run found: {@see SystemMetrics} throttles its interval
+     * across a replica's processes with an atomic cache `add()` and only the
+     * process that *wins* it records the sample in memory, so every other re-asks
+     * the cache on every flush — against the host's Redis a round trip per
+     * request at 1.19 ms, dwarfing every figure being compared and landing
+     * wherever the interval lock was held, so two identical runs disagreed by 3x.
+     * That is the cache backend's latency, not capture's, and neither engine's
+     * (it predates the epic, unchanged by it), so the benchmark takes the backend
+     * out and says so.
      */
     private const SHARED_ENV = [
         'NIGHTWATCH_FORCE_REQUEST' => '1',
@@ -166,14 +142,11 @@ class BenchCaptureCommand extends Command
     private const CONNECTION = 'prism_bench';
 
     /**
-     * Namespace prefixes whose presence proves a span left as OTLP.
-     *
-     * `google/protobuf` is in the tree — the OTLP exporter requires it — and
-     * that is the point: the claim "spans never leave this process as OTLP" is
-     * only worth making if something checks it, and a class from either of
-     * these is loaded on the first byte an OTLP exporter serialises. Absence of
-     * the *package* would prove nothing; absence of the *class*, after a run
-     * that produced thousands of spans, proves the exporter was never reached.
+     * Namespace prefixes whose presence proves a span left as OTLP: a class from
+     * either is loaded on the first byte an OTLP exporter serialises, and
+     * `google/protobuf` is in the tree anyway (the exporter requires it), so
+     * absence of the *package* would prove nothing where absence of the *class*
+     * after a run of thousands of spans proves the exporter was never reached.
      */
     private const PROTOBUF_NAMESPACES = ['Google\\Protobuf', 'Opentelemetry\\Proto'];
 
@@ -190,9 +163,7 @@ class BenchCaptureCommand extends Command
 
     // ---------------------------------------------------------------- parent
 
-    /**
-     * Spawn one child per configuration, collect their answers and report.
-     */
+    /** Spawn one child per configuration, collect their answers and report. */
     private function runComparison(): int
     {
         $requested = $this->requestedProfiles();
@@ -227,14 +198,12 @@ class BenchCaptureCommand extends Command
         /** @var array<string, list<BenchResult>> $rows */
         $rows = [];
 
-        // Round-robin rather than one configuration at a time. This box's own
-        // load moves the same measurement by 40% between two runs a second
-        // apart, so a sweep that finished one configuration before starting the
-        // next would attribute whatever the machine did in between to whichever
-        // configuration happened to be running — and the gate would flap on
-        // ambient load rather than on the code under test. Interleaving spreads
-        // the drift across all four; taking the median round then throws away
-        // the excursions rather than averaging them in.
+        // Round-robin, not one configuration at a time: this box's own load
+        // moves the same measurement by 40% between two runs a second apart, so
+        // finishing one before the next would charge the machine's drift to
+        // whichever was running and flap the gate on ambient load, not the code
+        // under test. Interleaving spreads that drift over all four; the median
+        // round then discards the excursions rather than averaging them in.
         for ($round = 0; $round < $rounds; $round++) {
             if ($rounds > 1) {
                 $this->line(sprintf('  <fg=gray>round %d/%d</>', $round + 1, $rounds));
@@ -259,12 +228,10 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * Run one configuration in its own process and parse the result back.
-     *
-     * The child's whole stdout is kept when it fails: a configuration that
-     * cannot even boot is a real finding (a missing extension, a fatal in the
-     * reconstructed old client), and swallowing the output would turn it into
-     * an unexplained blank row.
+     * Run one configuration in its own process and parse the result back. Its
+     * whole stdout is kept when it fails: a configuration that cannot even boot
+     * is a real finding (a missing extension, a fatal in the reconstructed old
+     * client), and swallowing it would leave an unexplained blank row.
      */
     private function runChild(string $name, string $artisan, ?string $legacyDirectory): BenchResult
     {
@@ -301,9 +268,8 @@ class BenchCaptureCommand extends Command
         $answer = $this->parseChildOutput($process->getOutput());
 
         if ($answer !== null) {
-            // Under -v, what was actually live in the child. A configuration
-            // that silently failed to install itself is otherwise
-            // indistinguishable from one that is genuinely cheap.
+            // Under -v, what was live in the child: a silent failure to install
+            // looks exactly like a genuinely cheap configuration.
             if ($this->output->isVerbose() && is_array($answer['state'] ?? null)) {
                 $this->line('    <fg=gray>'.json_encode($answer['state']).'</>');
             }
@@ -322,13 +288,10 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * The middle round by wall-clock, which is the whole round rather than a
-     * field-by-field median: mixing one round's timing with another's event
-     * count would report a request that never happened.
-     *
-     * A configuration that failed in any round is reported as skipped — a
-     * measurement taken while a sibling round could not even run is not a
-     * measurement worth quoting.
+     * The middle round by wall-clock — the whole round, not a field-by-field
+     * median: mixing one round's timing with another's event count would report
+     * a request that never happened. A configuration that failed in any round is
+     * skipped rather than quoted from the rounds that did run.
      *
      * @param  list<BenchResult>  $rounds
      */
@@ -350,8 +313,7 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * Read the one marker line a child prints, ignoring everything else it
-     * wrote.
+     * Read the one marker line a child prints, ignoring everything else it wrote.
      *
      * @return array<string, mixed>|null
      */
@@ -433,11 +395,9 @@ class BenchCaptureCommand extends Command
     // ---------------------------------------------------------------- report
 
     /**
-     * Print the comparison.
-     *
-     * Every capture figure is quoted as what it *adds* to the same workload
-     * with nothing capturing, because the absolute numbers are a property of
-     * this machine and the added ones are a property of the change.
+     * Print the comparison, every capture figure quoted as what it *adds* to the
+     * same workload with nothing capturing: the absolute numbers are a property
+     * of this machine, the added ones a property of the change.
      *
      * @param  array<string, BenchResult>  $results
      */
@@ -531,14 +491,11 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * The gate (AC4). Two things fail it, and neither is a matter of degree:
-     * a configuration that costs the host more wall-clock per request than the
-     * old client did, and any sign that a span left the process as OTLP.
-     *
-     * A requested-but-unmeasurable old client fails too. The comparison is the
-     * whole point of the command, and reporting three numbers with nothing to
-     * compare them against, exit code zero, is precisely how a regression gets
-     * recorded as a note.
+     * The gate (AC4). Two things fail it, neither a matter of degree: costing
+     * the host more wall-clock per request than the old client did, and any sign
+     * a span left the process as OTLP. A requested-but-unmeasurable old client
+     * fails too: the comparison is the point, and three numbers with nothing to
+     * compare against under exit zero is how a regression is recorded as a note.
      *
      * @param  array<string, BenchResult>  $results
      */
@@ -602,9 +559,7 @@ class BenchCaptureCommand extends Command
 
     // ----------------------------------------------------------------- child
 
-    /**
-     * Measure one configuration in this process and print it as JSON.
-     */
+    /** Measure one configuration in this process and print it as JSON. */
     private function measureOne(string $profile): int
     {
         if (! isset(self::PROFILES[$profile])) {
@@ -626,10 +581,7 @@ class BenchCaptureCommand extends Command
         return self::SUCCESS;
     }
 
-    /**
-     * Drive the workload `warmup + requests` times and reduce the timed half to
-     * one result.
-     */
+    /** Drive the workload `warmup + requests` times, reducing the timed half to one result. */
     private function measure(string $profile): BenchResult
     {
         $application = $this->laravel;
@@ -670,11 +622,10 @@ class BenchCaptureCommand extends Command
 
             $request = Request::create('/'.self::ROUTE, 'GET');
 
-            // The reset a long-lived runtime performs between requests. Without
+            // The reset a long-lived runtime performs between requests: without
             // it the engine's global middleware — a `scoped` binding holding a
-            // `hasHandledRequest` flag — samples the first request and waves
-            // every later one straight through, so the benchmark would time one
-            // captured request and N-1 uncaptured ones.
+            // `hasHandledRequest` flag — samples the first request and waves the
+            // rest through, timing one captured request and N-1 uncaptured ones.
             $application->forgetScopedInstances();
             TraceContext::reset();
             Recursion::reset();
@@ -688,11 +639,10 @@ class BenchCaptureCommand extends Command
             $start = hrtime(true);
             $response = $kernel->handle($request);
 
-            // Read the drop counters HERE, between the request and the flush.
-            // Both are "since the last drain", and the drain is what terminate
-            // is about to do — so a count read afterwards is always zero and
-            // the report would say a run dropped nothing however much it threw
-            // away.
+            // Read the drop counters HERE, between the request and the flush:
+            // both are "since the last drain" and terminate is about to drain,
+            // so a count read afterwards is always zero and the report would say
+            // a run dropped nothing however much it threw away.
             if ($timed) {
                 $bufferDropped += $buffer?->dropped() ?? 0;
                 $translateDropped += $ingest?->dropped() ?? 0;
@@ -733,9 +683,7 @@ class BenchCaptureCommand extends Command
         );
     }
 
-    /**
-     * Bring the pre-2.0 client back and wire it up.
-     */
+    /** Bring the pre-2.0 client back and wire it up. */
     private function installLegacy(BenchTransport $transport): void
     {
         $directory = $this->option('legacy-source');
@@ -750,13 +698,11 @@ class BenchCaptureCommand extends Command
 
     /**
      * Register the benchmarked route and the throwaway datastore behind it.
-     *
-     * The queries run against an in-memory SQLite connection of the benchmark's
-     * own rather than the host's database: the figure being measured is what
-     * *capturing* a query costs, and a real connection would fold the network
-     * and the planner into every row of the table. The cache operations use the
-     * array store for the same reason. Both still raise the framework events
-     * every engine listens for, which is the whole of what capture sees.
+     * Queries run against the benchmark's own in-memory SQLite connection and
+     * the cache operations against the array store, not the host's: the figure
+     * measured is what *capturing* a query costs, where a real connection would
+     * fold the network and the planner into every row. Both still raise the
+     * framework events every engine listens for, which is all capture sees.
      */
     private function prepareWorkload(): void
     {
@@ -804,11 +750,10 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * Whether any protobuf class has been loaded in this process (AC6).
-     *
-     * Read off `get_declared_classes()` rather than by asking whether the
-     * package is installed: it is installed — the OTLP exporter requires it —
-     * and the claim worth checking is that nothing ever reached for it.
+     * Whether any protobuf class has loaded in this process (AC6), read off
+     * `get_declared_classes()` and not from whether the package is installed —
+     * it is, the OTLP exporter requires it, and the claim worth checking is that
+     * nothing ever reached for it.
      */
     private function protobufTouched(): bool
     {
@@ -824,10 +769,8 @@ class BenchCaptureCommand extends Command
     }
 
     /**
-     * What was actually live in this process, so a row in the report can be
-     * audited rather than trusted. A configuration that silently failed to
-     * install itself would otherwise be indistinguishable from one that is
-     * genuinely cheap.
+     * What was live in this process, so a report row is audited rather than
+     * trusted: a silent install failure looks exactly like a cheap configuration.
      *
      * @return array<string, bool|string>
      */

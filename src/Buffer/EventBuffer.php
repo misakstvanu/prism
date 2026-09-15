@@ -11,28 +11,28 @@ use Misakstvanu\Prism\PrismServiceProvider;
  * a single request or queue job (US-037).
  *
  * Registered as a container singleton by
- * {@see PrismServiceProvider::registerCapture()} so every
- * capture listener (US-042+) writes into one buffer, and drained on flush
- * (US-038 ships the batch). Two invariants keep it safe under load:
+ * {@see PrismServiceProvider::registerCapture()} so every capture listener
+ * (US-042+) writes into one buffer, drained on flush (US-038 ships the batch).
+ * Two invariants keep it safe under load:
  *
- *   - Bounded memory. A configurable capacity (config `prism.batch.size`,
- *     default 1,000) caps how many events one request may hold. Past the cap
- *     the excess is dropped and counted rather than accumulated, so a storm of
- *     queries or logs can never grow the buffer without limit. The `dropped`
- *     count travels with the flushed batch so the console can surface it.
+ *   - Bounded memory. Capacity (config `prism.batch.size`, default 1,000) caps
+ *     how many events one request may hold; past it the excess is dropped and
+ *     counted rather than accumulated, so a storm of queries or logs can never
+ *     grow the buffer without limit. The `dropped` count travels with the
+ *     flushed batch so the console can surface it.
  *
- *   - No leakage between runs. A queue worker is a long-lived process that
- *     handles many jobs; the buffer is cleared at the start of every job
- *     (the provider listens on JobProcessing) and after every flush, so one
- *     job never sees another's events.
+ *   - No leakage between runs. A queue worker is long-lived and handles many
+ *     jobs; the buffer is cleared at the start of every job (the provider
+ *     listens on JobProcessing) and after every flush, so one job never sees
+ *     another's events.
  *
- * Adding an event is O(1) — an array append plus a counter bump, with no
+ * Adding an event is O(1) — an array append plus a counter bump, no
  * serialization; encoding happens only at flush.
  */
 final class EventBuffer
 {
     /**
-     * Events accumulated so far, grouped by telemetry type. The server groups
+     * Events accumulated so far, grouped by telemetry type — the server groups
      * by type for its bulk insert, so grouping at the source is free.
      *
      * @var array<string, list<array<string, mixed>>>
@@ -40,14 +40,14 @@ final class EventBuffer
     private array $events = [];
 
     /**
-     * Number of events currently buffered. Tracked as a counter so add() and
-     * count() stay O(1) instead of walking the grouped arrays.
+     * Number of events currently buffered. A counter so add() and count() stay
+     * O(1) instead of walking the grouped arrays.
      */
     private int $count = 0;
 
     /**
-     * Number of events dropped since the last clear because the buffer was at
-     * capacity. Shipped with the batch (US-038) so a truncated batch is visible.
+     * Events dropped since the last clear because the buffer was at capacity.
+     * Shipped with the batch (US-038) so a truncated batch is visible.
      */
     private int $dropped = 0;
 
@@ -78,8 +78,8 @@ final class EventBuffer
     }
 
     /**
-     * Drain the buffer: snapshot the current events and dropped count, then
-     * clear so the next request or job starts empty.
+     * Drain the buffer: snapshot the events and dropped count, then clear so
+     * the next request or job starts empty.
      */
     public function flush(): FlushedBatch
     {
@@ -91,8 +91,8 @@ final class EventBuffer
     }
 
     /**
-     * Reset the buffer to empty. Called after a flush and at the start of each
-     * queue job so events never leak across runs.
+     * Reset to empty. Called after a flush and at the start of each queue job
+     * so events never leak across runs.
      */
     public function clear(): void
     {
@@ -102,8 +102,8 @@ final class EventBuffer
     }
 
     /**
-     * Events buffered so far, grouped by type. A snapshot for inspection;
-     * callers that consume the buffer should flush().
+     * Snapshot of the buffered events, grouped by type, for inspection; callers
+     * that consume the buffer should flush().
      *
      * @return array<string, list<array<string, mixed>>>
      */

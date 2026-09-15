@@ -12,44 +12,29 @@ use Misakstvanu\Prism\Support\IgnoreList;
 use Misakstvanu\Prism\Support\Recursion;
 
 /**
- * `prism.ignore.*` said in the capture engine's vocabulary (US-010).
+ * `prism.ignore.*` said in the capture engine's vocabulary (US-010), in one file rather than five call
+ * sites that each guessed. The lists are unchanged — a host still writes {@see IgnoreList} wildcards
+ * under one `ignore` block — but `laravel/nightwatch` offers a different hook per dimension and no hook
+ * at all for two of them. Every method is a pure predicate over already-resolved pattern lists, a
+ * hot-path consult with no container lookup, the same stance as {@see IgnoreList} itself.
  *
- * The lists themselves are unchanged — a host still writes {@see IgnoreList}
- * wildcards under one `ignore` block — but the engine reading them is now
- * `laravel/nightwatch`, which offers a different hook per dimension and no hook
- * at all for two of them. This class is the one place that translation happens,
- * so a screen full of self-monitoring noise can be traced to one file rather
- * than to five call sites that each guessed.
+ * When the host application *is* a Prism workspace, the whole ingest pipeline is work the host does on
+ * Prism's behalf — the inbound batch a request, storing it a job, metering it a run of cache counters,
+ * the write an HTTP call to ClickHouse — each captured, shipped and stored by the pipeline that
+ * produced it. {@see Recursion} closes that loop for the package's *own* work, this closes it for the
+ * host's, and the loop does not settle on its own. Five hooks, three shapes, not interchangeable:
  *
- * Why this matters more than tidiness: when the host application *is* a Prism
- * workspace, the whole ingest pipeline is work the host does on Prism's behalf.
- * The inbound batch is a request, storing it is a job, metering it is a run of
- * cache counters and the write itself is an HTTP call to ClickHouse — each of
- * which is captured, shipped, and stored by the very pipeline that produced it.
- * {@see Recursion} closes that loop for the package's *own* work; this closes it
- * for the host's, and the loop does not settle on its own.
- *
- * Five hooks, three shapes, and the shapes are not interchangeable:
- *
- *   - **Rejected outright** (`cache`, `http`, `jobs`). Nightwatch takes a reject
- *     callback per record type and never buffers what one refuses. An ignored
- *     signal should cost nothing, and losing the per-execution counter that goes
- *     with it is the point rather than a side effect.
- *   - **Sampled out** (`paths`, `commands`). There is no reject hook for an
- *     execution, because a request or a command *is* the execution rather than a
- *     record inside one. `Core::dontSample()` is the equivalent: at
- *     `finishExecution()` the whole buffer is discarded instead of shipped, so
- *     not only the request record but every query, cache event and log line it
- *     produced goes with it. That is strictly more than the old client dropped,
- *     and it is what an ignore list is asking for.
- *   - **Dropped at the seam** (`exceptions`). Nightwatch has no reject callback
- *     for an exception, so the earliest place Prism owns is
- *     {@see PrismIngest::write()}. The record is built either way; what this
- *     prevents is it reaching the buffer, the envelope or the wire.
- *
- * Every method is a pure predicate over already-resolved pattern lists, so a
- * hook can consult one on a hot path without a container lookup — the same
- * stance as {@see IgnoreList} itself.
+ *   - **Rejected outright** (`cache`, `http`, `jobs`): a Nightwatch reject callback per record type,
+ *     never buffering what one refuses, so an ignored signal costs nothing — and losing the
+ *     per-execution counter with it is the point, not a side effect.
+ *   - **Sampled out** (`paths`, `commands`): no reject hook exists for an execution — a request or a
+ *     command *is* the execution, not a record inside one — so `Core::dontSample()` discards the whole
+ *     buffer at `finishExecution()` instead of shipping it, and every query, cache event and log line
+ *     goes with the request record: strictly more than the old client dropped, and what an ignore list
+ *     is asking for.
+ *   - **Dropped at the seam** (`exceptions`): Nightwatch has no reject callback for one, so the
+ *     earliest place Prism owns is {@see PrismIngest::write()}; the record is built either way, and
+ *     this prevents it reaching the buffer, the envelope or the wire.
  */
 final class RejectRules
 {
@@ -70,10 +55,7 @@ final class RejectRules
         private readonly array $exceptions = [],
     ) {}
 
-    /**
-     * Resolve every list once, at boot, so nothing re-reads or re-filters config
-     * while a request is being served.
-     */
+    /** Resolved once at boot, so no config is re-read or re-filtered per request. */
     public static function fromConfig(Repository $config): self
     {
         return new self(
@@ -87,21 +69,14 @@ final class RejectRules
     }
 
     /**
-     * `prism.ignore.paths`, plus the browser SDK's own reporting endpoint
-     * whatever the host configured it to be.
-     *
-     * The shipped `ignore.paths` already carries `_prism/*`, which covers the
-     * default. This covers a renamed one, and it is the same stance
-     * {@see cacheKeyPatterns()} takes one dimension along: a path that exists
-     * *because* Prism is installed is not something a host should have to
-     * remember to silence. Left captured, every browser report becomes a
-     * request row plus the session read, the scrub pass and the queue dispatch
-     * it made — telemetry about telemetry, on a route the page hits once per
-     * error.
-     *
-     * Only added when the endpoint is actually registered: with
-     * `browser.enabled` off there is no such route, and silencing a path the
-     * host may be serving something else on is not Prism's to do.
+     * `prism.ignore.paths`, plus the browser SDK's own reporting endpoint whatever the host configured
+     * it to be. The shipped `ignore.paths` carries `_prism/*`, covering the default; this covers a
+     * renamed one — {@see cacheKeyPatterns()}'s stance one dimension along, that a path existing
+     * *because* Prism is installed is not the host's to remember to silence. Left captured, every
+     * browser report becomes a request row plus the session read, the scrub pass and the queue dispatch
+     * it made, on a route the page hits once per error. Only added when the endpoint is actually
+     * registered: with `browser.enabled` off there is no such route, and silencing a path the host may
+     * be serving something else on is not Prism's to do.
      *
      * @return list<string>
      */
@@ -125,41 +100,32 @@ final class RejectRules
     }
 
     /**
-     * `prism.ignore.cache` as the regex list `Nightwatch::rejectCacheKeys()`
-     * expects.
-     *
-     * The conversion is the load-bearing part and it lives in one helper
-     * ({@see IgnoreList::toRegex()}): upstream runs `@preg_match($pattern, $key)`
-     * and only falls back to a literal comparison when the pattern will not
-     * compile, so handing it a raw `prism:*` silences precisely nothing — and a
-     * cache exclusion that silently does nothing is how a workspace hosting
-     * itself ends up drowning in its own bookkeeping.
+     * `prism.ignore.cache` as the regex list `Nightwatch::rejectCacheKeys()` expects. The conversion is
+     * load-bearing and lives in one helper ({@see IgnoreList::toRegex()}): upstream runs
+     * `@preg_match($pattern, $key)` and falls back to a literal comparison only when the pattern will
+     * not compile, so a raw `prism:*` silences precisely nothing — and a cache exclusion that silently
+     * does nothing is how a workspace hosting itself drowns in its own bookkeeping.
      *
      * @return list<string>
      */
     public function cacheKeyPatterns(): array
     {
         return [
-            // The package's own bookkeeping, whatever the host configured — the
-            // spool index and the metrics interval marks. The metrics
-            // collectors run deliberately outside a {@see Recursion::suppress()}
-            // scope, so this is the only thing that keeps their touches out of
-            // the telemetry they exist to produce.
+            // The package's own bookkeeping whatever the host configured — the spool index and the
+            // metrics interval marks. The collectors run deliberately outside a
+            // {@see Recursion::suppress()} scope, so this is the only thing keeping their touches
+            // out of the telemetry they exist to produce.
             IgnoreList::toRegex(Recursion::CACHE_PREFIX.'*'),
             ...array_map(IgnoreList::toRegex(...), $this->cache),
         ];
     }
 
     /**
-     * Whether the package is doing its own work right now, in which case
-     * nothing at all should be captured.
-     *
-     * {@see Recursion} is the package's oldest guard and every one of the old
-     * client's listeners consulted it directly. The capture engine's sensors
-     * do not, and cannot be made to — so the reject callbacks are where that
-     * question now gets asked, once per signal type. Building an envelope,
-     * spooling a batch and shipping it are all bracketed in a suppression
-     * scope; without this, the very act of sending telemetry is telemetry.
+     * Whether the package is doing its own work right now, in which case nothing at all should be
+     * captured. The old client's listeners consulted {@see Recursion} directly; the capture engine's
+     * sensors do not and cannot be made to, so the reject callbacks ask once per signal type. Building
+     * an envelope, spooling a batch and shipping it are all bracketed in a suppression scope; without
+     * this, sending telemetry is itself telemetry.
      */
     public function rejectsCurrentWork(): bool
     {
@@ -167,13 +133,10 @@ final class RejectRules
     }
 
     /**
-     * Whether an outgoing call's destination is on `prism.ignore.http`.
-     *
-     * The destination is offered three ways — host, host and path, and the full
-     * URL without its query string — exactly as the old client offered it, so a
-     * host that already wrote `clickhouse`, `clickhouse/*` or
-     * `http://clickhouse:8123/*` keeps the answer it had. The query string is
-     * excluded because it varies per call and may carry a credential.
+     * Whether an outgoing call's destination is on `prism.ignore.http`. Offered three ways — host, host
+     * and path, and the full URL without its query string — exactly as the old client offered it, so a
+     * host that wrote `clickhouse`, `clickhouse/*` or `http://clickhouse:8123/*` keeps the answer it
+     * had. The query string is excluded: it varies per call and may carry a credential.
      */
     public function rejectsOutgoingRequest(OutgoingRequest $record): bool
     {
@@ -181,12 +144,10 @@ final class RejectRules
     }
 
     /**
-     * Whether a URL is on `prism.ignore.http`.
-     *
-     * Split out of {@see rejectsOutgoingRequest()} for the span lane (US-015):
-     * an OpenTelemetry client span describes the same outgoing call the capture
-     * engine's record does, so the two must answer the ignore list identically
-     * or a dogfooded install silences one and keeps drawing the other.
+     * Whether a URL is on `prism.ignore.http`. Split out of {@see rejectsOutgoingRequest()} for the span
+     * lane (US-015): an OpenTelemetry client span describes the same outgoing call the capture engine's
+     * record does, so the two must answer identically or a dogfooded install silences one and keeps
+     * drawing the other.
      */
     public function rejectsUrl(string $url): bool
     {
@@ -205,8 +166,8 @@ final class RejectRules
         $scheme = is_string($parts['scheme'] ?? null) ? $parts['scheme'] : '';
         $port = is_int($parts['port'] ?? null) ? $parts['port'] : null;
 
-        // A port that is the scheme's own is not part of how anyone writes the
-        // destination down, and PSR-7 drops it for the same reason.
+        // A port that is the scheme's own is not how anyone writes the destination down; PSR-7
+        // drops it for the same reason.
         if ($port !== null && $port === self::defaultPort($scheme)) {
             $port = null;
         }
@@ -228,13 +189,10 @@ final class RejectRules
     }
 
     /**
-     * Whether a job class name is one never to capture.
-     *
-     * The package's own jobs are refused whatever the host configured: the flush
-     * job exists only to ship telemetry, so capturing it produces the batch that
-     * dispatches the next one. {@see Recursion::isInternalJob()} answers the same
-     * question for an object; the capture engine reports a job by name, and one
-     * of the two has to speak strings.
+     * Whether a job class name is one never to capture. The package's own jobs are refused whatever the
+     * host configured: the flush job exists only to ship telemetry, so capturing it produces the batch
+     * that dispatches the next one. {@see Recursion::isInternalJob()} answers the same question for an
+     * object; the capture engine reports a job by name, so one of the two has to speak strings.
      */
     public function rejectsJob(string $name): bool
     {
@@ -247,13 +205,10 @@ final class RejectRules
     }
 
     /**
-     * Whether a request is one never to capture — either because its path is on
-     * `prism.ignore.paths`, or because it carries the internal marker.
-     *
-     * The marker is the important half. An inbound batch from another Prism
-     * client is Prism's own traffic end to end, arriving on a path the receiving
-     * application chose and cannot be assumed to know; the header is the only
-     * signal that crosses that process boundary.
+     * Whether a request is one never to capture — its path is on `prism.ignore.paths`, or it carries the
+     * internal marker. The marker is the important half: an inbound batch from another Prism client is
+     * Prism's own traffic end to end, arriving on a path the receiving application chose and cannot be
+     * assumed to know, and the header is the only signal that crosses that process boundary.
      */
     public function rejectsRequest(Request $request): bool
     {
@@ -271,13 +226,11 @@ final class RejectRules
     }
 
     /**
-     * Whether an exception class is on `prism.ignore.exceptions`.
-     *
-     * Matched with `instanceof` semantics rather than by pattern, so a subclass
-     * of an ignored throwable is ignored too — `is_a()` on the name because a
-     * record carries the class it was, not the object it came from. A name that
-     * cannot be autoloaded simply does not match, which is the safe direction:
-     * an exception is reported rather than silently swallowed.
+     * Whether an exception class is on `prism.ignore.exceptions`. Matched with `instanceof` semantics
+     * rather than by pattern, so a subclass of an ignored throwable is ignored too — `is_a()` on the
+     * name, because a record carries the class it was, not the object it came from. A name that cannot
+     * be autoloaded does not match, the safe direction: the exception is reported rather than silently
+     * swallowed.
      */
     public function rejectsException(string $class): bool
     {
@@ -295,11 +248,9 @@ final class RejectRules
     }
 
     /**
-     * Whether a raw Nightwatch record describes an exception this rejects.
-     *
-     * The shape {@see PrismIngest} asks in, kept here so the one class that
-     * knows Prism's ignore lists is also the one that knows which upstream
-     * field carries the thrown class. A record of any other type is not this
+     * Whether a raw Nightwatch record describes an exception this rejects — the shape
+     * {@see PrismIngest} asks in, kept here so the class that knows Prism's ignore lists is also the one
+     * that knows which upstream field carries the thrown class. Any other record type is not this
      * list's business and answers false.
      *
      * @param  array<string, mixed>  $record
