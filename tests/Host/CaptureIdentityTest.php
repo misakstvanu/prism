@@ -110,6 +110,7 @@ it('reports the engine ingest when Prism never swapped its own in', function () 
         streamFactory: fn () => throw new RuntimeException('prism:check must not open the agent socket'),
         buffer: new RecordsBuffer(length: 500),
         tokenHash: 'testhash',
+        events: app('events'),
     );
 
     $this->artisan('prism:check')

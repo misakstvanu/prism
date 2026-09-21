@@ -197,6 +197,7 @@ function socketIngest(callable $streamFactory): NightwatchSocketIngest
         streamFactory: $streamFactory,
         buffer: new RecordsBuffer(length: 500),
         tokenHash: 'testhash',
+        events: app('events'),
     );
 }
 
